@@ -23,6 +23,9 @@ static NEXT_STREAM_CONTEXT: AtomicU64 = AtomicU64::new(1);
 static NEXT_OPERATION_EPOCH: AtomicU64 = AtomicU64::new(1);
 static STREAMS: OnceLock<RwLock<HashMap<u64, StreamContext>>> = OnceLock::new();
 static EVENT_SINK: OnceLock<RwLock<Option<Arc<dyn AgentTranscriptEventSink>>>> = OnceLock::new();
+// Counts emit() calls that have read a live sink but have not yet finished
+// invoking it, so bridge teardown can wait for them instead of racing them.
+static EVENT_SINK_INFLIGHT: AtomicU64 = AtomicU64::new(0);
 
 fn streams() -> &'static RwLock<HashMap<u64, StreamContext>> {
     STREAMS.get_or_init(|| RwLock::new(HashMap::new()))
@@ -133,6 +136,12 @@ pub fn set_agent_transcript_event_sink(sink: Arc<dyn AgentTranscriptEventSink>) 
 #[uniffi::export]
 pub fn clear_agent_transcript_event_sink() {
     *event_sink().write() = None;
+    // Block until any emit() that already grabbed the outgoing sink has
+    // finished invoking it, so the foreign callback never fires after the
+    // bridge that owns it reports itself detached.
+    while EVENT_SINK_INFLIGHT.load(Ordering::SeqCst) != 0 {
+        std::thread::yield_now();
+    }
 }
 
 #[derive(Clone, Debug, thiserror::Error, uniffi::Error, PartialEq, Eq)]
@@ -1361,6 +1370,7 @@ fn emit(
     update: AgentTranscriptUpdate,
     cache_write: Option<AgentTranscriptCacheWrite>,
 ) {
+    EVENT_SINK_INFLIGHT.fetch_add(1, Ordering::SeqCst);
     let sink = event_sink().read().clone();
     if let Some(sink) = sink {
         sink.event(AgentTranscriptEvent {
@@ -1372,6 +1382,7 @@ fn emit(
             cache_write,
         });
     }
+    EVENT_SINK_INFLIGHT.fetch_sub(1, Ordering::SeqCst);
 }
 
 fn stream_data(context: u64, bytes: Vec<u8>) {

@@ -1,0 +1,104 @@
+name: Personal APK
+
+# Builds a personally signed arm64 APK from a reviewed commit and uploads it
+# as a private workflow artifact. No release is created and no upstream
+# secrets (RevenueCat, Play) are used.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Commit to build (defaults to the audited upstream commit)
+        required: true
+        default: 759eab478fcefe7103b7d415308d77e689bd109c
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build personal release APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      NODE_ENV: production
+      WHIP_DISTRIBUTION_CHANNEL: github
+
+    steps:
+      - name: Check out reviewed commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 22
+
+      - name: Set up Java
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Install Android SDK packages
+        run: >-
+          "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          "platforms;android-36"
+          "build-tools;36.0.0"
+          "ndk;27.1.12297006"
+          "cmake;3.22.1"
+
+      - name: Install JavaScript dependencies
+        run: npm ci --include=dev
+
+      - name: Prepare personal signing key
+        env:
+          ANDROID_UPLOAD_KEYSTORE_BASE64: ${{ secrets.ANDROID_UPLOAD_KEYSTORE_BASE64 }}
+          ANDROID_UPLOAD_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_UPLOAD_KEYSTORE_PASSWORD }}
+          ANDROID_UPLOAD_KEY_ALIAS: ${{ secrets.ANDROID_UPLOAD_KEY_ALIAS }}
+          ANDROID_UPLOAD_KEY_PASSWORD: ${{ secrets.ANDROID_UPLOAD_KEY_PASSWORD }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/signing"
+          printf '%s' "$ANDROID_UPLOAD_KEYSTORE_BASE64" \
+            | base64 --decode > "$RUNNER_TEMP/signing/upload-keystore.jks"
+          printf 'storeFile=%s\nstorePassword=%s\nkeyAlias=%s\nkeyPassword=%s\n' \
+            "$RUNNER_TEMP/signing/upload-keystore.jks" \
+            "$ANDROID_UPLOAD_KEYSTORE_PASSWORD" \
+            "$ANDROID_UPLOAD_KEY_ALIAS" \
+            "$ANDROID_UPLOAD_KEY_PASSWORD" \
+            > "$RUNNER_TEMP/signing/upload-keystore.properties"
+          chmod 600 "$RUNNER_TEMP"/signing/*
+
+      - name: Build signed release APK
+        run: >-
+          WHIP_UPLOAD_KEYSTORE_PROPERTIES="$RUNNER_TEMP/signing/upload-keystore.properties"
+          nix develop .#default -c
+          android/gradlew -p android app:assembleRelease
+          -Dorg.gradle.jvmargs="-Xmx4096m -XX:MaxMetaspaceSize=512m"
+          -PreactNativeArchitectures=arm64-v8a
+          --no-daemon
+
+      - name: Package APK
+        run: |
+          rm -rf "$RUNNER_TEMP/signing"
+          cp android/app/build/outputs/apk/release/app-release.apk whip-arm64.apk
+          sha256sum whip-arm64.apk | tee whip-arm64.apk.sha256
+
+      - name: Upload APK
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: whip-arm64-apk
+          path: |
+            whip-arm64.apk
+            whip-arm64.apk.sha256
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0

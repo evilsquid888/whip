@@ -698,6 +698,9 @@ struct Registry {
 static NEXT_SUBSCRIPTION_ID: AtomicU64 = AtomicU64::new(1);
 static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
 static EVENT_SINK: OnceLock<RwLock<Option<Arc<dyn HerdrEventSink>>>> = OnceLock::new();
+// Counts calls that have read a live sink but have not yet finished invoking
+// it, so bridge teardown can wait for them instead of racing them.
+static EVENT_SINK_INFLIGHT: AtomicU64 = AtomicU64::new(0);
 
 fn registry() -> &'static Mutex<Registry> {
     REGISTRY.get_or_init(|| Mutex::new(Registry::default()))
@@ -739,11 +742,13 @@ fn forward_events(client_key: &str, events: Vec<HerdrEvent>) {
     let Some(events) = crate::host_runtime::deliver_herdr_events(client_key, events) else {
         return;
     };
+    EVENT_SINK_INFLIGHT.fetch_add(1, Ordering::SeqCst);
     if let Some(sink) = event_sink().read().clone() {
         for event in events {
             sink.event(client_key.to_owned(), event);
         }
     }
+    EVENT_SINK_INFLIGHT.fetch_sub(1, Ordering::SeqCst);
 }
 
 fn transport_closed(id: u64, reason: String) {
@@ -754,11 +759,13 @@ fn transport_closed(id: u64, reason: String) {
     subscription.finish_acknowledgement(Err(HerdrEventError::TransportDisconnected(format!(
         "Herdr event subscription closed before acknowledgement: {reason}"
     ))));
+    EVENT_SINK_INFLIGHT.fetch_add(1, Ordering::SeqCst);
     if !crate::host_runtime::event_subscription_closed(&subscription.client_key, reason.clone())
         && let Some(sink) = event_sink().read().clone()
     {
         sink.closed(subscription.client_key.clone(), reason);
     }
+    EVENT_SINK_INFLIGHT.fetch_sub(1, Ordering::SeqCst);
     remove_subscription(id);
 }
 
@@ -766,11 +773,13 @@ fn fail_subscription(subscription: &EventSubscription, reason: String) {
     subscription.finish_acknowledgement(Err(HerdrEventError::SubscriptionUnavailable(
         reason.clone(),
     )));
+    EVENT_SINK_INFLIGHT.fetch_add(1, Ordering::SeqCst);
     if !crate::host_runtime::event_subscription_closed(&subscription.client_key, reason.clone())
         && let Some(sink) = event_sink().read().clone()
     {
         sink.closed(subscription.client_key.clone(), reason);
     }
+    EVENT_SINK_INFLIGHT.fetch_sub(1, Ordering::SeqCst);
     subscription.close_stream();
     remove_subscription(subscription.id);
 }
@@ -857,6 +866,12 @@ pub fn set_herdr_event_sink(sink: Arc<dyn HerdrEventSink>) {
 #[uniffi::export]
 pub fn clear_herdr_event_sink() {
     *event_sink().write() = None;
+    // Block until any call that already grabbed the outgoing sink has
+    // finished invoking it, so the foreign callback never fires after the
+    // bridge that owns it reports itself detached.
+    while EVENT_SINK_INFLIGHT.load(Ordering::SeqCst) != 0 {
+        std::thread::yield_now();
+    }
 }
 
 #[uniffi::export]

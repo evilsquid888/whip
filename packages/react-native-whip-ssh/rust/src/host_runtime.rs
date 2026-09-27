@@ -8,6 +8,7 @@ mod monitoring;
 mod remote_files;
 mod terminal;
 
+use crate::sink_calls::SinkCalls;
 use std::collections::HashMap;
 use std::sync::{
     Arc, OnceLock,
@@ -33,6 +34,7 @@ use crate::ssh::{SshErrorCode, SshFailure, SshSession, SshShellClose};
 #[cfg(test)]
 use agents::*;
 use connection::*;
+pub(crate) use diagnostics::log_lifecycle;
 use diagnostics::*;
 use events::*;
 pub(crate) use events::{
@@ -60,9 +62,8 @@ static NEXT_RUNTIME_INCARNATION: AtomicU64 = AtomicU64::new(1);
 // Process ownership is independent of foreign wrappers and Android services.
 static RUNTIMES: OnceLock<RwLock<HashMap<String, Arc<RuntimeInner>>>> = OnceLock::new();
 static EVENT_SINK: OnceLock<RwLock<Option<Arc<dyn HostRuntimeEventSink>>>> = OnceLock::new();
-// Counts emit() calls that have read a live sink but have not yet finished
-// invoking it, so bridge teardown can wait for them instead of racing them.
-static EVENT_SINK_INFLIGHT: AtomicU64 = AtomicU64::new(0);
+// Tracks sink calls that bridge teardown must wait for; see `sink_calls`.
+static EVENT_SINK_CALLS: SinkCalls = SinkCalls::new();
 
 fn runtimes() -> &'static RwLock<HashMap<String, Arc<RuntimeInner>>> {
     RUNTIMES.get_or_init(|| RwLock::new(HashMap::new()))
@@ -582,12 +583,11 @@ fn emit(event: HostRuntimeEvent) {
     crate::usage::observe_runtime_event(&event);
     // Foreign callbacks may synchronously re-enter HostRuntime. Never retain
     // either the sink registry lock or a runtime-state lock across the call.
-    EVENT_SINK_INFLIGHT.fetch_add(1, Ordering::SeqCst);
+    let _sink_call = EVENT_SINK_CALLS.enter();
     let sink = event_sink().read().clone();
     if let Some(sink) = sink {
         sink.event(event);
     }
-    EVENT_SINK_INFLIGHT.fetch_sub(1, Ordering::SeqCst);
 }
 
 fn publish_lifecycle_status(inner: &RuntimeInner) {
@@ -663,12 +663,7 @@ pub fn set_host_runtime_event_sink(sink: Arc<dyn HostRuntimeEventSink>) {
 #[uniffi::export]
 pub fn clear_host_runtime_event_sink() {
     *event_sink().write() = None;
-    // Block until any emit() that already grabbed the outgoing sink has
-    // finished invoking it, so the foreign callback never fires after the
-    // bridge that owns it reports itself detached.
-    while EVENT_SINK_INFLIGHT.load(Ordering::SeqCst) != 0 {
-        std::thread::yield_now();
-    }
+    EVENT_SINK_CALLS.drain_for_teardown("host runtime");
 }
 
 // React bridge invalidation detaches foreign callbacks, never SSH transports.

@@ -179,6 +179,9 @@ impl Registry {
 static NEXT_BRIDGE_ID: AtomicU64 = AtomicU64::new(1);
 static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
 static EVENT_SINK: OnceLock<RwLock<Option<Arc<dyn HerdrTerminalEventSink>>>> = OnceLock::new();
+// Counts calls that have read a live sink but have not yet finished invoking
+// it, so bridge teardown can wait for them instead of racing them.
+static EVENT_SINK_INFLIGHT: AtomicU64 = AtomicU64::new(0);
 
 fn registry() -> &'static Mutex<Registry> {
     REGISTRY.get_or_init(|| Mutex::new(Registry::default()))
@@ -345,8 +348,10 @@ impl Bridge {
                 *enabled,
             );
         }
+        EVENT_SINK_INFLIGHT.fetch_add(1, Ordering::SeqCst);
         let sink = event_sink().read().clone();
         let Some(sink) = sink else {
+            EVENT_SINK_INFLIGHT.fetch_sub(1, Ordering::SeqCst);
             if let ServerMessage::Closed { reason } = message {
                 self.emit_closed_to(terminal_id, reason, None);
                 self.close_transport();
@@ -354,6 +359,7 @@ impl Bridge {
             return;
         };
         self.dispatch_to(terminal_id, message, sink.as_ref(), delivery_generation);
+        EVENT_SINK_INFLIGHT.fetch_sub(1, Ordering::SeqCst);
     }
 
     fn dispatch_to(
@@ -505,6 +511,7 @@ impl Bridge {
         {
             return;
         }
+        EVENT_SINK_INFLIGHT.fetch_add(1, Ordering::SeqCst);
         if let Some(sink) = sink {
             self.emit_control(
                 sink,
@@ -512,6 +519,7 @@ impl Bridge {
                 HerdrTerminalControlEvent::Closed { reason },
             );
         }
+        EVENT_SINK_INFLIGHT.fetch_sub(1, Ordering::SeqCst);
     }
 
     fn protocol_failure(&self, error: HerdrBridgeError) {
@@ -640,6 +648,12 @@ pub fn set_herdr_terminal_event_sink(sink: Arc<dyn HerdrTerminalEventSink>) {
 #[uniffi::export]
 pub fn clear_herdr_terminal_event_sink() {
     *event_sink().write() = None;
+    // Block until any call that already grabbed the outgoing sink has
+    // finished invoking it, so the foreign callback never fires after the
+    // bridge that owns it reports itself detached.
+    while EVENT_SINK_INFLIGHT.load(Ordering::SeqCst) != 0 {
+        std::thread::yield_now();
+    }
 }
 
 #[allow(

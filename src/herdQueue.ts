@@ -1,3 +1,5 @@
+import type { AgentControlView } from 'react-native-whip-ssh';
+import { agentStatusPriority } from './lib/agentStatusPriority';
 import type { AgentInfo, AgentStatus, TabInfo, WorkspaceInfo } from './types';
 
 export interface HerdHostQueue {
@@ -17,6 +19,7 @@ export interface HerdQueueAgent {
   agent: AgentInfo;
   tabLabel: string;
   primaryLabel: string;
+  control?: AgentControlView;
 }
 
 export interface HerdProjectionRequest {
@@ -47,16 +50,8 @@ export function resolveHerdProjectionRequest(
   };
 }
 
-const AGENT_STATUS_SORT_PRIORITY: Record<AgentStatus, number> = {
-  blocked: 0,
-  done: 1,
-  working: 2,
-  idle: 3,
-  unknown: 4,
-};
-
 export function compareAgentStatusPriority(a: AgentStatus, b: AgentStatus): number {
-  return AGENT_STATUS_SORT_PRIORITY[a] - AGENT_STATUS_SORT_PRIORITY[b];
+  return agentStatusPriority(a) - agentStatusPriority(b);
 }
 
 export function orderByConnectionAndAgentStatusPriority<T>(

@@ -1,9 +1,11 @@
 //! Neutral transcript types shared by every supported agent.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Enum)]
 pub enum AgentTranscriptKind {
+    Claude,
     Codex,
     OpenCode,
 }
@@ -61,11 +63,53 @@ pub enum AgentTurnStatus {
     Error,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Enum)]
+pub enum AgentTurnOutcome {
+    Completed,
+    Interrupted,
+    Failed,
+}
+
+/// Inclusive input/output counts: cache reads/writes are subsets of input;
+/// reasoning is a subset of output. Missing counts remain unknown.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, uniffi::Record)]
+pub struct AgentTokenUsage {
+    pub input: Option<u64>,
+    pub output: Option<u64>,
+    pub reasoning: Option<u64>,
+    pub cache_read: Option<u64>,
+    pub cache_write: Option<u64>,
+    pub total: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, uniffi::Record)]
+pub struct AgentTranscriptDetails {
+    pub model: Option<String>,
+    pub provider: Option<String>,
+    pub usage: Option<AgentTokenUsage>,
+    /// Provider response identity, used to deduplicate split Claude records.
+    pub usage_id: Option<String>,
+    pub outcome: Option<AgentTurnOutcome>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, uniffi::Enum)]
 pub enum AgentScalarValue {
     String { value: String },
     Number { value: f64 },
     Boolean { value: bool },
+}
+
+impl AgentScalarValue {
+    pub(crate) fn from_json_primitive(value: &Value) -> Option<Self> {
+        match value {
+            Value::String(value) => Some(Self::String {
+                value: value.clone(),
+            }),
+            Value::Number(value) => value.as_f64().map(|value| Self::Number { value }),
+            Value::Bool(value) => Some(Self::Boolean { value: *value }),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, uniffi::Record)]
@@ -161,9 +205,25 @@ pub struct AgentToolDiagnostic {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, uniffi::Record)]
+pub struct AgentQuestionOption {
+    pub label: String,
+    pub description: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, uniffi::Record)]
+pub struct AgentQuestion {
+    pub header: Option<String>,
+    pub question: String,
+    pub multiple: bool,
+    pub options: Vec<AgentQuestionOption>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, uniffi::Record)]
 pub struct AgentToolState {
     pub status: AgentToolStatus,
     pub input: Vec<AgentField>,
+    #[serde(default)]
+    pub input_json: Option<String>,
     pub output: Option<String>,
     pub error: Option<String>,
     pub title: Option<String>,
@@ -171,11 +231,15 @@ pub struct AgentToolState {
     pub completed_at_ms: Option<u64>,
     pub exit_code: Option<i64>,
     #[serde(default)]
+    pub duration_ms: Option<u64>,
+    #[serde(default)]
     pub files: Vec<AgentFileDiff>,
     #[serde(default)]
     pub diagnostics: Vec<AgentToolDiagnostic>,
     #[serde(default)]
     pub loaded: Vec<String>,
+    #[serde(default)]
+    pub questions: Vec<AgentQuestion>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, uniffi::Enum)]
@@ -187,6 +251,11 @@ pub enum AgentTranscriptPart {
     Text {
         id: String,
         text: String,
+        timestamp_ms: Option<u64>,
+    },
+    Image {
+        id: String,
+        source: String,
         timestamp_ms: Option<u64>,
     },
     Reasoning {
@@ -211,6 +280,8 @@ pub enum AgentTranscriptPart {
         level: AgentNoticeLevel,
         text: String,
         timestamp_ms: Option<u64>,
+        #[serde(default)]
+        questions: Vec<AgentQuestion>,
     },
 }
 
@@ -218,6 +289,7 @@ impl AgentTranscriptPart {
     pub(super) fn id(&self) -> &str {
         match self {
             Self::Text { id, .. }
+            | Self::Image { id, .. }
             | Self::Reasoning { id, .. }
             | Self::Tool { id, .. }
             | Self::Plan { id, .. }
@@ -236,6 +308,8 @@ pub struct AgentTranscriptMessage {
     pub error: Option<String>,
     pub parts: Vec<AgentTranscriptPart>,
     pub diffs: Vec<AgentFileDiff>,
+    #[serde(default)]
+    pub details: Option<AgentTranscriptDetails>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, uniffi::Record)]
@@ -243,10 +317,16 @@ pub struct AgentTranscriptTurn {
     pub id: String,
     pub user_message_id: Option<String>,
     pub assistant_message_ids: Vec<String>,
+    /// Ordered messages for turns with multiple user prompts. An empty list
+    /// falls back to the singular user and assistant references.
+    #[serde(default)]
+    pub message_ids: Vec<String>,
     pub status: AgentTurnStatus,
     pub started_at_ms: Option<u64>,
     pub completed_at_ms: Option<u64>,
     pub diffs: Vec<AgentFileDiff>,
+    #[serde(default)]
+    pub details: Option<AgentTranscriptDetails>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, uniffi::Record)]

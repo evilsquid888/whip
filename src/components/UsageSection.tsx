@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { ChartColumn } from 'lucide-react-native';
 import { Animated, AppState, Pressable, StyleSheet, View } from 'react-native';
 import { useTranslation } from 'react-i18next';
 import { usageChart, usageSummary } from 'react-native-whip-ssh';
@@ -10,10 +11,11 @@ import {
   type UsageChartPeriod,
   type UsageRange,
 } from '../lib/usagePeriods';
-import { useTheme } from '../theme';
+import { appGlassControlStyle, useTheme } from '../theme';
 import { useSectionExpansion } from '../hooks/useSectionExpansion';
 import { hapticPress, useReducedMotion } from './app-ui';
 import { DetailsTitle } from './SettingsScreen';
+import { GlassBackdrop, useAppGlassEnabled } from './GlassSurface';
 import {
   CollapsibleSectionCard,
   SECTION_TITLE_CLASS_NAME,
@@ -64,6 +66,7 @@ export function UsageSection() {
     <View className="px-4 py-2">
       <CollapsibleSectionCard
         title={t('usage.title')}
+        icon={ChartColumn}
         titleContent={
           <DetailsTitle
             title={t('usage.title')}
@@ -90,6 +93,7 @@ function UsageContent({
 }) {
   const { t, i18n } = useTranslation();
   const { colors } = useTheme();
+  const appGlassEnabled = useAppGlassEnabled();
   const [chart, setChart] = useState<ChartView | null>(null);
   const [selected, setSelected] = useState<number | null>(null);
   const [unavailable, setUnavailable] = useState(false);
@@ -163,9 +167,10 @@ function UsageContent({
     <>
       <View
         accessibilityRole="tablist"
-        className="mb-5 mt-3 flex-row rounded-xl p-1"
-        style={{ backgroundColor: colors.surfaceRaised }}
+        className="relative mb-5 mt-3 flex-row overflow-hidden rounded-xl p-1"
+        style={appGlassEnabled ? undefined : { backgroundColor: colors.surfaceRaised }}
       >
+        {appGlassEnabled ? <GlassBackdrop shapeClassName="rounded-xl" /> : null}
         {usageRanges.map(option => (
           <Pressable
             key={option}
@@ -176,9 +181,16 @@ function UsageContent({
               setSelected(null);
               onRangeChange(option);
             })}
-            className="min-h-11 min-w-0 flex-1 items-center justify-center rounded-lg px-1 py-2"
+            className="min-h-11 min-w-0 flex-1 items-center justify-center rounded-lg border px-1 py-2 active:opacity-70"
             style={
-              option === range ? { backgroundColor: colors.canvas } : undefined
+              appGlassEnabled && option === range
+                ? appGlassControlStyle(true, colors)
+                : {
+                    borderColor: 'transparent',
+                    backgroundColor: !appGlassEnabled && option === range
+                      ? colors.canvas
+                      : 'transparent',
+                  }
             }
           >
             <Text

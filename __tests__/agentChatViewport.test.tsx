@@ -1,8 +1,13 @@
-import { Fragment, type ReactElement } from 'react';
-import {
-  atomOneDarkReasonable,
-  atomOneLight,
-} from 'react-syntax-highlighter/dist/esm/styles/hljs';
+import { ChatSearchBar, CHAT_SEARCH_BAR_HEIGHT } from '../src/components/ChatSearchBar';
+import { SearchText } from '../src/components/SearchText';
+import { NativeCodeBlock } from '../src/components/NativeCodeBlock';
+import { JsonOutputViewer } from '../src/components/JsonOutputViewer';
+import * as toolOutput from '../src/lib/toolOutput';
+import { Fragment, useState, type ReactElement } from 'react';
+import Clipboard from '@react-native-clipboard/clipboard';
+import * as Haptics from 'expo-haptics';
+import { Linking } from 'react-native';
+import { COPY_FEEDBACK_MS } from '../src/hooks/useCopyFeedback';
 import {
   act,
   create,
@@ -13,18 +18,42 @@ import {
 import {
   emptyTranscript,
   type AgentChatState,
+  type TranscriptPart,
   type TranscriptToolPart,
   type TranscriptTurn,
 } from '../src/agentChat';
 import { AgentChatView } from '../src/components/AgentChatView';
+import { ChatComposerSelection } from '../src/components/ChatComposerSelection';
 import type { ChatBlock } from '../src/lib/agentChatBlocks';
 import type { ChatViewportState } from '../src/lib/chatViewportState';
+import type { ChatSearchDocument, ChatSearchResults } from 'react-native-whip-ssh/src/chatSearch';
+import { CHAT_SEARCH_DELAY_MS } from '../src/hooks/useChatSearch';
+import { SCROLL_IDLE_MS } from '../src/hooks/useScrollActivity';
+
+const mockSearchDocuments = jest.fn((_documents: ChatSearchDocument[]) => undefined);
+const mockSearch = jest.fn<ChatSearchResults, [string]>();
+const mockSearchNavigate = jest.fn<ChatSearchResults, [boolean]>();
+const mockSearchSelect = jest.fn<ChatSearchResults, [number]>();
+const mockSearchDispose = jest.fn();
+jest.mock('react-native-whip-ssh/src/chatSearch', () => ({
+  NativeChatSearchIndex: jest.fn().mockImplementation(() => ({
+    setDocuments: mockSearchDocuments, search: mockSearch, navigate: mockSearchNavigate, select: mockSearchSelect, dispose: mockSearchDispose,
+  })),
+}));
+
+beforeEach(() => {
+  jest.mocked(Haptics.selectionAsync).mockClear();
+  jest.mocked(Haptics.notificationAsync).mockClear();
+  mockSearch.mockReset().mockImplementation(query => ({ query, matches: [], selected: undefined, truncated: false }));
+  mockSearchNavigate.mockReset();
+  mockSearchDocuments.mockClear();
+  mockSearchDispose.mockClear();
+});
 
 jest.mock(
   'lucide-react-native',
   () => new Proxy({}, { get: (_target, name) => String(name) }),
 );
-jest.mock('react-native-code-highlighter', () => 'CodeHighlighter');
 jest.mock('@shopify/flash-list', () => {
   const React = jest.requireActual<typeof import('react')>('react');
   return {
@@ -36,17 +65,16 @@ jest.mock('@shopify/flash-list', () => {
     }),
   };
 });
-jest.mock('react-syntax-highlighter/dist/esm/styles/hljs', () =>
-  jest.requireActual('react-syntax-highlighter/dist/cjs/styles/hljs'),
-);
 jest.mock('react-native-css-interop/jsx-runtime', () =>
   jest.requireActual('react/jsx-runtime'),
 );
 jest.mock('react-native', () => ({
   ActivityIndicator: 'ActivityIndicator',
+  Keyboard: { dismiss: jest.fn() },
   Linking: { openURL: jest.fn(async () => undefined) },
   Pressable: 'Pressable',
   ScrollView: 'ScrollView',
+  Text: 'Text',
   StyleSheet: { create: (styles: unknown) => styles },
   View: 'View',
 }));
@@ -66,15 +94,26 @@ jest.mock('../src/components/app-ui', () => ({
   useReducedMotion: () => true,
 }));
 jest.mock('../src/components/GlassSurface', () => ({
+  GlassSurface: 'GlassSurface',
   useAppGlassEnabled: () => false,
 }));
 jest.mock('../src/components/MarkdownText', () => ({
   MarkdownText: 'MarkdownText',
 }));
+jest.mock('../src/components/SelectableChatText', () => ({ SelectableChatText: 'SelectableChatText' }));
+jest.mock('../src/services/remoteFileTransfer', () => ({ cacheRemoteFile: jest.fn() }));
+jest.mock('react-native-safe-area-context', () => ({ SafeAreaView: 'SafeAreaView' }));
+jest.mock('react-syntax-highlighter/dist/esm/styles/hljs', () =>
+  jest.requireActual('react-syntax-highlighter/dist/cjs/styles/hljs'),
+);
+jest.mock('react-syntax-highlighter/dist/esm/default-highlight', () =>
+  jest.requireActual('react-syntax-highlighter/dist/cjs/default-highlight'),
+);
 jest.mock('../src/components/OverlayScrollbar', () => ({
   OverlayScrollbar: 'OverlayScrollbar',
 }));
 jest.mock('../src/components/ui/button', () => ({ Button: 'Button' }));
+jest.mock('../src/components/ui/input', () => ({ Input: 'Input' }));
 jest.mock('../src/components/ui/text', () => ({ Text: 'Text' }));
 jest.mock('../src/services/operationalDiagnostics', () => ({
   operationalErrorDetails: () => ({}),
@@ -82,7 +121,7 @@ jest.mock('../src/services/operationalDiagnostics', () => ({
 }));
 let mockIsDark = false;
 jest.mock('../src/theme', () => ({
-  appGlassControlStyle: () => undefined,
+  latestButtonStyle: () => undefined,
   useTheme: () => ({
     isDark: mockIsDark,
     colors: {
@@ -119,6 +158,10 @@ function chatView(state: AgentChatState, active = true, onReady?: () => void) {
   );
 }
 
+function isToolToggle(node: ReactTestInstance): boolean {
+  return String(node.type) === 'Pressable' && node.props.testID === 'agent-tool-toggle';
+}
+
 function flatList(renderer: ReactTestRenderer): ReactTestInstance {
   return renderer.root.find(node => String(node.type) === 'FlashList');
 }
@@ -153,6 +196,92 @@ const TURN: TranscriptTurn = {
   status: 'working',
 };
 
+test('selection actions belong to the active chat session even when an old native callback arrives late', () => {
+  const addToComposer = jest.fn();
+  const state = chatState([TURN]);
+  let renderer!: ReactTestRenderer;
+  const view = (active: boolean, session = state) => <ChatComposerSelection.Provider value={addToComposer}>
+    {chatView(session, active)}
+  </ChatComposerSelection.Provider>;
+  try {
+    act(() => { renderer = create(view(true)); });
+    const row = () => {
+      const list = flatList(renderer);
+      return list.props.renderItem({ item: list.props.data[0], index: 0 });
+    };
+    const select = row().props.onAddToComposer;
+    act(() => { select('selected text'); });
+    expect(addToComposer).toHaveBeenCalledWith('selected text');
+    addToComposer.mockClear();
+    act(() => renderer.update(view(false)));
+    expect(row().props.onAddToComposer).toBeUndefined();
+    act(() => { select('late hidden selection'); });
+    act(() => renderer.update(view(true, {
+      ...state, sessionId: 'new-session', transcript: { ...state.transcript, sessionId: 'new-session' },
+    })));
+    act(() => { select('late old session selection'); });
+    expect(addToComposer).not.toHaveBeenCalled();
+  } finally {
+    act(() => renderer?.unmount());
+  }
+});
+
+test.each([
+  { target: 'prompt', gesture: 'tap' },
+  { target: 'response', gesture: 'tap' },
+] as const)('confirms a $target copy on $gesture and extends feedback on repeated copies', ({ target }) => {
+  jest.useFakeTimers();
+  const prompt = 'A prompt with exact whitespace\n  preserved.';
+  const response = 'An answer with **Markdown**\n\nand another paragraph.';
+  const turn: TranscriptTurn = {
+    ...TURN,
+    status: 'idle',
+    user: { id: 'user-copy', role: 'user', diffs: [], parts: [{ id: 'prompt-copy', type: 'text', text: prompt }] },
+    assistants: [{ id: 'assistant-copy', role: 'assistant', diffs: [], parts: [{ id: 'response-copy', type: 'text', text: response }] }],
+  };
+  let renderer!: ReactTestRenderer;
+  let rows!: ReactTestRenderer;
+  try {
+    act(() => { renderer = create(chatView(chatState([turn]))); });
+    act(() => { rows = create(renderedBlocks(renderer)); });
+    const label = target === 'prompt' ? 'Copy prompt' : 'Copy response';
+    const button = () => rows.root.find(node => String(node.type) === 'Button' && node.props.accessibilityLabel === label);
+    const press = () => { button().props.onPress(); };
+    expect(button().findAll(node => String(node.type) === 'Copy')).toHaveLength(1);
+    jest.mocked(Clipboard.setString).mockImplementationOnce(() => { throw new Error('Clipboard unavailable'); });
+    expect(() => act(press)).toThrow('Clipboard unavailable');
+    expect(button().findAll(node => String(node.type) === 'Check')).toHaveLength(0);
+    expect(Haptics.notificationAsync).not.toHaveBeenCalled();
+    act(press);
+    expect(Clipboard.setString).toHaveBeenLastCalledWith(target === 'prompt' ? prompt : response);
+    expect(Haptics.notificationAsync).toHaveBeenCalledTimes(1);
+    expect(Haptics.notificationAsync).toHaveBeenCalledWith(Haptics.NotificationFeedbackType.Success);
+    expect(button().findAll(node => String(node.type) === 'Check')).toHaveLength(1);
+    act(() => { jest.advanceTimersByTime(COPY_FEEDBACK_MS - 100); });
+    act(press);
+    expect(Haptics.notificationAsync).toHaveBeenCalledTimes(2);
+    act(() => { jest.advanceTimersByTime(100); });
+    expect(button().findAll(node => String(node.type) === 'Check')).toHaveLength(1);
+    act(() => { jest.advanceTimersByTime(COPY_FEEDBACK_MS - 100); });
+    expect(button().findAll(node => String(node.type) === 'Copy')).toHaveLength(1);
+    act(press);
+  } finally {
+    act(() => { rows?.unmount(); renderer?.unmount(); });
+    expect(jest.getTimerCount()).toBe(0);
+    jest.useRealTimers();
+  }
+});
+
+test('renders a user message containing only an image', () => {
+  const turn: TranscriptTurn = { ...TURN, user: { id: 'user-image', role: 'user', diffs: [], parts: [{ id: 'image', type: 'image', source: '/home/me/.whip/uploads/cat.png' }] } };
+  let renderer!: ReactTestRenderer;
+  let rows!: ReactTestRenderer;
+  act(() => { renderer = create(chatView(chatState([turn]))); });
+  act(() => { rows = create(renderedBlocks(renderer)); });
+  expect(rows.root.findAll(node => node.props?.accessibilityLabel === 'Expand image /home/me/.whip/uploads/cat.png')).toHaveLength(1);
+  act(() => { rows.unmount(); renderer.unmount(); });
+});
+
 const SHELL_TURN: TranscriptTurn = {
   assistants: [{
     diffs: [],
@@ -178,7 +307,7 @@ const SHELL_TURN: TranscriptTurn = {
   status: 'idle',
 };
 
-function toolTurn(part: TranscriptToolPart): TranscriptTurn {
+function toolTurn(part: TranscriptPart): TranscriptTurn {
   return {
     assistants: [{
       diffs: [],
@@ -219,9 +348,11 @@ describe('AgentChatView viewport insets', () => {
   afterEach(() => {
     act(() => renderer?.unmount());
     act(() => boundaries?.unmount());
+    jest.useRealTimers();
   });
 
   test('keeps the viewport edge-to-edge while insetting content and indicators', () => {
+    jest.useFakeTimers();
     act(() => {
       renderer = create(
         <AgentChatView
@@ -272,12 +403,126 @@ describe('AgentChatView viewport insets', () => {
       list.props.onScroll(scrollEvent(600, 1_000));
       list.props.onScrollBeginDrag(scrollEvent(600, 1_000));
       list.props.onScroll(scrollEvent(0, 1_000));
+      list.props.onScrollEndDrag(scrollEvent(0, 1_000));
     });
+    act(() => { jest.advanceTimersByTime(SCROLL_IDLE_MS); });
     const latestButton = renderer.root.find(
       node => node.props.accessibilityLabel === 'Jump to latest',
     );
     expect(latestButton.props.style[0]).toEqual({ bottom: 297 });
+    expect(latestButton.props.className.split(' ')).toContain('self-center');
+    expect(latestButton.props.size).toBe('icon');
+    expect(latestButton.findAll(node => String(node.type) === 'ArrowDown')).toHaveLength(1);
+    expect(latestButton.findAll(node => String(node.type) === 'Text')).toHaveLength(0);
   });
+});
+
+describe('AgentChatView links', () => {
+  let renderer: ReactTestRenderer;
+  let rows: ReactTestRenderer;
+
+  afterEach(() => {
+    act(() => renderer?.unmount());
+    act(() => rows?.unmount());
+  });
+
+  test.each(['text', 'reasoning', 'plan'] as const)('%s links route web URLs through the browser handler and files through the file viewer', type => {
+    const onOpenWebLink = jest.fn();
+    const onOpenFile = jest.fn();
+    const state = chatState([{
+      ...TURN,
+      assistants: [{ id: 'assistant', role: 'assistant', diffs: [], parts: [{ type, id: 'part', text: 'Links' }] }],
+    }]);
+    jest.mocked(Linking.openURL).mockClear();
+    act(() => {
+      renderer = create(<AgentChatView {...chatView(state).props} onOpenWebLink={onOpenWebLink} onOpenFile={onOpenFile} />);
+    });
+    act(() => { rows = create(renderedBlocks(renderer)); });
+    const markdown = rows.root.find(node => String(node.type) === 'MarkdownText');
+    act(() => {
+      markdown.props.onLinkPress({ url: 'https://example.com/docs' });
+      markdown.props.onLinkPress({ url: '/repo/src/main.rs#L12' });
+      markdown.props.onLinkPress({ url: 'mailto:dev@example.com' });
+      markdown.props.onLinkPress({ url: 'tel:123456789' });
+    });
+    expect(onOpenWebLink).toHaveBeenCalledTimes(1);
+    expect(onOpenWebLink).toHaveBeenCalledWith('https://example.com/docs');
+    expect(onOpenFile).toHaveBeenCalledWith({ path: '/repo/src/main.rs', line: 12 });
+    expect(Linking.openURL).toHaveBeenCalledTimes(2);
+    expect(Linking.openURL).toHaveBeenCalledWith('mailto:dev@example.com');
+    expect(Linking.openURL).toHaveBeenCalledWith('tel:123456789');
+  });
+
+  test('tool buttons and markdown output use the same browser handler', () => {
+    const url = 'https://example.com/docs';
+    const onOpenWebLink = jest.fn();
+    const tool: TranscriptToolPart = {
+      ...failedTool('shell'),
+      tool: 'websearch',
+      state: { diagnostics: [], files: [], input: { url }, loaded: [], status: 'completed', output: `[Docs](${url})` },
+    };
+    act(() => {
+      renderer = create(<AgentChatView {...chatView(chatState([toolTurn(tool)])).props} onOpenWebLink={onOpenWebLink} />);
+    });
+    act(() => { rows = create(renderedBlocks(renderer)); });
+    const stopPropagation = jest.fn();
+    act(() => {
+      rows.root.find(node => String(node.type) === 'Pressable' && node.props.accessibilityLabel === `Open ${url}`).props.onPress({ stopPropagation });
+      rows.root.find(node => isToolToggle(node) && node.props.accessibilityState?.expanded === false).props.onPress();
+    });
+    act(() => { rows.update(renderedBlocks(renderer)); });
+    act(() => { rows.root.find(node => String(node.type) === 'MarkdownText').props.onLinkPress({ url }); });
+    expect(stopPropagation).toHaveBeenCalled();
+    expect(onOpenWebLink.mock.calls).toEqual([[url], [url]]);
+    // Tools retain their link action when their output is removed.
+    act(() => {
+      renderer.update(<AgentChatView {...chatView(chatState([toolTurn({ ...tool, state: { ...tool.state, output: undefined } })])).props} onOpenWebLink={onOpenWebLink} />);
+    });
+    act(() => { rows.update(renderedBlocks(renderer)); });
+    act(() => { rows.root.find(node => String(node.type) === 'Pressable' && node.props.accessibilityLabel === `Open ${url}`).props.onPress({ stopPropagation }); });
+    expect(onOpenWebLink).toHaveBeenCalledTimes(3);
+  });
+});
+
+test.each(['opencode', 'codex', 'claude'] as const)('%s exposes turn accounting, timestamps and complete tool inputs', agent => {
+  const startedAt = Date.UTC(2026, 9, 14, 12);
+  const input = { command: 'echo hello', options: { paths: ['src', 'tests'], enabled: false } };
+  const turn: TranscriptTurn = {
+    ...SHELL_TURN, startedAt, completedAt: startedAt + 5000,
+    details: { model: 'test-model', provider: 'test-provider', outcome: 'completed',
+      usage: { input: 1200, output: 300, cacheRead: 1000, cacheWrite: 0, reasoning: 100, total: 1500 } },
+    assistants: [{ ...SHELL_TURN.assistants[0], createdAt: startedAt + 1000, completedAt: startedAt + 5000,
+      parts: [{ ...SHELL_TURN.assistants[0].parts[0] as TranscriptToolPart,
+        state: { ...(SHELL_TURN.assistants[0].parts[0] as TranscriptToolPart).state,
+          input: { command: input.command }, inputJson: JSON.stringify(input), startedAt, completedAt: startedAt + 2500, durationMs: 2500, exitCode: 0 } }] }],
+  };
+  let renderer!: ReactTestRenderer;
+  let rows!: ReactTestRenderer;
+  const text = () => rows.root.findAll(node => String(node.type) === 'Text')
+    .flatMap(node => node.children.filter(child => typeof child === 'string')).join('\n');
+  try {
+    act(() => { renderer = create(<AgentChatView {...chatView(chatState([turn])).props} agent={agent} agentStatus="done" />); });
+    act(() => { rows = create(renderedBlocks(renderer)); });
+    expect(text()).toContain('1.5K tokens');
+    expect(text()).toContain('Completed');
+    expect(text()).toContain(new Date(startedAt + 1000).toLocaleTimeString());
+    expect(text()).not.toContain('test-provider');
+    act(() => { rows.root.find(node => String(node.type) === 'Pressable' && node.props.accessibilityLabel === 'Turn details').props.onPress(); });
+    act(() => { rows.update(renderedBlocks(renderer)); });
+    expect(text()).toContain('test-provider');
+    expect(text()).toContain('1,200');
+    expect(text()).toContain('Cache reads');
+    expect(text()).toContain('Reasoning');
+    act(() => { rows.root.find(isToolToggle).props.onPress(); });
+    act(() => { rows.update(renderedBlocks(renderer)); });
+    expect(text()).toContain('2.5s · Exit 0');
+    expect(text()).toContain(new Date(startedAt).toLocaleString());
+    expect(rows.root.findAllByType(JsonOutputViewer.type)).toHaveLength(0);
+    act(() => { rows.root.find(node => String(node.type) === 'Pressable' && node.props.accessibilityLabel === 'Tool input details').props.onPress(); });
+    expect(rows.root.findByType(JsonOutputViewer.type).props.value).toEqual(input);
+  } finally {
+    act(() => { rows?.unmount(); renderer?.unmount(); });
+  }
 });
 
 describe('AgentChatView tool output', () => {
@@ -288,11 +533,158 @@ describe('AgentChatView tool output', () => {
     act(() => renderer?.unmount());
     act(() => turnRenderer?.unmount());
     mockIsDark = false;
+    jest.useRealTimers();
+    jest.restoreAllMocks();
   });
 
-  test.each([false, true])('highlights shell commands with a transparent theme and scrollable output (isDark=%s)', isDark => {
+  test.each(['single line', 'heredoc'])('bounds a large %s command header while retaining expanded content, copy and search', shape => {
+    jest.useFakeTimers();
+    const body = '正文 mixed text '.repeat(1500);
+    const command = shape === 'heredoc' ? `cat > chapter.txt <<'EOF'\n${body}\nEOF` : `printf '${body}'`;
+    const output = 'large tool output '.repeat(1500);
+    const tool = failedTool('shell');
+    tool.state = { ...tool.state, status: 'completed', input: { command }, output, error: undefined };
+    act(() => { renderer = create(<AgentChatView {...chatView(chatState([toolTurn(tool)])).props} searchOpen />); });
+    act(() => { turnRenderer = create(renderedBlocks(renderer)); });
+    act(() => { renderer.root.findByType(ChatSearchBar).props.search.setQuery('正文'); });
+    act(() => { jest.advanceTimersByTime(CHAT_SEARCH_DELAY_MS); });
+    const toggle = () => turnRenderer.root.find(node => isToolToggle(node) && node.props.accessibilityState);
+    const header = () => toggle().findAllByType(SearchText).map(node => node.props.text).join('');
+    expect(header()).toContain(shape === 'heredoc' ? "cat > chapter.txt <<'EOF'…" : 'printf');
+    expect(header().length).toBeLessThan(200);
+    expect(toggle().props.accessibilityLabel.length).toBeLessThan(200);
+    expect(turnRenderer.root.findAllByType(NativeCodeBlock)).toHaveLength(0);
+    expect(turnRenderer.root.findAllByType(SearchText).some(node => node.props.text === output)).toBe(false);
+    expect(mockSearchDocuments.mock.calls.at(-1)![0].some(document => document.text.includes(command) && document.text.includes(output))).toBe(true);
+
+    act(() => { toggle().props.onPress(); });
+    act(() => { turnRenderer.update(renderedBlocks(renderer)); });
+    expect(header().length).toBeLessThan(200);
+    expect(turnRenderer.root.findByType(NativeCodeBlock).props.content).toBe(command);
+    act(() => { turnRenderer.root.find(node => String(node.type) === 'Pressable' && node.props.accessibilityLabel === 'Copy shell command and output').props.onPress(); });
+    expect(Clipboard.setString).toHaveBeenLastCalledWith(`$ ${command}\n\n${output}`);
+
+    act(() => { toggle().props.onPress(); });
+    act(() => { turnRenderer.update(renderedBlocks(renderer)); });
+    expect(turnRenderer.root.findAllByType(NativeCodeBlock)).toHaveLength(0);
+    expect(turnRenderer.root.findAllByType(SearchText).every(node => node.props.text.length < 200)).toBe(true);
+  });
+
+  test('bounds generic tool descriptions and argument previews before rendering', () => {
+    const tool = failedTool('shell');
+    tool.tool = 'mcp__data';
+    tool.state = {
+      ...tool.state,
+      status: 'completed',
+      input: { description: '描述 '.repeat(7000), value: 'value '.repeat(7000) },
+      error: undefined,
+    };
+    act(() => { renderer = create(chatView(chatState([toolTurn(tool)]))); });
+    act(() => { turnRenderer = create(renderedBlocks(renderer)); });
+    const previews = turnRenderer.root.findAllByType(SearchText).map(node => node.props.text);
+    expect(previews.some(text => text.startsWith('描述'))).toBe(true);
+    expect(previews.some(text => text.startsWith('value='))).toBe(true);
+    expect(previews.every(text => text.length < 200)).toBe(true);
+  });
+
+  test('defers JSON parsing and rendering until expansion and reuses unchanged output', () => {
+    const detect = jest.spyOn(toolOutput, 'parseJsonToolOutput');
+    const tool = failedTool('shell');
+    tool.tool = 'mcp__data';
+    tool.state = { ...tool.state, status: 'completed', error: undefined, output: '{"value":1}' };
+    act(() => { renderer = create(chatView(chatState([toolTurn(tool)]))); });
+    act(() => { turnRenderer = create(renderedBlocks(renderer)); });
+    expect(detect).not.toHaveBeenCalled();
+    expect(turnRenderer.root.findAllByType(JsonOutputViewer.type)).toHaveLength(0);
+    const toggle = turnRenderer.root.find(node => isToolToggle(node) && node.props.accessibilityState?.expanded === false);
+    expect(Haptics.selectionAsync).not.toHaveBeenCalled();
+    act(() => { toggle.props.onPress(); });
+    expect(Haptics.selectionAsync).toHaveBeenCalledTimes(1);
+    act(() => { turnRenderer.update(renderedBlocks(renderer)); });
+    expect(detect).toHaveBeenCalledTimes(1);
+    expect(turnRenderer.root.findAllByType(JsonOutputViewer.type)).toHaveLength(1);
+    act(() => { turnRenderer.update(renderedBlocks(renderer)); });
+    expect(detect).toHaveBeenCalledTimes(1);
+  });
+
+  test.each([
+    { name: 'mcp__data', isDark: false },
+    { name: 'mcp__data', isDark: true },
+    { name: 'websearch', isDark: false },
+    { name: 'shell', isDark: true },
+  ])('highlights JSON from $name (isDark=$isDark) and preserves copy and search', async ({ name, isDark }) => {
+    jest.useFakeTimers();
     mockIsDark = isDark;
-    const originalTheme = isDark ? atomOneDarkReasonable : atomOneLight;
+    const output = ' {"count": 42,"items":[true,null,"value"]}\n';
+    const tool = failedTool('shell');
+    tool.tool = name;
+    tool.state = { ...tool.state, status: 'completed', error: undefined, output };
+    act(() => { renderer = create(<AgentChatView {...chatView(chatState([toolTurn(tool)])).props} searchOpen />); });
+    act(() => { turnRenderer = create(renderedBlocks(renderer)); });
+    const toggle = turnRenderer.root.find(node => isToolToggle(node) && node.props.accessibilityState?.expanded === false);
+    act(() => { toggle.props.onPress(); });
+    act(() => { renderer.root.findByType(ChatSearchBar).props.search.setQuery('"count": 42'); });
+    act(() => { jest.advanceTimersByTime(CHAT_SEARCH_DELAY_MS); });
+    await act(async () => { turnRenderer.update(renderedBlocks(renderer)); });
+
+    const json = turnRenderer.root.findByType(JsonOutputViewer.type);
+    expect(json.props.value).toEqual({ count: 42, items: [true, null, 'value'] });
+    expect(json.findAll(node => String(node.type) === 'Text' && node.props.selectable === true).length).toBeGreaterThan(0);
+    const original = name === 'shell' ? `$ exit 1\n\n${output}` : output;
+    const highlights = json.findAllByProps({ testID: 'search-highlight' });
+    expect(highlights.map(node => node.props.children).join('')).toBe('"count": 42');
+    expect(turnRenderer.root.findAllByType(NativeCodeBlock)).toHaveLength(name === 'shell' ? 1 : 0);
+    const copyLabel = name === 'shell' ? 'Copy shell command and output' : 'Copy tool output';
+    const copy = turnRenderer.root.find(node => String(node.type) === 'Pressable' && node.props.accessibilityLabel === copyLabel);
+    jest.mocked(Clipboard.setString).mockImplementationOnce(() => {
+      throw new Error('Clipboard unavailable');
+    });
+    expect(() => act(() => { copy.props.onPress(); })).toThrow('Clipboard unavailable');
+    expect(Haptics.notificationAsync).not.toHaveBeenCalled();
+    act(() => { copy.props.onPress(); });
+    expect(Clipboard.setString).toHaveBeenLastCalledWith(original);
+    expect(Haptics.notificationAsync).toHaveBeenCalledTimes(1);
+    expect(Haptics.notificationAsync).toHaveBeenCalledWith(Haptics.NotificationFeedbackType.Success);
+
+    act(() => { toggle.props.onPress(); });
+    act(() => { turnRenderer.update(renderedBlocks(renderer)); });
+    expect(turnRenderer.root.findAllByType(JsonOutputViewer.type)).toHaveLength(0);
+    expect(turnRenderer.root.findAllByType(NativeCodeBlock)).toHaveLength(0);
+  });
+
+  test.each(['{"incomplete":', 'plain output'])('keeps %s as selectable text', output => {
+    const tool = failedTool('shell');
+    tool.tool = 'mcp__data';
+    tool.state = { ...tool.state, status: 'completed', error: undefined, output };
+    act(() => { renderer = create(chatView(chatState([toolTurn(tool)]))); });
+    act(() => { turnRenderer = create(renderedBlocks(renderer)); });
+    const toggle = turnRenderer.root.find(node => isToolToggle(node) && node.props.accessibilityState?.expanded === false);
+    act(() => { toggle.props.onPress(); });
+    act(() => { turnRenderer.update(renderedBlocks(renderer)); });
+    expect(turnRenderer.root.findAllByType(JsonOutputViewer.type)).toHaveLength(0);
+    const selectedText = turnRenderer.root.find(node => String(node.type) === 'Text' && node.props.selectable === true);
+    expect(selectedText.findByType(SearchText).props.text).toBe(output);
+  });
+
+  test.each(['shell', 'write'] as const)('confirms a %s code-block copy then restores the copy icon', tool => {
+    jest.useFakeTimers();
+    act(() => { renderer = create(chatView(chatState([toolTurn(failedTool(tool))]))); });
+    act(() => { turnRenderer = create(renderedBlocks(renderer)); });
+    const toggle = turnRenderer.root.find(node => isToolToggle(node) && node.props.accessibilityState?.expanded === false);
+    act(() => { toggle.props.onPress(); });
+    act(() => { turnRenderer.update(renderedBlocks(renderer)); });
+    const label = tool === 'shell' ? 'Copy shell command and output' : 'Copy tool output';
+    const copy = () => turnRenderer.root.find(node => String(node.type) === 'Pressable' && node.props.accessibilityLabel === label);
+    expect(copy().findAll(node => String(node.type) === 'Copy')).toHaveLength(1);
+    act(() => { copy().props.onPress(); });
+    expect(Clipboard.setString).toHaveBeenLastCalledWith(tool === 'shell' ? '$ exit 1\n\ncommand failed output' : 'replacement');
+    expect(copy().findAll(node => String(node.type) === 'Check')).toHaveLength(1);
+    act(() => { jest.advanceTimersByTime(COPY_FEEDBACK_MS); });
+    expect(copy().findAll(node => String(node.type) === 'Copy')).toHaveLength(1);
+  });
+
+  test.each([false, true])('renders shell commands natively and keeps output scrollable (isDark=%s)', isDark => {
+    mockIsDark = isDark;
     act(() => {
       renderer = create(chatView(chatState([SHELL_TURN])));
     });
@@ -301,7 +693,7 @@ describe('AgentChatView tool output', () => {
     });
 
     const toggle = turnRenderer.root.find(node => (
-      String(node.type) === 'Pressable'
+      isToolToggle(node)
       && node.props.accessibilityState?.expanded === false
     ));
     act(() => {
@@ -310,30 +702,40 @@ describe('AgentChatView tool output', () => {
     act(() => { turnRenderer.update(renderedBlocks(renderer)); });
 
     const expandedToggle = turnRenderer.root.find(node => (
-      String(node.type) === 'Pressable'
+      isToolToggle(node)
       && node.props.accessibilityState?.expanded === true
     ));
     const horizontalScroller = turnRenderer.root.find(node => (
       String(node.type) === 'ScrollView' && node.props.horizontal === true
     ));
-    const commandHighlighter = turnRenderer.root.find(node => (
-      String(node.type) === 'CodeHighlighter'
+    const shellText = horizontalScroller.find(node => (
+      String(node.type) === 'Text' && node.props.selectable === true
     ));
     expect(expandedToggle.findAll(node => String(node.type) === 'ScrollView')).toHaveLength(0);
-    expect(commandHighlighter.props.children).toBe('$ printf a-very-long-command-that-exceeds-the-chat-width');
-    expect(commandHighlighter.props.language).toBe('bash');
-    expect(commandHighlighter.props.hljsStyle).toEqual({
-      ...originalTheme,
-      hljs: {
-        ...originalTheme.hljs,
-        background: 'transparent',
-        backgroundColor: 'transparent',
-      },
+    expect(turnRenderer.root.findByType(NativeCodeBlock).props).toMatchObject({
+      content: 'printf a-very-long-command-that-exceeds-the-chat-width',
+      language: 'bash',
     });
-    expect(originalTheme.hljs.background).not.toBe('transparent');
-    expect(commandHighlighter.props.scrollViewProps.nestedScrollEnabled).toBe(true);
+    expect(shellText.findByType(SearchText).props.text).toBe(
+      'a-very-long-output-row-that-also-exceeds-the-chat-width',
+    );
+    expect(shellText.props.className).toBe('font-mono text-[11px] leading-[17px] text-foreground');
+    expect(turnRenderer.root.findAll(node => String(node.type) === 'ScrollView')).toHaveLength(1);
     expect(horizontalScroller.props.className).toBe('w-full');
     expect(horizontalScroller.props.nestedScrollEnabled).toBe(true);
+  });
+
+  test('renders a running command natively before output arrives, only after expansion', () => {
+    const tool = failedTool('shell');
+    tool.state = { ...tool.state, status: 'running', input: { command: 'rg --files src' }, output: undefined, error: undefined };
+    act(() => { renderer = create(chatView(chatState([toolTurn(tool)]))); });
+    act(() => { turnRenderer = create(renderedBlocks(renderer)); });
+    expect(turnRenderer.root.findAllByType(NativeCodeBlock)).toHaveLength(0);
+    const toggle = turnRenderer.root.find(node => isToolToggle(node) && node.props.accessibilityState?.expanded === false);
+    act(() => { toggle.props.onPress(); });
+    act(() => { turnRenderer.update(renderedBlocks(renderer)); });
+    expect(turnRenderer.root.findByType(NativeCodeBlock).props).toMatchObject({ content: 'rg --files src', language: 'bash' });
+    expect(turnRenderer.root.findAllByType(JsonOutputViewer.type)).toHaveLength(0);
   });
 
   test.each(['shell', 'write'] as const)(
@@ -348,7 +750,7 @@ describe('AgentChatView tool output', () => {
       });
 
       const collapsedToggle = turnRenderer.root.find(node => (
-        String(node.type) === 'Pressable'
+        isToolToggle(node)
         && node.props.accessibilityState?.expanded === false
       ));
       expect(turnRenderer.root.find(node => String(node.type) === 'CircleAlert')).toBeDefined();
@@ -356,7 +758,7 @@ describe('AgentChatView tool output', () => {
         String(node.type) === 'View'
         && node.props.className?.includes('bg-destructive/10')
       ))).toBeDefined();
-      expect(turnRenderer.root.findAll(node => node.props?.children === `${tool} failed details`)).toHaveLength(0);
+      expect(turnRenderer.root.findAll(node => node.props?.text === `${tool} failed details`)).toHaveLength(0);
 
       act(() => {
         void collapsedToggle.props.onPress();
@@ -364,10 +766,10 @@ describe('AgentChatView tool output', () => {
       act(() => { turnRenderer.update(renderedBlocks(renderer)); });
 
       expect(turnRenderer.root.find(node => (
-        String(node.type) === 'Pressable'
+        isToolToggle(node)
         && node.props.accessibilityState?.expanded === true
       ))).toBeDefined();
-      expect(turnRenderer.root.findAll(node => node.props?.children === `${tool} failed details`)).not.toHaveLength(0);
+      expect(turnRenderer.root.findAll(node => node.props?.text === `${tool} failed details`)).not.toHaveLength(0);
     },
   );
 
@@ -387,10 +789,10 @@ describe('AgentChatView tool output', () => {
     act(() => { turnRenderer.update(renderedBlocks(renderer)); });
 
     expect(turnRenderer.root.find(node => (
-      String(node.type) === 'Pressable'
+      isToolToggle(node)
       && node.props.accessibilityState?.expanded === false
     ))).toBeDefined();
-    expect(turnRenderer.root.findAll(node => node.props?.children === 'shell failed details')).toHaveLength(0);
+    expect(turnRenderer.root.findAll(node => node.props?.text === 'shell failed details')).toHaveLength(0);
   });
 
   test('retains expansion by block identity when a tool scrolls out and back into the list', () => {
@@ -404,8 +806,8 @@ describe('AgentChatView tool output', () => {
       return list.props.renderItem({ item: list.props.data[index], index });
     };
     act(() => { turnRenderer = create(row(0)); });
-    const toggle = () => turnRenderer.root.find(node => String(node.type) === 'Pressable'
-      && node.props.accessibilityRole === 'button');
+    const toggle = () => turnRenderer.root.find(node => isToolToggle(node)
+      && typeof node.props.accessibilityState?.expanded === 'boolean');
     act(() => { toggle().props.onPress(); });
     act(() => { turnRenderer.update(row(0)); });
     expect(toggle().props.accessibilityState.expanded).toBe(true);
@@ -414,6 +816,88 @@ describe('AgentChatView tool output', () => {
     act(() => { turnRenderer.update(row(0)); });
     expect(toggle().props.accessibilityState.expanded).toBe(true);
   });
+});
+
+test.each([
+  { agent: 'codex' as const, tool: 'functions · request_user_input_async' },
+  { agent: 'claude' as const, tool: 'AskUserQuestion' },
+  { agent: 'opencode' as const, tool: 'question' },
+])(
+  '$agent shows a read-only question from transcript data while the pane is idle',
+  ({ agent, tool }) => {
+    const summary = 'Database\nWhich database?\n• SQLite: Local storage\n• Postgres: Shared storage';
+    const part: TranscriptToolPart = {
+      ...failedTool('shell'), tool,
+      state: { input: { question_summary: summary }, status: 'running', files: [], loaded: [], diagnostics: [] },
+    };
+    const state = chatState([toolTurn(part)]);
+    const props = { ...chatView(state).props, agent, agentStatus: 'idle' as const };
+    let renderer!: ReactTestRenderer;
+    let rows!: ReactTestRenderer;
+    act(() => { renderer = create(<AgentChatView {...props} />); });
+    act(() => { rows = create(renderedBlocks(renderer)); });
+    expect(rows.root.findByProps({ testID: 'agent-question-notice' })).toBeDefined();
+    expect(rows.root.findByType(SearchText).props.text).toBe(summary);
+    for (const type of ['Input', 'Button', 'ActivityIndicator']) {
+      expect(rows.root.findAll(node => String(node.type) === type)).toHaveLength(0);
+    }
+    act(() => { renderer.update(<AgentChatView {...props} active={false} state={{ ...state, status: 'stale' }} />); });
+    act(() => { rows.update(renderedBlocks(renderer)); });
+    expect(rows.root.findByType(SearchText).props.text).toBe(summary);
+    act(() => { rows.unmount(); renderer.unmount(); });
+  },
+);
+
+test('a blocked pane without transcript input events does not invent a notice', () => {
+  let renderer!: ReactTestRenderer;
+  let footer!: ReactTestRenderer;
+  act(() => { renderer = create(<AgentChatView {...chatView(chatState([])).props} agentStatus="blocked" />); });
+  act(() => { footer = create(flatList(renderer).props.ListFooterComponent as ReactElement); });
+  expect(footer.root.findAll(node => String(node.type) === 'Text')).toHaveLength(0);
+  act(() => { footer.unmount(); renderer.unmount(); });
+});
+
+test.each([
+  { agent: 'codex' as const, tool: 'functions · request_user_input_async' },
+  { agent: 'claude' as const, tool: 'AskUserQuestion' },
+  { agent: 'opencode' as const, tool: 'question' },
+  { agent: 'codex' as const, tool: undefined },
+])('$agent copies exact option labels from a recorded $tool question', ({ agent, tool }) => {
+  jest.useFakeTimers();
+  const label = 'SQLite: local ✓';
+  const questions = [{
+    header: 'Database', question: 'Which database?', multiple: false,
+    options: [{ label, description: 'Local storage' }, { label: 'Postgres' }],
+  }];
+  const part: TranscriptPart = tool ? {
+    ...failedTool('shell'), tool,
+    state: { input: {}, status: 'completed', files: [], loaded: [], diagnostics: [], questions },
+  } : { type: 'notice', id: 'question', level: 'info', text: 'Codex asked a question.', questions };
+  const props = { ...chatView({ ...chatState([toolTurn(part)]), status: 'stale' }).props, agent, active: false };
+  let renderer!: ReactTestRenderer;
+  let rows!: ReactTestRenderer;
+  try {
+    act(() => { renderer = create(<AgentChatView {...props} />); });
+    act(() => { rows = create(renderedBlocks(renderer)); });
+    const copy = () => rows.root.find(node => String(node.type) === 'Pressable'
+      && node.props.accessibilityLabel === `Copy option ${label}`);
+    jest.mocked(Clipboard.setString).mockImplementationOnce(() => { throw new Error('Clipboard unavailable'); });
+    expect(() => act(() => { copy().props.onPress(); })).toThrow('Clipboard unavailable');
+    expect(copy().findAll(node => String(node.type) === 'Check')).toHaveLength(0);
+    expect(Haptics.notificationAsync).not.toHaveBeenCalled();
+    act(() => { copy().props.onPress(); });
+    expect(Clipboard.setString).toHaveBeenLastCalledWith(label);
+    expect(Haptics.notificationAsync).toHaveBeenCalledWith(Haptics.NotificationFeedbackType.Success);
+    expect(copy().findAll(node => String(node.type) === 'Check')).toHaveLength(1);
+    const other = rows.root.find(node => String(node.type) === 'Pressable' && node.props.accessibilityLabel === 'Copy option Postgres');
+    expect(other.findAll(node => String(node.type) === 'Check')).toHaveLength(0);
+    act(() => { jest.advanceTimersByTime(COPY_FEEDBACK_MS); });
+    expect(copy().findAll(node => String(node.type) === 'Copy')).toHaveLength(1);
+    expect(rows.root.findAll(node => String(node.type) === 'Input')).toHaveLength(0);
+  } finally {
+    act(() => { rows?.unmount(); renderer?.unmount(); });
+    jest.useRealTimers();
+  }
 });
 
 describe('AgentChatView activity presentation', () => {
@@ -447,6 +931,15 @@ describe('AgentChatView activity presentation', () => {
       String(node.type) === 'View' && node.props.accessibilityLiveRegion === 'polite'
     ));
   }
+
+  test('shows a terminal icon for shell tools and keeps the command accessible', () => {
+    renderTurn(toolTurn(failedTool('shell')));
+    expect(turnRenderer.root.find(node => String(node.type) === 'SquareTerminal')).toBeDefined();
+    expect(turnRenderer.root.findAll(node => node.props?.text === 'Shell')).toHaveLength(0);
+    expect(turnRenderer.root.find(node => isToolToggle(node)
+      && node.props.accessibilityState?.expanded === false).props.accessibilityLabel)
+      .toBe('Shell, exit 1');
+  });
 
   test.each(['text', 'reasoning'] as const)(
     'streams unfinished %s, then shows thinking after completion while the turn works',
@@ -511,18 +1004,20 @@ describe('AgentChatView activity presentation', () => {
       },
     };
     renderTurn({ ...toolTurn(tool), status: 'working' });
-    expect(turnRenderer.root.find(node => node.props?.children === 'Web search')).toBeDefined();
-    expect(turnRenderer.root.find(node => node.props?.children === 'weather history')).toBeDefined();
+    expect(turnRenderer.root.find(node => String(node.type) === 'Search')).toBeDefined();
+    expect(turnRenderer.root.findAll(node => node.props?.text === 'Web search')).toHaveLength(0);
+    expect(turnRenderer.root.find(node => node.props?.text === 'weather history')).toBeDefined();
     expect(thinkingIndicators()).toHaveLength(1);
-    const toggle = turnRenderer.root.find(node => String(node.type) === 'Pressable'
+    const toggle = turnRenderer.root.find(node => isToolToggle(node)
       && node.props.accessibilityState?.expanded === false);
+    expect(toggle.props.accessibilityLabel).toBe('Web search, weather history');
     act(() => { toggle.props.onPress(); });
     act(() => { turnRenderer.update(renderedBlocks(renderer)); });
-    expect(turnRenderer.root.find(node => String(node.type) === 'MarkdownText').props.content)
-      .toBe(tool.state.output);
+    expect(turnRenderer.root.findByType(JsonOutputViewer.type).props.value)
+      .toEqual([{ title: 'Weather history', url: 'https://example.test/weather' }]);
   });
 
-  test('a grouped context tool also supplies the only activity indicator', () => {
+  test('a read tool supplies the only activity indicator', () => {
     const tool = failedTool('shell');
     tool.tool = 'read';
     tool.state = { ...tool.state, error: undefined, status: 'running', input: { path: 'README.md' } };
@@ -532,12 +1027,192 @@ describe('AgentChatView activity presentation', () => {
   });
 });
 
+describe('AgentChatView pinned context', () => {
+  let renderer: ReactTestRenderer;
+  let turn: TranscriptTurn;
+  const scrollToIndex = jest.fn();
+  const scrollToEnd = jest.fn();
+  const scrollToOffset = jest.fn();
+  const firstPrompt = {
+    id: 'first-prompt', role: 'user' as const, diffs: [],
+    parts: [{ id: 'first-text', type: 'text' as const, text: 'First question\n  with spacing' }],
+  };
+  const followup = {
+    ...firstPrompt, id: 'followup',
+    parts: [{ id: 'followup-text', type: 'text' as const, text: 'Follow-up question' }],
+  };
+  const earlierAnswer = {
+    id: 'earlier-answer', role: 'assistant' as const, diffs: [], completedAt: 2,
+    parts: [{ id: 'answer-text', type: 'text' as const, text: 'Earlier answer' }],
+  };
+  const layouts = [
+    { y: 0, height: 100 }, { y: 100, height: 500 },
+    { y: 600, height: 300 }, { y: 900, height: 400 }, { y: 1300, height: 1 },
+  ];
+  const pinnedPrompts = () => renderer.root.findAllByProps({ testID: 'chat-pinned-prompt' });
+  const activityButton = () => renderer.root.find(node => String(node.type) === 'Pressable'
+    && node.props.accessibilityLabel?.startsWith('Current activity:'));
+  const view = (options: Partial<React.ComponentProps<typeof AgentChatView>> = {}) => (
+    <AgentChatView {...chatView(chatState([turn])).props} contentInsets={{ ...CONTENT_INSETS, top: 24 }} {...options} />
+  );
+  const scrollTo = (offset: number) => act(() => {
+    const list = flatList(renderer);
+    list.props.onScrollBeginDrag(scrollEvent(1600, 2000));
+    list.props.onScroll(scrollEvent(offset, 2000));
+    list.props.onScrollEndDrag(scrollEvent(offset, 2000));
+  });
+  const setParts = (parts: TranscriptPart[]) => {
+    const latest = { ...turn.assistants[1], parts };
+    turn = { ...turn, assistants: [earlierAnswer, latest], messages: [firstPrompt, earlierAnswer, followup, latest] };
+    act(() => { renderer.update(view()); });
+  };
+
+  beforeEach(() => {
+    jest.useFakeTimers();
+    scrollToIndex.mockReset(); scrollToEnd.mockReset(); scrollToOffset.mockReset();
+    const latest = {
+      ...SHELL_TURN.assistants[0],
+      parts: SHELL_TURN.assistants[0].parts.map(part => part.type === 'tool'
+        ? { ...part, state: { ...part.state, status: 'running' as const, input: { command: 'echo active' } } } : part),
+    };
+    turn = {
+      ...TURN, assistants: [earlierAnswer, latest],
+      messages: [firstPrompt, earlierAnswer, followup, latest],
+    };
+    act(() => {
+      renderer = create(view(), {
+        createNodeMock: element => element.type === 'FlashList' ? {
+          scrollToIndex, scrollToEnd, scrollToOffset,
+          getLayout: (index: number) => layouts[index],
+          getFirstItemOffset: () => 40,
+          getAbsoluteLastScrollOffset: () => 1600,
+        } : null,
+      });
+    });
+    act(() => {
+      chatViewport(renderer).props.onLayout({ nativeEvent: { layout: { height: 400 } } });
+      flatList(renderer).props.onContentSizeChange(0, 2000);
+      flatList(renderer).props.onScroll(scrollEvent(1600, 2000));
+      flatList(renderer).props.onViewableItemsChanged({ viewableItems: [{ item: finalBlock(renderer, turn), isViewable: true }] });
+      flatList(renderer).props.onLoad();
+    });
+    scrollToIndex.mockClear(); scrollToEnd.mockClear(); scrollToOffset.mockClear();
+  });
+  afterEach(() => {
+    act(() => { renderer.unmount(); });
+    jest.useRealTimers();
+  });
+
+  test('follows the prompt above the screen, including follow-ups within a single turn, and yields to visible prompts', () => {
+    scrollTo(180);
+    expect(pinnedPrompts()[0].props.accessibilityLabel).toBe('Jump to prompt: First question with spacing');
+    expect(pinnedPrompts()[0].props.style.top).toBe(24);
+    scrollTo(580);
+    expect(pinnedPrompts()[0].props.accessibilityLabel).toContain('First question');
+    // The long follow-up is partially visible. Do not cover it with the previous prompt.
+    scrollTo(650);
+    expect(pinnedPrompts()).toHaveLength(0);
+    scrollTo(850);
+    expect(pinnedPrompts()).toHaveLength(0);
+    scrollTo(950);
+    expect(pinnedPrompts()[0].props.accessibilityLabel).toBe('Jump to prompt: Follow-up question');
+    scrollTo(500);
+    expect(pinnedPrompts()[0].props.accessibilityLabel).toContain('First question');
+    scrollTo(50);
+    expect(pinnedPrompts()).toHaveLength(0);
+  });
+
+  test('tapping the pinned prompt reveals its original row without re-enabling follow', () => {
+    scrollTo(950);
+    act(() => { pinnedPrompts()[0].props.onPress(); });
+    expect(scrollToIndex).toHaveBeenCalledWith({ index: 2, animated: false, viewOffset: 24 });
+    act(() => {
+      flatList(renderer).props.onMomentumScrollBegin();
+      flatList(renderer).props.onScroll(scrollEvent(616, 2000));
+      flatList(renderer).props.onMomentumScrollEnd(scrollEvent(616, 2000));
+      flatList(renderer).props.onContentSizeChange(0, 2100);
+    });
+    expect(pinnedPrompts()).toHaveLength(0);
+    expect(scrollToEnd).not.toHaveBeenCalled();
+  });
+
+  test('supports image-only prompts, bounds pasted previews, and yields while searching', () => {
+    const imagePrompt = { ...followup, parts: [{ id: 'image', type: 'image' as const, source: '/uploads/photo.png' }] };
+    turn = { ...turn, messages: [firstPrompt, earlierAnswer, imagePrompt, turn.assistants[1]] };
+    act(() => { renderer.update(view()); });
+    scrollTo(950);
+    expect(pinnedPrompts()[0].props.accessibilityLabel).toBe('Jump to prompt: [Image]');
+    const pasted = { ...followup, parts: [{ id: 'paste', type: 'text' as const, text: 'Very long prompt '.repeat(1000) }] };
+    turn = { ...turn, messages: [firstPrompt, earlierAnswer, pasted, turn.assistants[1]] };
+    act(() => { renderer.update(view()); });
+    expect(pinnedPrompts()[0].props.accessibilityLabel.length).toBeLessThan(300);
+    expect(pinnedPrompts()[0].props.accessibilityLabel).toContain('…');
+    act(() => { renderer.update(view({ searchOpen: true })); });
+    expect(pinnedPrompts()).toHaveLength(0);
+    act(() => { renderer.update(view({ searchOpen: false })); });
+    expect(pinnedPrompts()).toHaveLength(1);
+  });
+
+  test('keeps the latest running activity visible during scrolling and updates it without moving the reader', () => {
+    expect(activityButton().props.accessibilityLabel).toBe('Current activity: Shell, echo active');
+    scrollTo(180);
+    // The activity stays visible during the drag and the scroll-idle delay.
+    expect(activityButton().props.accessibilityLabel).toContain('echo active');
+    const tool = turn.assistants[1].parts[0] as TranscriptToolPart;
+    setParts([tool, { ...tool, id: 'read', callId: 'read', tool: 'read', state: { ...tool.state, input: { path: '/repo/src/main.rs' } } }]);
+    expect(activityButton().props.accessibilityLabel).toBe('Current activity: Read, main.rs');
+    act(() => { flatList(renderer).props.onContentSizeChange(0, 2200); });
+    expect(scrollToEnd).not.toHaveBeenCalled();
+    expect(scrollToIndex).not.toHaveBeenCalled();
+    expect(scrollToOffset).not.toHaveBeenCalled();
+    setParts([{ id: 'stream', type: 'text', text: 'Here is the current answer' }]);
+    expect(activityButton().props.accessibilityLabel).toBe('Current activity: Responding, Here is the current answer');
+    setParts([{ id: 'reasoning', type: 'reasoning', text: 'Checking the result' }]);
+    expect(activityButton().props.accessibilityLabel).toBe('Current activity: Thinking, Checking the result');
+    setParts([{ ...tool, state: { ...tool.state, status: 'completed' } }]);
+    expect(activityButton().props.accessibilityLabel).toBe('Current activity: Thinking');
+  });
+
+  test('the activity strip clears for finished, interrupted, stale, and hidden chats, and a tap resumes follow', () => {
+    scrollTo(180);
+    act(() => { activityButton().props.onPress(); });
+    expect(scrollToEnd).toHaveBeenCalledWith({ animated: true });
+    scrollToEnd.mockClear();
+    act(() => { flatList(renderer).props.onContentSizeChange(0, 2200); });
+    expect(scrollToEnd).toHaveBeenCalledWith({ animated: false });
+    for (const status of ['idle', 'interrupted', 'error'] as const) {
+      act(() => { renderer.update(view({ state: chatState([{ ...turn, status }]), agentStatus: 'idle' })); });
+      expect(renderer.root.findAllByProps({ testID: 'chat-pinned-activity' })).toHaveLength(0);
+    }
+    act(() => { renderer.update(view({ state: { ...chatState([turn]), status: 'stale' } })); });
+    expect(renderer.root.findAllByProps({ testID: 'chat-pinned-activity' })).toHaveLength(0);
+    act(() => { renderer.update(view({ active: false })); });
+    expect(renderer.root.findAllByProps({ testID: 'chat-pinned-activity' })).toHaveLength(0);
+    expect(pinnedPrompts()).toHaveLength(0);
+  });
+
+  test('keeps activity and the latest button above the controls when keyboard insets change', () => {
+    scrollTo(180);
+    act(() => { jest.advanceTimersByTime(SCROLL_IDLE_MS); });
+    act(() => { renderer.update(view({ latestButtonBottom: 198 })); });
+    const activity = () => renderer.root.findByProps({ testID: 'chat-pinned-activity' });
+    const latest = () => renderer.root.find(node => node.props.accessibilityLabel === 'Jump to latest');
+    expect(activity().props.style).toEqual({ bottom: 194, height: 44 });
+    expect(latest().props.style[0].bottom).toBeGreaterThanOrEqual(194 + 44);
+    act(() => { renderer.update(view({ contentInsets: { top: 24, bottom: 486 }, latestButtonBottom: 498 })); });
+    expect(activity().props.style.bottom).toBe(494);
+    expect(latest().props.style[0].bottom).toBeGreaterThanOrEqual(494 + 44);
+    expect(scrollToEnd).not.toHaveBeenCalled();
+  });
+});
+
 describe('AgentChatView auto-follow', () => {
   let renderer: ReactTestRenderer;
   let scrollToEnd: jest.Mock;
   let scrollToOffset: jest.Mock;
 
   beforeEach(() => {
+    jest.useFakeTimers();
     scrollToEnd = jest.fn();
     scrollToOffset = jest.fn();
     act(() => {
@@ -551,6 +1226,7 @@ describe('AgentChatView auto-follow', () => {
 
   afterEach(() => {
     act(() => renderer.unmount());
+    jest.useRealTimers();
   });
 
   const establishScrollableContent = (testRenderer: ReactTestRenderer) => {
@@ -607,6 +1283,25 @@ describe('AgentChatView auto-follow', () => {
     });
     expect(renderer.root.findAll(
       node => node.props.accessibilityLabel === 'Jump to latest',
+    )).toHaveLength(0);
+    act(() => {
+      flatList(renderer).props.onScrollEndDrag(scrollEvent(500, 1_000));
+      flatList(renderer).props.onMomentumScrollBegin();
+      jest.advanceTimersByTime(SCROLL_IDLE_MS);
+    });
+    expect(renderer.root.findAll(
+      node => node.props.accessibilityLabel === 'Jump to latest',
+    )).toHaveLength(0);
+    act(() => {
+      flatList(renderer).props.onMomentumScrollEnd(scrollEvent(500, 1_000));
+      jest.advanceTimersByTime(SCROLL_IDLE_MS - 1);
+    });
+    expect(renderer.root.findAll(
+      node => node.props.accessibilityLabel === 'Jump to latest',
+    )).toHaveLength(0);
+    act(() => { jest.advanceTimersByTime(1); });
+    expect(renderer.root.findAll(
+      node => node.props.accessibilityLabel === 'Jump to latest',
     )).toHaveLength(1);
 
     act(() => {
@@ -615,7 +1310,10 @@ describe('AgentChatView auto-follow', () => {
     expect(scrollToEnd).not.toHaveBeenCalled();
 
     act(() => {
+      flatList(renderer).props.onScrollBeginDrag(scrollEvent(500, 1_100));
       flatList(renderer).props.onScroll(scrollEvent(650, 1_100));
+      flatList(renderer).props.onScrollEndDrag(scrollEvent(650, 1_100));
+      jest.advanceTimersByTime(SCROLL_IDLE_MS);
     });
     expect(renderer.root.findAll(
       node => node.props.accessibilityLabel === 'Jump to latest',
@@ -629,8 +1327,16 @@ describe('AgentChatView auto-follow', () => {
 
     scrollToEnd.mockClear();
     act(() => {
+      flatList(renderer).props.onScrollBeginDrag(scrollEvent(800, 1_200));
       flatList(renderer).props.onScroll(scrollEvent(800, 1_200));
       flatList(renderer).props.onScroll(scrollEvent(750, 1_200));
+      flatList(renderer).props.onScrollEndDrag(scrollEvent(750, 1_200));
+      jest.advanceTimersByTime(SCROLL_IDLE_MS);
+    });
+    expect(renderer.root.findAll(
+      node => node.props.accessibilityLabel === 'Jump to latest',
+    )).toHaveLength(0);
+    act(() => {
       flatList(renderer).props.onContentSizeChange(0, 1_300);
     });
     expect(scrollToEnd).not.toHaveBeenCalled();
@@ -644,6 +1350,8 @@ describe('AgentChatView auto-follow', () => {
     act(() => {
       flatList(renderer).props.onScrollBeginDrag(scrollEvent(600, 1_000));
       flatList(renderer).props.onScroll(scrollEvent(400, 1_000));
+      flatList(renderer).props.onScrollEndDrag(scrollEvent(400, 1_000));
+      jest.advanceTimersByTime(SCROLL_IDLE_MS);
     });
 
     const latestButton = renderer.root.find(
@@ -759,7 +1467,7 @@ describe('AgentChatView warm viewport restoration', () => {
 
   test('leaving near bottom restores the exact bottom before reveal', () => {
     userScrollTo(560);
-    expect(latestButtons()).toHaveLength(1);
+    expect(latestButtons()).toHaveLength(0);
     update(false);
     update(true);
     expect(scrollToOffset).toHaveBeenCalledWith({ offset: 600, animated: false });
@@ -872,7 +1580,7 @@ test('an evicted viewport restores expanded blocks and its block-relative positi
     rows = create(renderedBlocks(renderer));
   });
   expect(onReady).toHaveBeenCalledTimes(1);
-  const toolToggle = () => rows.root.find(node => String(node.type) === 'Pressable'
+  const toolToggle = () => rows.root.find(node => isToolToggle(node)
     && typeof node.props.accessibilityState?.expanded === 'boolean');
   act(() => { toolToggle().props.onPress(); });
   act(() => {
@@ -904,7 +1612,7 @@ test('an evicted viewport restores expanded blocks and its block-relative positi
   act(() => { renderer.unmount(); rows.unmount(); });
 });
 
-describe.each(['codex', 'opencode'] as const)('AgentChatView initial viewport readiness (%s)', agent => {
+describe.each(['codex', 'opencode', 'claude'] as const)('AgentChatView initial viewport readiness (%s)', agent => {
   let renderer: ReactTestRenderer;
   let scrollToEnd: jest.Mock;
   let scrollToOffset: jest.Mock;
@@ -1030,11 +1738,26 @@ describe.each(['codex', 'opencode'] as const)('AgentChatView initial viewport re
     });
     expect(onReady).not.toHaveBeenCalled();
     expect(chatViewport(renderer).parent?.props.style.opacity).toBe(0);
+    expect(chatViewport(renderer).parent?.props).toMatchObject({
+      collapsable: false,
+      pointerEvents: 'none',
+    });
     act(() => { flatList(renderer).props.onScroll(scrollEvent(400, 1_000)); });
     expect(onReady).not.toHaveBeenCalled();
     act(() => { flatList(renderer).props.onScroll(scrollEvent(600, 1_000)); });
     expect(onReady).toHaveBeenCalledTimes(1);
     expect(chatViewport(renderer).parent?.props.style.opacity).toBe(1);
+    expect(chatViewport(renderer).parent?.props).toMatchObject({
+      collapsable: false,
+      pointerEvents: 'auto',
+    });
+    const props = renderer.root.findByType(AgentChatView).props as Parameters<typeof AgentChatView>[0];
+    act(() => renderer.update(<AgentChatView {...props} active={false} />));
+    expect(chatViewport(renderer).parent?.props).toMatchObject({
+      collapsable: false,
+      pointerEvents: 'none',
+      style: { opacity: 0 },
+    });
   });
 
   test('keeps readiness latched when native geometry jitters after reaching the bottom', () => {
@@ -1123,5 +1846,216 @@ describe.each(['codex', 'opencode'] as const)('AgentChatView initial viewport re
     expect(onReady).toHaveBeenCalledTimes(1);
     expect(scrollToEnd).not.toHaveBeenCalled();
     expect(scrollToOffset).not.toHaveBeenCalled();
+  });
+});
+
+
+describe.each(['opencode', 'codex', 'claude'] as const)('shared tool expansion lifecycle (%s)', agent => {
+  let renderer: ReactTestRenderer;
+  let rows: ReactTestRenderer | undefined;
+  let saved: ChatViewportState | undefined;
+  const scrollToEnd = jest.fn();
+  const scrollToOffset = jest.fn();
+  const scrollToIndex = jest.fn(async () => undefined);
+  let firstVisibleIndex = 0;
+  const answerTurn: TranscriptTurn = {
+    ...TURN,
+    id: 'answer-turn', status: 'idle',
+    assistants: [{ id: 'answer-message', role: 'assistant', diffs: [], parts: [{ id: 'answer', type: 'text', text: 'Result' }] }],
+  };
+  const state = chatState([SHELL_TURN, answerTurn]);
+  const onReady = jest.fn();
+  const mount = () => act(() => {
+    renderer = create(<AgentChatView
+      {...chatView(state, true, onReady).props}
+      agent={agent}
+      savedViewport={saved}
+      onSaveViewport={value => { saved = value; }}
+    />, { createNodeMock: element => element.type === 'FlashList' ? {
+      scrollToEnd, scrollToOffset, scrollToIndex,
+      getFirstVisibleIndex: () => firstVisibleIndex,
+      getFirstItemOffset: () => 30,
+      getAbsoluteLastScrollOffset: () => 600,
+      getLayout: () => ({ x: 0, y: 200, width: 300, height: 500 }),
+    } : null });
+  });
+  const load = () => act(() => {
+    chatViewport(renderer).props.onLayout({ nativeEvent: { layout: { height: 400 } } });
+    flatList(renderer).props.onContentSizeChange(0, 1000);
+    flatList(renderer).props.onLoad();
+    flatList(renderer).props.onViewableItemsChanged({
+      viewableItems: [{ item: finalBlock(renderer, answerTurn), isViewable: true }],
+    });
+  });
+  beforeEach(() => {
+    saved = undefined;
+    rows = undefined;
+    firstVisibleIndex = 0;
+    jest.clearAllMocks();
+  });
+  afterEach(() => {
+    act(() => { renderer?.unmount(); rows?.unmount(); });
+  });
+
+  test('retains individual tool expansion through viewport eviction', () => {
+    mount(); load();
+    act(() => { rows = create(renderedBlocks(renderer)); });
+    const toggles = () => rows!.root.findAll(node => isToolToggle(node)
+      && typeof node.props.accessibilityState?.expanded === 'boolean');
+    act(() => { toggles()[0].props.onPress(); });
+    act(() => { rows!.update(renderedBlocks(renderer)); });
+    expect(toggles().map(node => node.props.accessibilityState.expanded)).toEqual([true]);
+    act(() => { renderer.unmount(); rows!.unmount(); });
+    expect(saved).toMatchObject({ followEnd: true });
+    expect(saved!.expandedBlocks.size).toBe(1);
+    mount(); load();
+    act(() => { rows = create(renderedBlocks(renderer)); });
+    expect(toggles().map(node => node.props.accessibilityState.expanded)).toEqual([true]);
+  });
+});
+
+
+describe.each(['opencode', 'codex', 'claude'] as const)('chat search navigation (%s)', agent => {
+  let renderer: ReactTestRenderer;
+  let setSearchOpen: (open: boolean) => void;
+  function SearchableChat({ state: chat }: { state: AgentChatState }) {
+    const [open, setOpen] = useState(false);
+    setSearchOpen = setOpen;
+    return <AgentChatView {...chatView(chat).props} agent={agent} searchOpen={open} onCloseSearch={() => setOpen(false)} />;
+  }
+  const scrollToIndex = jest.fn(async () => undefined);
+  const scrollToEnd = jest.fn();
+  const state = chatState([{
+    ...SHELL_TURN,
+    assistants: SHELL_TURN.assistants.map(message => ({ ...message, parts: message.parts.map(part => part.type === 'tool'
+      ? { ...part, tool: agent === 'claude' ? 'Bash' : 'shell', state: { ...part.state, output: 'first needle and second needle' } }
+      : part) })),
+    user: { id: 'prompt', role: 'user', diffs: [], parts: [{ id: 'prompt-text', type: 'text', text: 'Find needle' }] },
+  }]);
+  const button = (label: string) => renderer.root.find(node => String(node.type) === 'Button' && node.props.accessibilityLabel === label);
+  const input = () => renderer.root.find(node => String(node.type) === 'Input');
+  const hit = (documentId: string, offset = 0n) => ({ documentId, offset, before: 'before ', matched: 'needle', after: ' after', leading: false, trailing: false });
+  let result: ChatSearchResults;
+  let toolId: string;
+  beforeEach(() => {
+    jest.useFakeTimers();
+    scrollToIndex.mockClear(); scrollToEnd.mockClear();
+    act(() => {
+      renderer = create(<SearchableChat state={{ ...state, status: 'stale' }} />, {
+        createNodeMock: element => element.type === 'FlashList' ? {
+          scrollToEnd, scrollToIndex, scrollToOffset: jest.fn(), getAbsoluteLastScrollOffset: () => 600,
+        } : null,
+      });
+    });
+    act(() => {
+      chatViewport(renderer).props.onLayout({ nativeEvent: { layout: { height: 400 } } });
+      flatList(renderer).props.onContentSizeChange(0, 1000);
+      flatList(renderer).props.onLoad();
+      flatList(renderer).props.onViewableItemsChanged({ viewableItems: [{ item: finalBlock(renderer, state.transcript.turns[0]), isViewable: true }] });
+      setSearchOpen(true);
+    });
+    mockSearch.mockImplementation(query => {
+      if (!query) return { query, matches: [], selected: undefined, truncated: false };
+      const documents = mockSearchDocuments.mock.calls.at(-1)![0];
+      toolId = documents.find(document => document.text.includes('printf'))!.id;
+      const userId = documents.find(document => document.text === 'Find needle')!.id;
+      result = { query, matches: [hit(toolId), hit(userId)], selected: 0, truncated: false };
+      return result;
+    });
+  });
+  afterEach(() => {
+    act(() => { renderer.unmount(); });
+    jest.useRealTimers();
+  });
+  const searchForNeedle = () => {
+    act(() => { input().props.onChangeText('needle'); });
+    act(() => { jest.advanceTimersByTime(CHAT_SEARCH_DELAY_MS); });
+    act(() => { flatList(renderer).props.onCommitLayoutEffect(); });
+  };
+
+  test('highlights prompt and tool occurrences, selects a candidate, and clears highlights on close', () => {
+    searchForNeedle();
+    let content: ReactTestRenderer;
+    act(() => { content = create(renderedBlocks(renderer)); });
+    expect(content!.root.findAllByProps({ testID: 'search-highlight' }).map(node => node.props.children)).toEqual(['needle', 'needle']);
+    expect(content!.root.find(node => String(node.type) === 'SelectableChatText').props.text).toBe('Find needle');
+    mockSearchSelect.mockReturnValue({ ...result, selected: 1 });
+    const candidate = renderer.root.find(node => String(node.type) === 'Pressable' && node.props.accessibilityLabel?.startsWith('Result 2:'));
+    act(() => { candidate.props.onPress(); });
+    act(() => { flatList(renderer).props.onCommitLayoutEffect(); });
+    expect(mockSearchSelect).toHaveBeenLastCalledWith(1);
+    const userIndex = flatList(renderer).props.data.findIndex((row: ChatBlock) => row.type === 'user');
+    expect(scrollToIndex).toHaveBeenLastCalledWith({ index: userIndex, animated: false, viewOffset: CHAT_SEARCH_BAR_HEIGHT });
+    act(() => { button('Close search').props.onPress(); });
+    act(() => { content.update(renderedBlocks(renderer)); });
+    expect(content!.root.findAllByProps({ testID: 'search-highlight' })).toHaveLength(0);
+    act(() => { content.unmount(); });
+  });
+
+  test('reveals cached tool output and navigates both directions', () => {
+    searchForNeedle();
+    const list = flatList(renderer);
+    const toolIndex = list.props.data.findIndex((row: ChatBlock) => row.id === toolId);
+    expect(toolIndex).toBeGreaterThanOrEqual(0);
+    expect(scrollToIndex).toHaveBeenLastCalledWith({ index: toolIndex, animated: false, viewOffset: CHAT_SEARCH_BAR_HEIGHT });
+    const rendered = list.props.renderItem({ item: list.props.data[toolIndex], index: toolIndex });
+    expect(rendered.props.expanded).toBe(true);
+    expect(rendered.props.searchSelected).toBe(true);
+    expect(renderer.root.findAll(node => node.props.testID === 'chat-search-excerpt')).toHaveLength(2);
+    mockSearchNavigate.mockReturnValue({ ...result, selected: 1 });
+    act(() => { button('Next match').props.onPress(); });
+    act(() => { flatList(renderer).props.onCommitLayoutEffect(); });
+    expect(mockSearchNavigate).toHaveBeenLastCalledWith(false);
+    const userIndex = flatList(renderer).props.data.findIndex((row: ChatBlock) => row.type === 'user');
+    expect(scrollToIndex).toHaveBeenLastCalledWith({ index: userIndex, animated: false, viewOffset: CHAT_SEARCH_BAR_HEIGHT });
+    mockSearchNavigate.mockReturnValue(result);
+    act(() => { button('Previous match').props.onPress(); });
+    act(() => { flatList(renderer).props.onCommitLayoutEffect(); });
+    expect(mockSearchNavigate).toHaveBeenLastCalledWith(true);
+    expect(scrollToEnd).not.toHaveBeenCalled();
+  });
+
+  test('does not pull the reader back to a match on streaming updates, and closes cleanly', () => {
+    searchForNeedle();
+    scrollToIndex.mockClear();
+    const updated = { ...state, transcript: { ...state.transcript, turns: [...state.transcript.turns] } };
+    act(() => { renderer.update(<SearchableChat state={updated} />); });
+    act(() => { jest.advanceTimersByTime(CHAT_SEARCH_DELAY_MS); });
+    act(() => { flatList(renderer).props.onCommitLayoutEffect(); });
+    expect(scrollToIndex).not.toHaveBeenCalled();
+    act(() => { input().props.onChangeText(''); });
+    expect(button('Next match').props.disabled).toBe(true);
+    act(() => { button('Close search').props.onPress(); });
+    expect(mockSearchDispose).toHaveBeenCalledTimes(1);
+    expect(renderer.root.findAll(node => String(node.type) === 'Input')).toHaveLength(0);
+    expect(flatList(renderer).props.data.some((row: ChatBlock) => row.id === toolId)).toBe(true);
+  });
+
+  test('explicit navigation can return to the same occurrence after manually scrolling away', () => {
+    searchForNeedle();
+    scrollToIndex.mockClear();
+    // A single-result search wraps to the same occurrence, but still means "reveal".
+    mockSearchNavigate.mockReturnValue({ ...result, matches: [result.matches[0]], selected: 0 });
+    act(() => { flatList(renderer).props.onScrollBeginDrag(scrollEvent(200, 1000)); });
+    act(() => { button('Next match').props.onPress(); });
+    act(() => { flatList(renderer).props.onCommitLayoutEffect(); });
+    expect(scrollToIndex).toHaveBeenCalledTimes(1);
+    scrollToIndex.mockClear();
+    act(() => { button('Next match').props.onPress(); });
+    act(() => { flatList(renderer).props.onCommitLayoutEffect(); });
+    expect(scrollToIndex).toHaveBeenCalledTimes(1);
+  });
+
+  test('switching conversations closes the old search without revealing stale hits', () => {
+    searchForNeedle();
+    scrollToIndex.mockClear();
+    act(() => {
+      renderer.update(<SearchableChat state={{ ...state, sessionId: 'other-session' }} />);
+    });
+    act(() => { jest.advanceTimersByTime(CHAT_SEARCH_DELAY_MS); });
+    act(() => { flatList(renderer).props.onCommitLayoutEffect(); });
+    expect(mockSearchDispose).toHaveBeenCalledTimes(1);
+    expect(renderer.root.findAll(node => String(node.type) === 'Input')).toHaveLength(0);
+    expect(scrollToIndex).not.toHaveBeenCalled();
   });
 });

@@ -132,6 +132,42 @@ describe('terminal bridge channels', () => {
     expect(native.closeHerdrBridge).not.toHaveBeenCalled();
   });
 
+  test('detached resize frames do not refresh host state', async () => {
+    jest.useFakeTimers();
+    const native = bridgeClient();
+    connectWithPassword.mockResolvedValue(native);
+    const client = new HerdrClient();
+    try {
+      await client.connect(profile);
+      const attachmentId = await client.terminal.openTerminal('term-1', jest.fn());
+      await jest.advanceTimersByTimeAsync(120);
+      const bridgeHandler = jest.mocked(native.startHerdrBridge).mock.calls[0][8];
+
+      await client.terminal.resizeTerminal('term-1', 100, 30, 8, 16);
+      client.terminal.detachTerminal('term-1', attachmentId);
+      await jest.advanceTimersByTimeAsync(120);
+      jest.mocked(native.requestHerdrApi).mockClear();
+
+      await client.terminal.openTerminal('term-1', jest.fn());
+      await jest.advanceTimersByTimeAsync(120);
+      jest.mocked(native.requestHerdrApi).mockClear();
+      bridgeHandler({
+        type: 'terminal',
+        seq: 1,
+        full: false,
+        width: 100,
+        height: 30,
+        bytes: '',
+      });
+      await jest.advanceTimersByTimeAsync(120);
+
+      expect(native.requestHerdrApi).not.toHaveBeenCalled();
+    } finally {
+      await client.disconnect();
+      jest.useRealTimers();
+    }
+  });
+
   test('dispatches input to a retained bridge without an async readiness yield', async () => {
     const native = bridgeClient();
     connectWithPassword.mockResolvedValue(native);
@@ -312,20 +348,32 @@ describe('terminal bridge channels', () => {
   });
 
   test('retries the same size after a native resize dispatch fails', async () => {
+    jest.useFakeTimers();
     const native = bridgeClient();
     connectWithPassword.mockResolvedValue(native);
     const client = new HerdrClient();
-    await client.connect(profile);
-    await client.terminal.openTerminal('term-1', jest.fn());
-    jest.mocked(native.herdrBridgeResize).mockClear();
-    jest.mocked(native.herdrBridgeResize)
-      .mockRejectedValueOnce(new Error('resize failed'));
+    try {
+      await client.connect(profile);
+      await client.terminal.openTerminal('term-1', jest.fn());
+      await jest.advanceTimersByTimeAsync(120);
+      jest.mocked(native.herdrBridgeResize).mockClear();
+      jest.mocked(native.requestHerdrApi).mockClear();
+      jest.mocked(native.herdrBridgeResize)
+        .mockRejectedValueOnce(new Error('resize failed'));
 
-    await expect(client.terminal.resizeTerminal('term-1', 100, 30, 8, 16))
-      .rejects.toThrow('resize failed');
-    await client.terminal.resizeTerminal('term-1', 100, 30, 8, 16);
+      await expect(client.terminal.resizeTerminal('term-1', 100, 30, 8, 16))
+        .rejects.toThrow('resize failed');
+      await jest.advanceTimersByTimeAsync(120);
+      expect(native.requestHerdrApi).not.toHaveBeenCalled();
 
-    expect(native.herdrBridgeResize).toHaveBeenCalledTimes(2);
+      await client.terminal.resizeTerminal('term-1', 100, 30, 8, 16);
+      await jest.advanceTimersByTimeAsync(120);
+      expect(native.herdrBridgeResize).toHaveBeenCalledTimes(2);
+      expect(native.requestHerdrApi).not.toHaveBeenCalled();
+    } finally {
+      await client.disconnect();
+      jest.useRealTimers();
+    }
   });
 
   test('forwards the touched terminal cell with attached-pane scrolling', async () => {
@@ -346,24 +394,43 @@ describe('terminal bridge channels', () => {
     );
   });
 
-  test('remote resizes do not trigger host-state reconciliation', async () => {
+  test('attach and resize frames do not refresh host state', async () => {
     jest.useFakeTimers();
     const native = bridgeClient();
     connectWithPassword.mockResolvedValue(native);
     const client = new HerdrClient();
     try {
       await client.connect(profile);
-      await client.terminal.openTerminal('term-1', jest.fn());
-      // Let the initial attachment refresh finish before measuring resize work.
-      await jest.advanceTimersByTimeAsync(120);
       jest.mocked(native.requestHerdrApi).mockClear();
+      await client.terminal.openTerminal('term-1', jest.fn());
+      await jest.advanceTimersByTimeAsync(120);
+      expect(native.requestHerdrApi).not.toHaveBeenCalled();
+      const bridgeHandler = jest.mocked(native.startHerdrBridge).mock.calls[0][8];
 
       await client.terminal.resizeTerminal('term-1', 100, 30, 8, 16);
       await client.terminal.resizeTerminal('term-1', 100, 30, 8, 16);
       await client.terminal.resizeTerminal('term-1', 100, 35, 8, 16);
-      await jest.advanceTimersByTimeAsync(120);
+      jest.advanceTimersByTime(100);
+      bridgeHandler({
+        type: 'terminal',
+        seq: 1,
+        full: false,
+        width: 100,
+        height: 35,
+        bytes: '',
+      });
+      jest.advanceTimersByTime(119);
+      await Promise.resolve();
+      expect(native.requestHerdrApi).not.toHaveBeenCalled();
 
+      jest.advanceTimersByTime(1);
+      await Promise.resolve();
       expect(native.herdrBridgeResize).toHaveBeenCalledTimes(2);
+      expect(native.requestHerdrApi).not.toHaveBeenCalled();
+
+      jest.mocked(native.requestHerdrApi).mockClear();
+      await client.terminal.resizeTerminal('term-1', 100, 35, 8, 16);
+      await jest.advanceTimersByTimeAsync(120);
       expect(native.requestHerdrApi).not.toHaveBeenCalled();
     } finally {
       await client.disconnect();
@@ -371,7 +438,7 @@ describe('terminal bridge channels', () => {
     }
   });
 
-  test('debounces host-state reconciliation after remote scroll activity', async () => {
+  test('stale resize frames do not refresh host state', async () => {
     jest.useFakeTimers();
     const native = bridgeClient();
     connectWithPassword.mockResolvedValue(native);
@@ -379,18 +446,51 @@ describe('terminal bridge channels', () => {
     try {
       await client.connect(profile);
       await client.terminal.openTerminal('term-1', jest.fn());
+      await jest.advanceTimersByTimeAsync(120);
       jest.mocked(native.requestHerdrApi).mockClear();
+      const bridgeHandler = jest.mocked(native.startHerdrBridge).mock.calls[0][8];
 
       await client.terminal.resizeTerminal('term-1', 100, 30, 8, 16);
-      await client.terminal.scrollTerminal('term-1', 'up', 3, 12, 7);
+      await client.terminal.resizeTerminal('term-1', 100, 35, 8, 16);
+      jest.advanceTimersByTime(100);
+      bridgeHandler({
+        type: 'terminal',
+        seq: 1,
+        full: false,
+        width: 100,
+        height: 30,
+        bytes: '',
+      });
+      await jest.advanceTimersByTimeAsync(20);
 
-      jest.advanceTimersByTime(119);
-      await Promise.resolve();
       expect(native.requestHerdrApi).not.toHaveBeenCalled();
+    } finally {
+      await client.disconnect();
+      jest.useRealTimers();
+    }
+  });
 
-      jest.advanceTimersByTime(1);
-      await Promise.resolve();
-      expect(native.requestHerdrApi).toHaveBeenCalledTimes(1);
+  test('scrolls the terminal without refreshing host state', async () => {
+    jest.useFakeTimers();
+    const native = bridgeClient();
+    connectWithPassword.mockResolvedValue(native);
+    const client = new HerdrClient();
+    try {
+      await client.connect(profile);
+      await client.terminal.openTerminal('term-1', jest.fn());
+      await jest.advanceTimersByTimeAsync(120);
+      jest.mocked(native.requestHerdrApi).mockClear();
+
+      await client.terminal.scrollTerminal('term-1', 'up', 3, 12, 7);
+      await jest.advanceTimersByTimeAsync(120);
+      await client.terminal.scrollTerminal('term-1', 'down', 2, 12, 7);
+      await jest.advanceTimersByTimeAsync(120);
+
+      expect(native.herdrBridgeScroll.mock.calls).toEqual([
+        ['term-1', 'up', 3, 12, 7],
+        ['term-1', 'down', 2, 12, 7],
+      ]);
+      expect(native.requestHerdrApi).not.toHaveBeenCalled();
     } finally {
       await client.disconnect();
       jest.useRealTimers();
@@ -419,7 +519,7 @@ describe('terminal bridge channels', () => {
     });
   });
 
-  test('ignores Herdr UI mouse capture and forwards Kitty keyboard mode changes', async () => {
+  test('forwards attached-application mouse capture separately from Kitty keyboard mode', async () => {
     const native = bridgeClient(20);
     connectWithPassword.mockResolvedValue(native);
     const client = new HerdrClient();
@@ -435,9 +535,9 @@ describe('terminal bridge channels', () => {
       type: 'protocol-state',
       state: { kittyKeyboardReportAll: true },
     });
-    expect(onControl).not.toHaveBeenCalledWith(expect.objectContaining({
-      state: expect.objectContaining({ mouseCapture: expect.anything() }),
-    }));
+    expect(onControl).toHaveBeenCalledWith({ type: 'mouse-capture', enabled: true });
+    bridgeHandler({ type: 'mouse_capture', flag: false });
+    expect(onControl).toHaveBeenLastCalledWith({ type: 'mouse-capture', enabled: false });
   });
 
   test('replays attached-pane protocol state when a renderer reattaches', async () => {
@@ -459,6 +559,7 @@ describe('terminal bridge channels', () => {
       type: 'protocol-state',
       state: { kittyKeyboardReportAll: true },
     });
+    expect(onControl).toHaveBeenCalledWith({ type: 'mouse-capture', enabled: true });
     expect(native.startHerdrBridge).toHaveBeenCalledTimes(1);
   });
 

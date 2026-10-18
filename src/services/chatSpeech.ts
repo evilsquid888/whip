@@ -1,13 +1,14 @@
-import { DeviceEventEmitter, NativeModules } from 'react-native';
+import { DeviceEventEmitter, NativeEventEmitter, NativeModules, Platform } from 'react-native';
 import * as Speech from 'expo-speech';
 import { NativeChatSpeechQueue } from 'react-native-whip-ssh';
 
 import { agentTranscriptService } from './NativeTranscriptService';
 import { reportBackgroundFailure } from './backgroundOperations';
 import { setChatSpeechFocus } from './chatSpeechFocus';
+import { setSpeechInputActive } from './speechInputFocus';
 
 export interface ChatSpeechTarget {
-  agent: 'codex' | 'opencode';
+  agent: 'claude' | 'codex' | 'opencode';
   bindingToken: string;
   hostId: string;
   paneId: string;
@@ -18,16 +19,26 @@ interface ChatSpeechNativeModule {
   startChatSpeech(token: string, label: string): Promise<void>;
   speakChat(token: string, text: string): Promise<void>;
   stopChatSpeech(token: string): Promise<void>;
+  addListener(event: string): void;
+  removeListeners(count: number): void;
 }
 
 interface ListeningSession {
   target: ChatSpeechTarget;
   stop: () => void;
+  silence: () => Promise<void>;
 }
 
 const CHAT_SPEECH_STOPPED = 'WhipChatSpeechStopped';
 let active: ListeningSession | null = null;
 let generation = 0;
+
+/** Wait for native playback to release its audio session before recording. */
+export async function suspendChatSpeechForInput(): Promise<void> {
+  const stopped = active?.silence();
+  setSpeechInputActive(true);
+  await Promise.all([stopped, Speech.stop()]);
+}
 
 /** One process-wide listener, independent of the chat viewport's lifecycle. */
 export function listenToChat(
@@ -37,13 +48,14 @@ export function listenToChat(
 ): () => void {
   active?.stop();
   const native = NativeModules.HerdrBackground as ChatSpeechNativeModule;
-  if (!native?.startChatSpeech) throw new Error('This build does not support chat speech. Install an updated Android build.');
+  if (!native?.startChatSpeech) throw new Error('This build does not support chat speech. Install an updated app build.');
   const queue = new NativeChatSpeechQueue();
   const token = `${target.bindingToken}:${++generation}`;
   let stopped = false;
   let ready = false;
   let draining = false;
   let unsubscribe = () => {};
+  let stoppedPlayback = Promise.resolve();
 
   const stop = () => {
     if (stopped) return;
@@ -55,7 +67,8 @@ export function listenToChat(
       active = null;
       setChatSpeechFocus(null);
     }
-    reportBackgroundFailure(native.stopChatSpeech(token), 'chat-speech-stop');
+    stoppedPlayback = native.stopChatSpeech(token);
+    reportBackgroundFailure(stoppedPlayback, 'chat-speech-stop');
   };
   const fail = (error: unknown) => {
     if (stopped) return;
@@ -63,7 +76,8 @@ export function listenToChat(
     onError(error);
     onStopped();
   };
-  const subscription = DeviceEventEmitter.addListener(CHAT_SPEECH_STOPPED, (event: { token: string; error?: string }) => {
+  const emitter = Platform.OS === 'ios' ? new NativeEventEmitter(native) : DeviceEventEmitter;
+  const subscription = emitter.addListener(CHAT_SPEECH_STOPPED, (event: { token: string; error?: string }) => {
     if (event.token !== token || stopped) return;
     if (event.error) {
       fail(new Error(event.error));
@@ -72,7 +86,7 @@ export function listenToChat(
     stop();
     onStopped();
   });
-  active = { target, stop };
+  active = { target, stop, silence: () => { stop(); return stoppedPlayback; } };
   setChatSpeechFocus(target);
 
   const drain = async () => {

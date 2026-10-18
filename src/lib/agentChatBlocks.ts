@@ -2,8 +2,7 @@ import type { TranscriptMessage, TranscriptPart, TranscriptToolPart, TranscriptT
 
 type BlockContent =
   | { type: 'user'; message: TranscriptMessage }
-  | { type: 'part'; part: TranscriptPart; streaming: boolean; nested?: boolean }
-  | { type: 'context'; tools: TranscriptToolPart[] }
+  | { type: 'part'; part: TranscriptPart; streaming: boolean; message?: TranscriptMessage }
   | { type: 'thinking' }
   | { type: 'error'; error: string }
   | { type: 'changes'; turn: TranscriptTurn }
@@ -20,10 +19,16 @@ export function isRunningTool(part: TranscriptToolPart): boolean {
   return part.state.status === 'pending' || part.state.status === 'running';
 }
 
+const QUESTION_TOOLS = new Set(['question', 'askuserquestion', 'request_user_input', 'request_user_input_async']);
+
+export function isQuestionTool(part: TranscriptToolPart): boolean {
+  return QUESTION_TOOLS.has(part.tool.toLowerCase().split(' · ').at(-1)?.split('.').at(-1) ?? '');
+}
+
 function renderable(part: TranscriptPart): boolean {
   if (part.type === 'text' || part.type === 'reasoning') return Boolean(part.text.trim());
-  if (part.type === 'tool') return part.tool !== 'todowrite'
-    && !(part.tool === 'question' && isRunningTool(part));
+  // Claude retains original tool names, including TodoWrite, without a separate plan.
+  if (part.type === 'tool') return part.tool !== 'todowrite' || part.state.status === 'error';
   return part.type === 'plan' || part.type === 'notice';
 }
 
@@ -44,35 +49,28 @@ export function transcriptBlocks(
         ? (turnIndex ? 'turn' : 'none')
         : content.type === 'meta' || content.type === 'changes' ? 'none' : 'part',
     });
-    if (turn.user) push(key('user', turn.user.id), { type: 'user', message: turn.user });
-    const parts = turn.assistants.flatMap(message => message.parts
-      .filter(renderable)
-      .map(part => ({ part, message, id: key('part', message.id, part.id) })));
-    const tail = parts.at(-1);
+    const messages = turn.messages ?? [...(turn.user ? [turn.user] : []), ...turn.assistants];
+    const content = messages.map(message => ({
+      message,
+      parts: message.role === 'assistant' ? message.parts
+        .filter(renderable)
+        .map(part => ({ part, message, id: key('part', message.id, part.id) })) : [],
+    }));
+    const parts = content.flatMap(item => item.parts);
+    const tail = messages.at(-1)?.role === 'user' ? undefined : parts.at(-1);
     const working = turnIndex === turns.length - 1 && (agentWorking || turn.status === 'working');
     const streamingId = working && tail && tail.message.completedAt === undefined
       && (tail.part.type === 'text' || tail.part.type === 'reasoning') ? tail.id : undefined;
-    let context: typeof parts = [];
-    const flushContext = () => {
-      if (!context.length) return;
-      const id = key('context', context[0].id);
-      push(id, { type: 'context', tools: context.map(item => item.part as TranscriptToolPart) });
-      if (expanded.has(id)) {
-        for (const item of context) push(item.id, {
-          type: 'part', part: item.part, streaming: false, nested: true,
-        });
-      }
-      context = [];
-    };
-    for (const item of parts) {
-      if (item.part.type === 'tool' && /^(?:read|list|glob|grep)$/i.test(item.part.tool)) {
-        context.push(item);
+    for (const { message, parts: messageParts } of content) {
+      if (message.role === 'user') {
+        push(key('user', message.id), { type: 'user', message });
       } else {
-        flushContext();
-        push(item.id, { type: 'part', part: item.part, streaming: item.id === streamingId });
+        for (const item of messageParts) {
+          push(item.id, { type: 'part', part: item.part, streaming: item.id === streamingId,
+            message: item === messageParts[0] ? message : undefined });
+        }
       }
     }
-    flushContext();
     if (working && turn.status !== 'error' && !streamingId
       && !parts.some(({ part }) => part.type === 'tool' && isRunningTool(part))) {
       push(key('thinking'), { type: 'thinking' });

@@ -1,8 +1,8 @@
 import Slider from '@react-native-community/slider';
-import { BellRing, Check, ChevronDown, ChevronRight, ChevronUp, Fingerprint, History, ImagePlus, Info, KeyRound, Minus, Play, Plus, Trash2, X, type LucideIcon } from 'lucide-react-native';
+import { BellRing, Bot, CaseSensitive, Check, ChevronDown, ChevronRight, ChevronUp, Code2, Fingerprint, History, Image as ImageIcon, ImagePlus, Info, KeyRound, Minus, Monitor, Moon, Palette, Play, Plus, Server, ShieldCheck, SquareTerminal, Sun, Trash2, Volume1, Volume2, X, type LucideIcon } from 'lucide-react-native';
 import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from 'react';
 import Clipboard from '@react-native-clipboard/clipboard';
-import { Alert, Image, Modal, Platform, Pressable, ScrollView, StyleSheet, ToastAndroid, View } from 'react-native';
+import { Alert, Image, Modal, Platform, Pressable, ScrollView, StyleSheet, View } from 'react-native';
 import Animated, {
   cancelAnimation,
   Easing,
@@ -25,6 +25,7 @@ import {
   MIN_XTERM_CACHE_CAPACITY,
 } from '@/src/lib/terminalRendererLru';
 import { cn } from '@/src/lib/utils';
+import { limitAgentInstructions } from '@/src/lib/agentInstructions';
 import {
   terminalVolumeKeyActions,
   type TerminalVolumeKey,
@@ -47,10 +48,13 @@ import {
 import { removeAppBackgroundImage, selectAppBackgroundImage } from '@/src/services/appBackground';
 import { openNotificationSettings } from '@/src/services/notificationSettings';
 import { removeTerminalBackgroundImage, selectTerminalBackgroundImage } from '@/src/services/terminalBackground';
+import { getBillingRolloutPolicy } from '../billing/rollout';
 import { hapticPress, IconButton } from './app-ui';
 import { ConfirmationPopup } from './ConfirmationPopup';
 import { GlassSurface } from './GlassSurface';
+import { GlassButton, GlassIconBadge } from './GlassControls';
 import { CollapsibleSectionCard } from './CollapsibleSectionCard';
+import { SettingsChoiceRow } from './SettingsChoiceRow';
 import { Button } from './ui/button';
 import { Icon } from './ui/icon';
 import { Input } from './ui/input';
@@ -123,6 +127,8 @@ export interface SettingsSectionProps {
   knownHostCount: number | null;
   appearance: AppearancePreference;
   fullscreenApp: boolean;
+  fullscreenAppUnlocked: boolean;
+  fullscreenTerminalUnlocked: boolean;
   smoothSpinners: boolean;
   appBackgroundImageUri: string | null;
   appBackgroundDimming: number;
@@ -136,6 +142,8 @@ export interface SettingsSectionProps {
   keepScreenOn: boolean;
   reopenTerminalOnLaunch: boolean;
   agentCommand: string;
+  reverseControlInstructions: string;
+  onReverseControlInstructionsChange: (value: string) => void;
   terminalHistory: readonly string[];
   onAlertsChange: (value: boolean) => void;
   onAgentAlertLevelChange: (value: AgentAlertLevel) => void;
@@ -211,6 +219,7 @@ export function SettingsSection(props: SettingsSectionProps) {
   const { expanded: securityExpanded, toggleExpanded: toggleSecurity } = useSectionExpansion('security', true);
   const { expanded: appearanceExpanded, toggleExpanded: toggleAppearance } = useSectionExpansion('appearance', true);
   const { expanded: herdExpanded, toggleExpanded: toggleHerd } = useSectionExpansion('herd', true);
+  const { expanded: reverseControlExpanded, toggleExpanded: toggleReverseControl } = useSectionExpansion('reverse-control', true);
   const { expanded: terminalExpanded, toggleExpanded: toggleTerminal } = useSectionExpansion('terminal', true);
   const { expanded: developerExpanded, toggleExpanded: toggleDeveloper } = useSectionExpansion('developer', true);
   const [doubleTapExpanded, setDoubleTapExpanded] = useState(false);
@@ -247,6 +256,7 @@ export function SettingsSection(props: SettingsSectionProps) {
       <View className="gap-3">
       <CollapsibleSectionCard
         title={t('settings.notifications')}
+        icon={BellRing}
         expanded={notificationsExpanded}
         onToggle={toggleNotifications}>
         <SettingRow title={t('settings.agentNotifications')} copy={t('settings.agentNotificationsCopy')} value={props.alertsEnabled} onChange={props.onAlertsChange} />
@@ -297,6 +307,7 @@ export function SettingsSection(props: SettingsSectionProps) {
 
       <CollapsibleSectionCard
         title={t('settings.security')}
+        icon={ShieldCheck}
         expanded={securityExpanded}
         onToggle={toggleSecurity}>
         <ActionRow
@@ -310,16 +321,17 @@ export function SettingsSection(props: SettingsSectionProps) {
           copy={props.knownHostCount === null
             ? t('settings.knownHostsUnavailable')
             : t('settings.knownHostsCopy', { count: props.knownHostCount })}
-          icon={Fingerprint}
+          icon={Server}
           onPress={props.onManageKnownHosts}
           divided
         />
-        <SettingRow title={t('settings.biometricForKeys')} copy={t(Platform.OS === 'ios' ? 'settings.biometricForKeysCopyIos' : 'settings.biometricForKeysCopy')} value={props.biometricForKeys} onChange={props.onBiometricForKeysChange} divided />
-        <SettingRow title={t('settings.biometricOnResume')} copy={t(Platform.OS === 'ios' ? 'settings.biometricOnResumeCopyIos' : 'settings.biometricOnResumeCopy')} value={props.biometricOnResume} onChange={props.onBiometricOnResumeChange} divided />
+        <SettingRow title={t('settings.biometricForKeys')} icon={Fingerprint} copy={t(Platform.OS === 'ios' ? 'settings.biometricForKeysCopyIos' : 'settings.biometricForKeysCopy')} value={props.biometricForKeys} onChange={props.onBiometricForKeysChange} divided />
+        <SettingRow title={t('settings.biometricOnResume')} icon={Fingerprint} copy={t(Platform.OS === 'ios' ? 'settings.biometricOnResumeCopyIos' : 'settings.biometricOnResumeCopy')} value={props.biometricOnResume} onChange={props.onBiometricOnResumeChange} divided />
       </CollapsibleSectionCard>
 
       <CollapsibleSectionCard
         title={t('settings.appearance')}
+        icon={Palette}
         expanded={appearanceExpanded}
         onToggle={toggleAppearance}>
         <AppearanceRow value={props.appearance} onChange={props.onAppearanceChange} />
@@ -328,6 +340,8 @@ export function SettingsSection(props: SettingsSectionProps) {
             copy={t('settings.fullscreenAppCopy')}
             value={props.fullscreenApp}
             onChange={props.onFullscreenAppChange}
+            locked={!props.fullscreenAppUnlocked}
+            onLockedPress={props.onOpenRancher}
             divided
           />
           <SettingRow
@@ -362,12 +376,12 @@ export function SettingsSection(props: SettingsSectionProps) {
             divided
           />
           <SettingRow
-            title={t('settings.experimentalGlass')}
+            title={t('settings.glass')}
             copy={!props.glassUnlocked
               ? t('settings.rancherGlassCopy')
               : props.appBackgroundImageUri
-                ? t('settings.experimentalGlassCopy')
-                : t('settings.experimentalGlassRequiresImage')}
+                ? t('settings.glassCopy')
+                : t('settings.glassRequiresImage')}
             value={props.appGlassEnabled}
             disabled={!props.appBackgroundImageUri || !props.glassUnlocked}
             locked={!props.glassUnlocked}
@@ -381,6 +395,7 @@ export function SettingsSection(props: SettingsSectionProps) {
 
       <CollapsibleSectionCard
         title={t('settings.herd')}
+        icon={Bot}
         expanded={herdExpanded}
         onToggle={toggleHerd}>
         <View className="p-3.5">
@@ -400,10 +415,39 @@ export function SettingsSection(props: SettingsSectionProps) {
       </CollapsibleSectionCard>
 
       <CollapsibleSectionCard
+        title={t('herd.reverseControl')}
+        icon={Bot}
+        expanded={reverseControlExpanded}
+        onToggle={toggleReverseControl}>
+        <View className="px-4 py-4">
+          <Text className="text-[15px] font-semibold">{t('settings.reverseControlInstructions')}</Text>
+          <Text className="mt-1 text-xs leading-[17px] text-muted-foreground">{t('settings.reverseControlInstructionsCopy')}</Text>
+          <Input
+            className="mt-3 min-h-[160px] font-mono text-xs"
+            accessibilityLabel={t('settings.reverseControlInstructions')}
+            value={props.reverseControlInstructions}
+            onChangeText={value => props.onReverseControlInstructionsChange(limitAgentInstructions(value))}
+            multiline
+            textAlignVertical="top"
+            autoCapitalize="none"
+            autoCorrect={false}
+          />
+        </View>
+      </CollapsibleSectionCard>
+
+      <CollapsibleSectionCard
         title={t('settings.terminal')}
+        icon={SquareTerminal}
         expanded={terminalExpanded}
         onToggle={toggleTerminal}>
-        <SettingRow title={t('settings.fullscreenTerminal')} copy={t('settings.fullscreenTerminalCopy')} value={props.terminalPreferences.fullscreen} onChange={value => props.onTerminalPreferencesChange({ ...props.terminalPreferences, fullscreen: value })} />
+        <SettingRow
+          title={t('settings.fullscreenTerminal')}
+          copy={t('settings.fullscreenTerminalCopy')}
+          value={props.terminalPreferences.fullscreen}
+          onChange={value => props.onTerminalPreferencesChange({ ...props.terminalPreferences, fullscreen: value })}
+          locked={!props.fullscreenTerminalUnlocked}
+          onLockedPress={props.onOpenRancher}
+        />
         <SettingRow title={t('settings.keepScreenOn')} copy={t('settings.keepScreenOnCopy')} value={props.keepScreenOn} onChange={props.onKeepScreenOnChange} divided />
         <SettingRow title={t('settings.reopenTerminal')} copy={t('settings.reopenTerminalCopy')} value={props.reopenTerminalOnLaunch} onChange={props.onReopenTerminalOnLaunchChange} divided />
         <SettingRow title={t('settings.useModifierKeyIcons')} copy={t('settings.useModifierKeyIconsCopy')} value={props.terminalPreferences.useModifierKeyIcons} onChange={value => props.onTerminalPreferencesChange({ ...props.terminalPreferences, useModifierKeyIcons: value })} divided />
@@ -417,6 +461,7 @@ export function SettingsSection(props: SettingsSectionProps) {
         />
         {Platform.OS === 'android' ? <ChoiceRow
           title={t('settings.volumeUpKey')}
+          icon={Volume2}
           copy={t('settings.volumeKeyCopy')}
           value={t(volumeKeyActionLabelKey('up', props.terminalPreferences.volumeUpAction))}
           onPress={() => setVolumeKeyEditor('up')}
@@ -424,6 +469,7 @@ export function SettingsSection(props: SettingsSectionProps) {
         /> : null}
         {Platform.OS === 'android' ? <ChoiceRow
           title={t('settings.volumeDownKey')}
+          icon={Volume1}
           copy={t('settings.volumeKeyCopy')}
           value={t(volumeKeyActionLabelKey('down', props.terminalPreferences.volumeDownAction))}
           onPress={() => setVolumeKeyEditor('down')}
@@ -444,6 +490,7 @@ export function SettingsSection(props: SettingsSectionProps) {
         <SettingRow title={t('settings.pauseResizeInBackground')} copy={t('settings.pauseResizeInBackgroundCopy')} value={props.terminalPreferences.pauseResizeInBackground} onChange={value => props.onTerminalPreferencesChange({ ...props.terminalPreferences, pauseResizeInBackground: value })} divided />
         <SliderRow
           title={t('settings.fontSize')}
+          icon={CaseSensitive}
           value={props.terminalPreferences.fontSize}
           minimumValue={8}
           maximumValue={24}
@@ -481,8 +528,9 @@ export function SettingsSection(props: SettingsSectionProps) {
         />
       </CollapsibleSectionCard>
 
-      <CollapsibleSectionCard
+      {getBillingRolloutPolicy().developerOptionsAvailable ? <CollapsibleSectionCard
         title={t('settings.developer')}
+        icon={Code2}
         expanded={developerExpanded}
         onToggle={toggleDeveloper}>
         <SettingRow
@@ -510,7 +558,7 @@ export function SettingsSection(props: SettingsSectionProps) {
             />
           </>
         ) : null}
-      </CollapsibleSectionCard>
+      </CollapsibleSectionCard> : null}
       </View>
 
       {Platform.OS === 'android' ? <VolumeKeyActionSheet
@@ -536,10 +584,10 @@ export function SettingsSection(props: SettingsSectionProps) {
   );
 }
 
-const appearanceOptions: { labelKey: string; value: AppearancePreference }[] = [
-  { labelKey: 'settings.system', value: 'system' },
-  { labelKey: 'settings.light', value: 'light' },
-  { labelKey: 'settings.dark', value: 'dark' },
+const appearanceOptions: { labelKey: string; value: AppearancePreference; icon: LucideIcon }[] = [
+  { labelKey: 'settings.system', value: 'system', icon: Monitor },
+  { labelKey: 'settings.light', value: 'light', icon: Sun },
+  { labelKey: 'settings.dark', value: 'dark', icon: Moon },
 ];
 
 const agentAlertLevelLabelKeys: Record<AgentAlertLevel, string> = {
@@ -567,7 +615,7 @@ function AgentAlertLevelRow({
         {agentAlertLevels.map(level => {
           const selected = level === value;
           return (
-            <Button
+            <GlassButton
               accessibilityRole="radio"
               accessibilityState={{ disabled, selected }}
               className="flex-1 rounded-full"
@@ -576,7 +624,7 @@ function AgentAlertLevelRow({
               onPress={hapticPress(() => onChange(level))}
               variant={selected ? 'default' : 'outline'}>
               <Text>{t(agentAlertLevelLabelKeys[level])}</Text>
-            </Button>
+            </GlassButton>
           );
         })}
       </View>
@@ -613,7 +661,7 @@ function DeveloperMembershipRow({
         {developerMembershipStates.map(state => {
           const selected = state === value;
           return (
-            <Button
+            <GlassButton
               accessibilityRole="radio"
               accessibilityState={{ selected }}
               className="flex-1 rounded-full px-2"
@@ -621,7 +669,7 @@ function DeveloperMembershipRow({
               onPress={hapticPress(() => onChange(state))}
               variant={selected ? 'default' : 'outline'}>
               <Text className="text-xs">{t(developerMembershipLabelKeys[state])}</Text>
-            </Button>
+            </GlassButton>
           );
         })}
       </View>
@@ -641,16 +689,18 @@ function AppearanceRow({ value, onChange }: { value: AppearancePreference; onCha
         {appearanceOptions.map(option => {
           const selected = option.value === value;
           return (
-            <Button
+            <GlassButton
               key={option.value}
-              className="flex-1 rounded-full"
+              className="flex-1 gap-1.5 rounded-full px-2"
               variant={selected ? 'default' : 'outline'}
+              accessibilityLabel={t(option.labelKey)}
               accessibilityRole="radio"
               accessibilityState={{ selected }}
               onPress={hapticPress(() => onChange(option.value))}
             >
+              <Icon as={option.icon} size={16} accessible={false} />
               <Text>{t(option.labelKey)}</Text>
-            </Button>
+            </GlassButton>
           );
         })}
       </View>
@@ -665,6 +715,7 @@ const languageOptions: { labelKey: string; value: LanguagePreference }[] = [
   { labelKey: 'settings.simplifiedChinese', value: 'zh-Hans' },
   { labelKey: 'settings.japanese', value: 'ja' },
   { labelKey: 'settings.spanish', value: 'es' },
+  { labelKey: 'settings.french', value: 'fr' },
 ];
 
 function LanguageRow({ value, onChange }: { value: LanguagePreference; onChange: (value: LanguagePreference) => void }) {
@@ -763,7 +814,7 @@ function ValueRow({ title, copy, value, onDecrease, onIncrease, divided = false,
   return <View className={rowClassName}><View className="min-w-0 flex-1 pr-2">{copy ? <DetailsTitle title={title} copy={copy} /> : <Text className="text-[15px] font-semibold leading-5">{title}</Text>}</View><View className="flex-row items-center"><IconButton icon={Minus} accessibilityLabel={t('settings.decrease', { name: title })} className="size-9" disabled={disabled} onPress={onDecrease} /><Text className={disabled ? 'min-w-[64px] text-center text-xs text-muted-foreground/50' : 'min-w-[64px] text-center text-xs text-muted-foreground'}>{value}</Text><IconButton icon={Plus} accessibilityLabel={t('settings.increase', { name: title })} className="size-9" disabled={disabled} onPress={onIncrease} /></View></View>;
 }
 
-function SliderRow({ title, value, minimumValue, maximumValue, step, formatValue, onChange, fontPreview = false, divided = false, disabled = false, locked = false, onLockedPress }: { title: string; value: number; minimumValue: number; maximumValue: number; step: number; formatValue: (value: number) => string; onChange: (value: number) => void; fontPreview?: boolean; divided?: boolean; disabled?: boolean; locked?: boolean; onLockedPress?: () => unknown }) {
+function SliderRow({ title, icon, value, minimumValue, maximumValue, step, formatValue, onChange, fontPreview = false, divided = false, disabled = false, locked = false, onLockedPress }: { title: string; icon?: LucideIcon; value: number; minimumValue: number; maximumValue: number; step: number; formatValue: (value: number) => string; onChange: (value: number) => void; fontPreview?: boolean; divided?: boolean; disabled?: boolean; locked?: boolean; onLockedPress?: () => unknown }) {
   const { colors } = useTheme();
   const { t } = useTranslation();
   const formattedValue = formatValue(value);
@@ -778,6 +829,7 @@ function SliderRow({ title, value, minimumValue, maximumValue, step, formatValue
       onPress={locked ? hapticPress(() => { void onLockedPress?.(); }) : undefined}>
       <View className="flex-row items-center justify-between gap-3">
         <View className="min-w-0 flex-1 flex-row items-center gap-2">
+          {icon ? <Icon as={icon} size={20} accessible={false} /> : null}
           <Text className="min-w-0 flex-shrink text-[15px] font-semibold leading-5">{title}</Text>
           {locked ? <RancherBadge /> : null}
         </View>
@@ -847,10 +899,11 @@ function XtermCacheCapacityRow({ value, onChange }: { value: number; onChange: (
   );
 }
 
-function ChoiceRow({ title, copy, value, onPress, divided = false }: { title: string; copy: string; value: string; onPress: () => void; divided?: boolean }) {
+function ChoiceRow({ title, icon, copy, value, onPress, divided = false }: { title: string; icon?: LucideIcon; copy: string; value: string; onPress: () => void; divided?: boolean }) {
   return (
     <Button className={divided ? 'min-h-16 justify-start rounded-none border-t border-border px-3.5 py-2' : 'min-h-16 justify-start rounded-none px-3.5 py-2'} size="content" variant="ghost" onPress={hapticPress(onPress)}>
-      <View className="min-w-0 flex-1 pr-3"><DetailsTitle title={title} copy={copy} /></View>
+      {icon ? <SettingIcon icon={icon} /> : null}
+      <View className={cn('min-w-0 flex-1 pr-3', icon && 'ml-3')}><DetailsTitle title={title} copy={copy} /></View>
       <Text className="max-w-[130px] text-right text-xs font-semibold text-primary">{value}</Text>
       <Icon as={ChevronRight} className="ml-1 text-muted-foreground" size={18} />
     </Button>
@@ -919,23 +972,17 @@ function DoubleTapActionMenu({ expanded, value, onToggle, onSelect, divided = fa
               contentHeight.value = event.nativeEvent.layout.height;
               setContentMeasured(true);
             }}>
-            <View className="overflow-hidden rounded-lg border border-border bg-card">
-              {terminalDoubleTapActions.map((action, index) => {
-                const selected = action === value;
-                return (
-                  <Button
-                    key={action}
-                    accessibilityRole="radio"
-                    accessibilityState={{ selected }}
-                    className={index === 0 ? 'min-h-12 justify-start rounded-none px-3.5' : 'min-h-12 justify-start rounded-none border-t border-border px-3.5'}
-                    variant={selected ? 'secondary' : 'ghost'}
-                    onPress={hapticPress(() => onSelect(action))}>
-                    <Text className="flex-1 text-left text-sm font-medium">{t(doubleTapActionLabelKey(action))}</Text>
-                    {selected ? <Icon as={Check} className="text-primary" size={18} /> : null}
-                  </Button>
-                );
-              })}
-            </View>
+            <GlassSurface className="rounded-lg border border-white/30 dark:border-white/10">
+              {terminalDoubleTapActions.map((action, index) => (
+                <SettingsChoiceRow
+                  key={action}
+                  label={t(doubleTapActionLabelKey(action))}
+                  selected={action === value}
+                  divided={index > 0}
+                  onSelect={() => onSelect(action)}
+                />
+              ))}
+            </GlassSurface>
           </View>
         ) : null}
       </Animated.View>
@@ -952,29 +999,23 @@ function VolumeKeyActionSheet({ keyName, value, onClose, onSelect }: { keyName: 
       <SettingsDetailsProvider>
         <View className="flex-1 justify-end">
           <Pressable accessibilityLabel={t('common.close')} className="absolute inset-0 bg-black/55" onPress={onClose} />
-          <View className="rounded-t-[22px] border-t border-border bg-card px-4 pt-4" style={{ paddingBottom: Math.max(16, bottom) }}>
+          <GlassSurface className="rounded-t-[22px] border-t border-white/30 px-4 pt-4 dark:border-white/10" style={{ paddingBottom: Math.max(16, bottom) }}>
             <View className="mb-3 flex-row items-center">
               <View className="min-w-0 flex-1"><DetailsTitle title={t(direction === 'up' ? 'settings.volumeUpKey' : 'settings.volumeDownKey')} copy={t('settings.volumeKeySheetCopy')} titleClassName="text-[18px] font-semibold" /></View>
               <IconButton icon={X} accessibilityLabel={t('common.close')} onPress={onClose} />
             </View>
             <View className="overflow-hidden rounded-lg border border-border">
-              {terminalVolumeKeyActions.map((action, index) => {
-                const selected = action === value;
-                return (
-                  <Button
-                    key={action}
-                    accessibilityRole="radio"
-                    accessibilityState={{ selected }}
-                    className={index === 0 ? 'min-h-12 justify-start rounded-none px-3.5' : 'min-h-12 justify-start rounded-none border-t border-border px-3.5'}
-                    variant={selected ? 'secondary' : 'ghost'}
-                    onPress={hapticPress(() => onSelect(action))}>
-                    <Text className="flex-1 text-left text-sm font-medium">{t(volumeKeyActionLabelKey(direction, action))}</Text>
-                    {selected ? <Icon as={Check} className="text-primary" size={18} /> : null}
-                  </Button>
-                );
-              })}
+              {terminalVolumeKeyActions.map((action, index) => (
+                <SettingsChoiceRow
+                  key={action}
+                  label={t(volumeKeyActionLabelKey(direction, action))}
+                  selected={action === value}
+                  divided={index > 0}
+                  onSelect={() => onSelect(action)}
+                />
+              ))}
             </View>
-          </View>
+          </GlassSurface>
         </View>
       </SettingsDetailsProvider>
     </Modal>
@@ -1024,8 +1065,6 @@ function TerminalHistoryManager({
 
   const copyEntry = (entry: string) => {
     Clipboard.setString(entry);
-    if (Platform.OS === 'android') ToastAndroid.show(t('settings.historyEntryCopied'), ToastAndroid.SHORT);
-    else Alert.alert(t('settings.historyEntryCopied'));
   };
 
   const confirmDelete = () => {
@@ -1133,7 +1172,8 @@ function BackgroundImageRow({ busy, uri, dimming, locked, variant, onChoose, onR
   const terminal = variant === 'terminal';
   return (
     <View className={terminal ? 'border-t border-border p-3.5' : 'p-3.5'}>
-      <View className="mb-3 flex-row items-center gap-2">
+      <View className="mb-3 flex-row items-center gap-5">
+        <SettingIcon icon={ImageIcon} />
         <View className="min-w-0 flex-1"><DetailsTitle title={t('settings.backgroundImage')} copy={t(locked ? 'settings.rancherBackgroundCopy' : 'settings.backgroundImageCopy')} /></View>
         {locked ? <RancherBadge /> : null}
       </View>
@@ -1156,8 +1196,8 @@ function BackgroundImageRow({ busy, uri, dimming, locked, variant, onChoose, onR
         )}
       </View>
       <View className="mt-3 flex-row gap-2">
-        <Button accessibilityHint={locked ? t('settings.opensRancher') : undefined} className="flex-1 rounded-full" variant="secondary" disabled={busy} onPress={hapticPress(locked ? () => { void onLockedPress(); } : onChoose)}><Icon as={ImagePlus} size={16} /><Text>{locked ? t('membership.rancher') : uri ? t('settings.replaceImage') : t('settings.chooseImage')}</Text></Button>
-        {uri && !locked ? <Button className="rounded-full px-4" variant="ghost" disabled={busy} onPress={hapticPress(onRemove)}><Icon as={Trash2} className="text-destructive" size={16} /><Text className="text-destructive">{t('common.remove')}</Text></Button> : null}
+        <GlassButton accessibilityHint={locked ? t('settings.opensRancher') : undefined} className="flex-1 rounded-full" variant="secondary" disabled={busy} onPress={hapticPress(locked ? () => { void onLockedPress(); } : onChoose)}><Icon as={ImagePlus} size={16} /><Text>{locked ? t('membership.rancher') : uri ? t('settings.replaceImage') : t('settings.chooseImage')}</Text></GlassButton>
+        {uri && !locked ? <GlassButton className="rounded-full px-4" variant="ghost" disabled={busy} onPress={hapticPress(onRemove)}><Icon as={Trash2} className="text-destructive" size={16} /><Text className="text-destructive">{t('common.remove')}</Text></GlassButton> : null}
       </View>
     </View>
   );
@@ -1195,11 +1235,27 @@ export function DetailsTitle({ title, copy, titleClassName = 'text-[15px] font-s
   );
 }
 
-function SettingRow({ title, copy, value, onChange, onDetailsPress, divided = false, disabled = false, locked = false, onLockedPress }: { title: string; copy: string; value: boolean; onChange: (value: boolean) => void; onDetailsPress?: () => void; divided?: boolean; disabled?: boolean; locked?: boolean; onLockedPress?: () => unknown }) {
+function SettingRow({ title, icon, copy, value, onChange, onDetailsPress, divided = false, disabled = false, locked = false, onLockedPress }: { title: string; icon?: LucideIcon; copy: string; value: boolean; onChange: (value: boolean) => void; onDetailsPress?: () => void; divided?: boolean; disabled?: boolean; locked?: boolean; onLockedPress?: () => unknown }) {
+  const label = (
+    <View className={cn('min-w-0 flex-1 flex-row items-center gap-5', locked ? 'pr-3' : 'pr-[18px]')}>
+      {icon ? <SettingIcon icon={icon} /> : null}
+      <View className="min-w-0 flex-1">
+        <DetailsTitle title={title} copy={copy} onDetailsPress={onDetailsPress} />
+      </View>
+    </View>
+  );
   if (locked) {
-    return <Button accessibilityHint={copy} accessibilityLabel={`${title}, Rancher`} className={divided ? 'min-h-16 justify-start rounded-none border-t border-border px-3.5 py-2' : 'min-h-16 justify-start rounded-none px-3.5 py-2'} size="content" variant="ghost" onPress={hapticPress(() => { void onLockedPress?.(); })}><View className="min-w-0 flex-1 pr-3"><DetailsTitle title={title} copy={copy} onDetailsPress={onDetailsPress} /></View><RancherBadge /><Icon as={ChevronRight} className="ml-1 text-muted-foreground" size={18} /></Button>;
+    return <Button accessibilityHint={copy} accessibilityLabel={`${title}, Rancher`} className={divided ? 'min-h-16 justify-start rounded-none border-t border-border px-3.5 py-2' : 'min-h-16 justify-start rounded-none px-3.5 py-2'} size="content" variant="ghost" onPress={hapticPress(() => { void onLockedPress?.(); })}>{label}<RancherBadge /><Icon as={ChevronRight} className="ml-1 text-muted-foreground" size={18} /></Button>;
   }
-  return <View className={divided ? 'min-h-16 flex-row items-center border-t border-border px-3.5 py-2' : 'min-h-16 flex-row items-center px-3.5 py-2'}><View className="flex-1 pr-[18px]"><DetailsTitle title={title} copy={copy} onDetailsPress={onDetailsPress} /></View><Switch checked={value} disabled={disabled} onCheckedChange={onChange} /></View>;
+  return <View className={divided ? 'min-h-16 flex-row items-center border-t border-border px-3.5 py-2' : 'min-h-16 flex-row items-center px-3.5 py-2'}>{label}<Switch checked={value} disabled={disabled} onCheckedChange={onChange} /></View>;
+}
+
+function SettingIcon({ icon }: { icon: LucideIcon }) {
+  return (
+    <GlassIconBadge className="bg-primary/10">
+      <Icon as={icon} className="text-primary" size={18} />
+    </GlassIconBadge>
+  );
 }
 
 function RancherBadge() {
@@ -1210,7 +1266,7 @@ function RancherBadge() {
 function ActionRow({ title, copy, icon, value, onPress, divided = false, disabled = false }: { title: string; copy: string; icon: LucideIcon; value?: string; onPress: () => void | Promise<void>; divided?: boolean; disabled?: boolean }) {
   return (
     <Button className={divided ? 'min-h-16 justify-start rounded-none border-t border-border px-3.5 py-2' : 'min-h-16 justify-start rounded-none px-3.5 py-2'} disabled={disabled} size="content" variant="ghost" onPress={hapticPress(onPress)}>
-      <View className="size-10 items-center justify-center rounded-full bg-primary/10"><Icon as={icon} className="text-primary" size={18} /></View>
+      <SettingIcon icon={icon} />
       <View className="ml-3 min-w-0 flex-1"><DetailsTitle title={title} copy={copy} /></View>
       {value ? <Text className="max-w-[90px] text-right text-xs font-semibold text-primary">{value}</Text> : null}
       <Icon as={ChevronRight} className="text-muted-foreground" size={18} />

@@ -2,6 +2,7 @@ import {
   formatRemoteFileSize,
   isRemoteHiddenPath,
   joinRemotePath,
+  MAX_REMOTE_TEXT_PREVIEW_BYTES,
   nextRemoteFileSort,
   normalizeRemotePath,
   parentRemotePath,
@@ -109,6 +110,25 @@ describe('remote file paths', () => {
 });
 
 describe('remote file previews', () => {
+  it.each(['notes', 'notes.txt', 'server.log', 'source.rs', 'README.md'])(
+    'pages large text files: %s', filename => {
+      expect(remotePreviewKind(filename, 10 * 1024 * 1024)).toBe('paged-text');
+    },
+  );
+
+  it.each(['notes', '/repo/notes', '.gitignore', 'LICENSE', '資料'])('offers a text preview for extensionless %s', filename => {
+    expect(remotePreviewKind(filename, 0)).toBe('text');
+    expect(remotePreviewKind(filename, MAX_REMOTE_TEXT_PREVIEW_BYTES)).toBe('text');
+    expect(remotePreviewKind(filename, MAX_REMOTE_TEXT_PREVIEW_BYTES + 1)).toBe('paged-text');
+    expect(remotePreviewKind(filename, undefined)).toBe('unsupported');
+  });
+
+  it('keeps extensionless code filenames specialized and unknown extensions unsupported', () => {
+    expect(remotePreviewKind('Dockerfile', 1000)).toBe('code');
+    expect(remotePreviewKind('Makefile', 1000)).toBe('code');
+    expect(remotePreviewKind('notes.custom', 1000)).toBe('unsupported');
+  });
+
   it('selects the production preview for supported file types and sizes', () => {
     expect(remotePreviewKind('README.md', 1000)).toBe('markdown');
     expect(remotePreviewKind('index.html', 1000)).toBe('html');

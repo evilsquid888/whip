@@ -3,6 +3,11 @@ export interface VisualContentInsets {
   bottom: number;
 }
 
+export interface TerminalSessionChromeLayout {
+  bottom: number;
+  visible: boolean;
+}
+
 export interface TerminalViewportLayout {
   floatingKeyboardInset: number;
   terminalTranslateY: number;
@@ -10,10 +15,19 @@ export interface TerminalViewportLayout {
   terminalInsets: VisualContentInsets;
 }
 
+export const BOTTOM_NAVIGATION_BASE_HEIGHT = 120;
+export const BOTTOM_NAVIGATION_BOTTOM_OFFSET = 16;
 export const TERMINAL_CONTROL_BAR_BASE_HEIGHT = 50;
 export const SESSION_TAB_BAR_HEIGHT = 55;
 export const SESSION_PANE_BAR_HEIGHT = 44;
 export const TERMINAL_FLOATING_ACTION_GAP = 12;
+export const TERMINAL_CURSOR_CLEARANCE = 8;
+export const LATEST_BUTTON_CLASS_NAME = 'absolute self-center rounded-full border';
+export const LATEST_BUTTON_ICON_SIZE = 28;
+
+export function bottomNavigationInset(bottomSafeAreaInset: number): number {
+  return BOTTOM_NAVIGATION_BOTTOM_OFFSET + BOTTOM_NAVIGATION_BASE_HEIGHT + bottomSafeAreaInset;
+}
 
 export function terminalSessionChromeHeight(paneCount: number): number {
   return SESSION_TAB_BAR_HEIGHT + (paneCount > 1 ? SESSION_PANE_BAR_HEIGHT : 0);
@@ -53,14 +67,11 @@ export function terminalBottomChromeClearance({
 }
 
 export function shouldShowTerminalSessionChrome({
-  composerVisible,
   keyboardVisible,
 }: {
-  composerVisible: boolean;
-  keyboardEnabled: boolean;
   keyboardVisible: boolean;
 }): boolean {
-  return composerVisible || !keyboardVisible;
+  return !keyboardVisible;
 }
 
 export function visualContentInsets(
@@ -139,20 +150,33 @@ export function terminalViewportLayout({
   composerHeight,
   composerVisible,
   controlBarHeight,
+  cursorBottom,
   keyboardInset,
   topInset,
+  viewportHeight,
 }: {
   composerExpanded: boolean;
   composerHeight: number;
   composerVisible: boolean;
   controlBarHeight: number;
+  cursorBottom?: number | null;
   keyboardInset: number;
   topInset: number;
+  viewportHeight?: number;
 }): TerminalViewportLayout {
   const floatingKeyboardInset = Math.max(0, keyboardInset);
-  const terminalTranslateY = !composerVisible && floatingKeyboardInset > 0
-    ? -floatingKeyboardInset
+  const occludedBottom = floatingKeyboardInset + Math.max(0, controlBarHeight);
+  const cursorShift = !composerVisible
+    && floatingKeyboardInset > 0
+    && typeof cursorBottom === 'number' && Number.isFinite(cursorBottom)
+    && typeof viewportHeight === 'number' && viewportHeight > 0
+    && Number.isFinite(viewportHeight)
+    ? Math.min(occludedBottom, Math.max(0,
+      cursorBottom + TERMINAL_CURSOR_CLEARANCE
+        - (viewportHeight - occludedBottom),
+    ))
     : 0;
+  const terminalTranslateY = cursorShift > 0 ? -cursorShift : 0;
   const terminalBottom = terminalBottomChromeInset({
     composerHeight,
     composerVisible: false,

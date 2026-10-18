@@ -1,6 +1,7 @@
 //! Authoritative connected-host Herdr domain state.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::herdr_api::{
@@ -43,6 +44,7 @@ pub struct HostStateSnapshot {
     pub last_synced_at_ms: Option<u64>,
     pub last_event_at_ms: Option<u64>,
     pub needs_resync: bool,
+    pub offline_cache_blob: Option<String>,
     pub focus: HostServerFocus,
     pub snapshot: Option<HerdrSessionSnapshot>,
 }
@@ -62,9 +64,27 @@ pub(crate) struct SnapshotToken {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct PaneScrollToken {
+    pub(crate) pane_id: String,
+    terminal_id: String,
+    connection_generation: u64,
+    sync_generation: u64,
+    scroll_revision: u64,
+}
+
+#[derive(Clone, Debug)]
 struct ActiveSync {
     token: SnapshotToken,
     buffered_events: Vec<HerdrEvent>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct AgentSessionReadToken {
+    pane_id: String,
+    terminal_id: String,
+    connection_generation: u64,
+    sync_generation: u64,
+    revision: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -88,16 +108,20 @@ pub(crate) struct HostState {
     sync_generation: u64,
     sync_status: HostSyncStatus,
     freshness: HostFreshness,
+    // Readiness belongs to the current connection, not each snapshot refresh.
+    connection_ready: bool,
     error: Option<String>,
     last_synced_at_ms: Option<u64>,
     last_event_at_ms: Option<u64>,
     needs_resync: bool,
     resync_running: bool,
     snapshot: Option<HerdrSessionSnapshot>,
+    offline_cache_blob: OnceLock<Option<String>>,
     active_sync: Option<ActiveSync>,
     locally_closed_pane_ids: HashSet<String>,
     agent_statuses: HashMap<String, HerdrAgentStatus>,
     pending_agent_transitions: Vec<AgentStatusTransition>,
+    pane_scroll_revisions: HashMap<String, u64>,
 }
 
 impl Default for HostState {
@@ -108,21 +132,28 @@ impl Default for HostState {
             sync_generation: 0,
             sync_status: HostSyncStatus::Idle,
             freshness: HostFreshness::Loading,
+            connection_ready: false,
             error: None,
             last_synced_at_ms: None,
             last_event_at_ms: None,
             needs_resync: false,
             resync_running: false,
             snapshot: None,
+            offline_cache_blob: OnceLock::new(),
             active_sync: None,
             locally_closed_pane_ids: HashSet::new(),
             agent_statuses: HashMap::new(),
             pending_agent_transitions: Vec::new(),
+            pane_scroll_revisions: HashMap::new(),
         }
     }
 }
 
 impl HostState {
+    pub(crate) fn is_connection_ready(&self) -> bool {
+        self.connection_ready
+    }
+
     pub(crate) fn projection(&self) -> HostStateSnapshot {
         let focus = self.snapshot.as_ref().map_or(
             HostServerFocus {
@@ -146,6 +177,18 @@ impl HostState {
             last_synced_at_ms: self.last_synced_at_ms,
             last_event_at_ms: self.last_event_at_ms,
             needs_resync: self.needs_resync,
+            offline_cache_blob: self
+                .offline_cache_blob
+                .get_or_init(|| {
+                    if self.freshness != HostFreshness::Fresh {
+                        return None;
+                    }
+                    crate::app_core::offline::encode(
+                        self.snapshot.as_ref()?,
+                        self.last_synced_at_ms.max(self.last_event_at_ms)?,
+                    )
+                })
+                .clone(),
             focus,
             snapshot: self.snapshot.clone(),
         }
@@ -160,9 +203,71 @@ impl HostState {
             .map(|pane| pane.terminal_id.clone())
     }
 
+    pub(crate) fn begin_agent_session_read(
+        &self,
+        terminal_id: &str,
+    ) -> Option<AgentSessionReadToken> {
+        if self.sync_status != HostSyncStatus::Synced || self.freshness != HostFreshness::Fresh {
+            return None;
+        }
+        let pane = self.snapshot.as_ref()?.panes.iter().find(|pane| {
+            pane.terminal_id == terminal_id && !self.locally_closed_pane_ids.contains(&pane.pane_id)
+        })?;
+        Some(AgentSessionReadToken {
+            pane_id: pane.pane_id.clone(),
+            terminal_id: pane.terminal_id.clone(),
+            connection_generation: self.connection_generation,
+            sync_generation: self.sync_generation,
+            revision: self.revision,
+        })
+    }
+
+    /// Herdr can replace a session without emitting pane.updated.
+    /// Refresh only identity; the read must not rewind status, scroll, or focus.
+    pub(crate) fn complete_agent_session_read(
+        &mut self,
+        token: AgentSessionReadToken,
+        pane: &HerdrPaneInfo,
+    ) -> bool {
+        if self.sync_status != HostSyncStatus::Synced
+            || self.freshness != HostFreshness::Fresh
+            || token.connection_generation != self.connection_generation
+            || token.sync_generation != self.sync_generation
+            || token.revision != self.revision
+            || pane.pane_id != token.pane_id
+            || pane.terminal_id != token.terminal_id
+        {
+            return false;
+        }
+        let Some(snapshot) = self.snapshot.as_mut() else {
+            return false;
+        };
+        let Some(current) = snapshot.panes.iter_mut().find(|current| {
+            current.pane_id == token.pane_id
+                && current.terminal_id == token.terminal_id
+                && current.workspace_id == pane.workspace_id
+                && current.tab_id == pane.tab_id
+        }) else {
+            return false;
+        };
+        if current.agent_session == pane.agent_session {
+            return false;
+        }
+        current.agent_session.clone_from(&pane.agent_session);
+        for agent in &mut snapshot.agents {
+            if agent.pane_id == token.pane_id {
+                agent.agent_session.clone_from(&pane.agent_session);
+            }
+        }
+        self.bump_revision();
+        true
+    }
+
     pub(crate) fn connection_installed(&mut self, generation: u64) {
         self.connection_generation = generation;
+        self.connection_ready = false;
         self.active_sync = None;
+        self.pane_scroll_revisions.clear();
         self.resync_running = false;
         self.needs_resync = true;
         self.error = None;
@@ -175,6 +280,7 @@ impl HostState {
     }
 
     pub(crate) fn mark_reconnecting(&mut self, reason: String) {
+        self.connection_ready = false;
         self.active_sync = None;
         self.resync_running = false;
         self.needs_resync = true;
@@ -188,6 +294,7 @@ impl HostState {
     }
 
     pub(crate) fn mark_disconnected(&mut self) {
+        self.connection_ready = false;
         self.active_sync = None;
         self.resync_running = false;
         self.needs_resync = false;
@@ -234,6 +341,12 @@ impl HostState {
             return self.fail_sync(token, reason);
         }
         normalize_snapshot(&mut snapshot);
+        // A full snapshot is the authoritative status baseline. Events received
+        // while it was in flight were also projected onto the old snapshot for
+        // the UI, but only their replay against this baseline can establish a
+        // live status transition.
+        self.agent_statuses = agent_statuses_from_snapshot(&snapshot);
+        self.bump_revision();
         let mut replay_error = None;
         for event in active.buffered_events {
             if let HerdrEvent::PaneClosed { pane_id, .. } = &event {
@@ -243,11 +356,15 @@ impl HostState {
             }
             if let Err(reason) = apply_event_transactional(&mut snapshot, &event) {
                 replay_error.get_or_insert(reason);
+            } else {
+                self.capture_agent_status_transitions(agent_statuses_from_snapshot(&snapshot));
             }
         }
         self.locally_closed_pane_ids.clear();
         self.snapshot = Some(snapshot);
+        self.pane_scroll_revisions.clear();
         self.sync_status = HostSyncStatus::Synced;
+        self.connection_ready |= replay_error.is_none();
         self.last_synced_at_ms = Some(now_ms);
         self.error.clone_from(&replay_error);
         self.needs_resync = replay_error.is_some();
@@ -257,7 +374,6 @@ impl HostState {
         } else {
             HostFreshness::Fresh
         };
-        self.bump_revision();
         replay_error.map_or(ApplyResult::Applied, ApplyResult::NeedsResync)
     }
 
@@ -276,6 +392,9 @@ impl HostState {
         }
         self.active_sync = None;
         self.sync_status = HostSyncStatus::Error;
+        // A connected host without Herdr must still offer server startup and
+        // SSH shell actions. A cached snapshot cannot initialize a new connection.
+        self.connection_ready |= self.snapshot.is_none();
         self.error = Some(reason.clone());
         self.needs_resync = true;
         self.resync_running = false;
@@ -302,6 +421,28 @@ impl HostState {
         } else if event_references_closed_pane(&event, &self.locally_closed_pane_ids) {
             return ApplyResult::IgnoredStale;
         }
+        if let HerdrEvent::PaneScrollChanged {
+            workspace_id,
+            pane_id,
+            scroll,
+        } = &event
+            && let Some(pane) = self.snapshot.as_mut().and_then(|snapshot| {
+                snapshot
+                    .panes
+                    .iter_mut()
+                    .find(|pane| pane.pane_id == *pane_id && pane.workspace_id == *workspace_id)
+            })
+        {
+            pane.scroll = Some(scroll.clone());
+            let pane_id = pane_id.clone();
+            if let Some(active) = self.active_sync.as_mut() {
+                active.buffered_events.push(event);
+            }
+            self.last_event_at_ms = Some(now_ms);
+            self.bump_revision();
+            self.pane_scroll_revisions.insert(pane_id, self.revision);
+            return ApplyResult::Applied;
+        }
         if let HerdrEvent::PaneOutputChanged { pane_id, .. } = &event {
             let pane_exists = self
                 .snapshot
@@ -327,6 +468,14 @@ impl HostState {
         if let Some(active) = self.active_sync.as_mut() {
             active.buffered_events.push(event.clone());
         }
+        let scroll_pane_id = match &event {
+            HerdrEvent::PaneScrollChanged { pane_id, .. } => Some(pane_id.clone()),
+            HerdrEvent::PaneCreated { pane } | HerdrEvent::PaneUpdated { pane } => {
+                Some(pane.pane_id.clone())
+            }
+            HerdrEvent::PaneMoved { pane, .. } => Some(pane.pane_id.clone()),
+            _ => None,
+        };
         self.last_event_at_ms = Some(now_ms);
         let result = match self.snapshot.as_mut() {
             Some(snapshot) => match apply_event_transactional(snapshot, &event) {
@@ -354,8 +503,78 @@ impl HostState {
             }
             ApplyResult::IgnoredStale => {}
         }
-        self.bump_revision();
+        if self.active_sync.is_some() {
+            self.bump_revision();
+        } else {
+            self.bump_revision_with_agent_transitions();
+        }
+        if matches!(result, ApplyResult::Applied)
+            && let Some(pane_id) = scroll_pane_id
+        {
+            self.pane_scroll_revisions.insert(pane_id, self.revision);
+        }
         result
+    }
+
+    pub(crate) fn begin_pane_scroll_read(&self, terminal_id: &str) -> Option<PaneScrollToken> {
+        if self.active_sync.is_some() {
+            return None;
+        }
+        let pane = self.snapshot.as_ref()?.panes.iter().find(|pane| {
+            pane.terminal_id == terminal_id && !self.locally_closed_pane_ids.contains(&pane.pane_id)
+        })?;
+        Some(PaneScrollToken {
+            pane_id: pane.pane_id.clone(),
+            terminal_id: pane.terminal_id.clone(),
+            connection_generation: self.connection_generation,
+            sync_generation: self.sync_generation,
+            scroll_revision: self
+                .pane_scroll_revisions
+                .get(&pane.pane_id)
+                .copied()
+                .unwrap_or(0),
+        })
+    }
+
+    /// A pane.get read seeds scroll metadata only. Never replace newer events,
+    /// agent status, focus, or topology with the rest of its response.
+    pub(crate) fn complete_pane_scroll_read(
+        &mut self,
+        token: PaneScrollToken,
+        pane: &HerdrPaneInfo,
+    ) -> bool {
+        if self.active_sync.is_some()
+            || token.connection_generation != self.connection_generation
+            || token.sync_generation != self.sync_generation
+            || pane.pane_id != token.pane_id
+            || pane.terminal_id != token.terminal_id
+            || self
+                .pane_scroll_revisions
+                .get(&token.pane_id)
+                .copied()
+                .unwrap_or(0)
+                != token.scroll_revision
+        {
+            return false;
+        }
+        let Some(current) = self.snapshot.as_mut().and_then(|snapshot| {
+            snapshot.panes.iter_mut().find(|current| {
+                current.pane_id == token.pane_id
+                    && current.terminal_id == token.terminal_id
+                    && current.workspace_id == pane.workspace_id
+                    && current.tab_id == pane.tab_id
+            })
+        }) else {
+            return false;
+        };
+        if current.scroll == pane.scroll {
+            return false;
+        }
+        current.scroll.clone_from(&pane.scroll);
+        self.bump_revision();
+        self.pane_scroll_revisions
+            .insert(token.pane_id, self.revision);
+        true
     }
 
     pub(crate) fn apply_control_result(
@@ -386,14 +605,14 @@ impl HostState {
                 }
                 Ok(projection)
             });
-        match applied {
+        let outcome = match applied {
             Ok(ControlProjection::Applied) => {
                 normalize_snapshot(&mut candidate);
                 *snapshot = candidate;
                 if let Some(pane_id) = locally_closed_pane_id {
                     self.locally_closed_pane_ids.insert(pane_id);
                 }
-                self.bump_revision();
+                self.bump_revision_with_agent_transitions();
                 ApplyResult::Applied
             }
             Ok(ControlProjection::AppliedNeedsResync(reason)) => {
@@ -402,7 +621,7 @@ impl HostState {
                 self.needs_resync = true;
                 self.error = Some(reason.clone());
                 self.freshness = HostFreshness::Stale;
-                self.bump_revision();
+                self.bump_revision_with_agent_transitions();
                 ApplyResult::NeedsResync(reason)
             }
             Ok(ControlProjection::Unchanged) => ApplyResult::Applied,
@@ -413,7 +632,15 @@ impl HostState {
                 self.bump_revision();
                 ApplyResult::NeedsResync(reason)
             }
+        };
+        if matches!(outcome, ApplyResult::Applied | ApplyResult::NeedsResync(_))
+            && !matches!(request, HerdrControlRequest::PaneGet { .. })
+            && let HerdrControlResult::PaneInfo { pane } = result
+        {
+            self.pane_scroll_revisions
+                .insert(pane.pane_id.clone(), self.revision);
         }
+        outcome
     }
 
     pub(crate) fn mark_needs_resync(&mut self, reason: String) {
@@ -470,23 +697,23 @@ impl HostState {
         self.resync_running
     }
 
-    fn bump_revision(&mut self) {
-        self.revision = self.revision.saturating_add(1);
-        self.capture_agent_status_transitions();
+    pub(crate) fn agent_view_changed(&mut self) {
+        self.bump_revision();
     }
 
-    fn capture_agent_status_transitions(&mut self) {
-        let Some(snapshot) = self.snapshot.as_ref() else {
-            return;
-        };
-        let mut current = snapshot
-            .panes
-            .iter()
-            .map(|pane| (pane.pane_id.clone(), pane.agent_status))
-            .collect::<HashMap<_, _>>();
-        for agent in &snapshot.agents {
-            current.insert(agent.pane_id.clone(), agent.agent_status);
+    fn bump_revision(&mut self) {
+        self.revision = self.revision.saturating_add(1);
+        self.offline_cache_blob.take();
+    }
+
+    fn bump_revision_with_agent_transitions(&mut self) {
+        self.bump_revision();
+        if let Some(snapshot) = self.snapshot.as_ref() {
+            self.capture_agent_status_transitions(agent_statuses_from_snapshot(snapshot));
         }
+    }
+
+    fn capture_agent_status_transitions(&mut self, current: HashMap<String, HerdrAgentStatus>) {
         let mut pane_ids = self
             .agent_statuses
             .keys()
@@ -524,6 +751,20 @@ impl HostState {
     }
 }
 
+fn agent_statuses_from_snapshot(
+    snapshot: &HerdrSessionSnapshot,
+) -> HashMap<String, HerdrAgentStatus> {
+    let mut statuses = snapshot
+        .panes
+        .iter()
+        .map(|pane| (pane.pane_id.clone(), pane.agent_status))
+        .collect::<HashMap<_, _>>();
+    for agent in &snapshot.agents {
+        statuses.insert(agent.pane_id.clone(), agent.agent_status);
+    }
+    statuses
+}
+
 pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -532,7 +773,7 @@ pub(crate) fn now_ms() -> u64 {
         })
 }
 
-fn validate_snapshot(snapshot: &HerdrSessionSnapshot) -> Result<(), String> {
+pub(crate) fn validate_snapshot(snapshot: &HerdrSessionSnapshot) -> Result<(), String> {
     let workspace_ids = snapshot
         .workspaces
         .iter()
@@ -589,17 +830,7 @@ fn validate_snapshot(snapshot: &HerdrSessionSnapshot) -> Result<(), String> {
     Ok(())
 }
 
-fn status_priority(status: HerdrAgentStatus) -> u8 {
-    match status {
-        HerdrAgentStatus::Blocked => 5,
-        HerdrAgentStatus::Done => 4,
-        HerdrAgentStatus::Working => 3,
-        HerdrAgentStatus::Idle => 2,
-        HerdrAgentStatus::Unknown => 1,
-    }
-}
-
-fn normalize_snapshot(snapshot: &mut HerdrSessionSnapshot) {
+pub(crate) fn normalize_snapshot(snapshot: &mut HerdrSessionSnapshot) {
     for agent in &mut snapshot.agents {
         let Some(pane) = snapshot
             .panes
@@ -631,7 +862,7 @@ fn normalize_snapshot(snapshot: &mut HerdrSessionSnapshot) {
             .entry(pane.tab_id.as_str())
             .or_insert((0, HerdrAgentStatus::Unknown));
         *count += 1;
-        if status_priority(pane.agent_status) > status_priority(*status) {
+        if pane.agent_status.priority() < status.priority() {
             *status = pane.agent_status;
         }
         *panes_by_workspace
@@ -653,7 +884,7 @@ fn normalize_snapshot(snapshot: &mut HerdrSessionSnapshot) {
             .entry(tab.workspace_id.as_str())
             .or_insert((0, HerdrAgentStatus::Unknown));
         *count += 1;
-        if status_priority(tab.agent_status) > status_priority(*status) {
+        if tab.agent_status.priority() < status.priority() {
             *status = tab.agent_status;
         }
     }
@@ -1059,6 +1290,7 @@ fn event_references_closed_pane(event: &HerdrEvent, closed_pane_ids: &HashSet<St
         HerdrEvent::PaneFocused { pane_id, .. }
         | HerdrEvent::PaneExited { pane_id, .. }
         | HerdrEvent::PaneOutputChanged { pane_id, .. }
+        | HerdrEvent::PaneScrollChanged { pane_id, .. }
         | HerdrEvent::PaneAgentDetected { pane_id, .. }
         | HerdrEvent::PaneAgentStatusChanged { pane_id, .. } => is_closed(pane_id),
         HerdrEvent::PaneMoved {
@@ -1237,6 +1469,18 @@ fn apply_event_to_snapshot(
                 return Err(format!("pane output references unknown pane {pane_id}"));
             }
         }
+        HerdrEvent::PaneScrollChanged {
+            workspace_id,
+            pane_id,
+            scroll,
+        } => {
+            let pane = snapshot
+                .panes
+                .iter_mut()
+                .find(|pane| pane.pane_id == *pane_id && pane.workspace_id == *workspace_id)
+                .ok_or_else(|| format!("pane scroll references unknown pane {pane_id}"))?;
+            pane.scroll = Some(scroll.clone());
+        }
         HerdrEvent::PaneAgentDetected {
             pane_id,
             agent,
@@ -1350,6 +1594,9 @@ fn apply_control_to_snapshot(
             Ok(ControlProjection::Applied)
         }
         HerdrControlResult::PaneInfo { pane } => {
+            if matches!(request, HerdrControlRequest::PaneGet { .. }) {
+                return Ok(ControlProjection::Unchanged);
+            }
             upsert_pane(snapshot, pane.clone())?;
             if matches!(
                 request,
@@ -1399,6 +1646,7 @@ fn apply_control_to_snapshot(
         HerdrControlResult::Pong { .. }
         | HerdrControlResult::SessionSnapshot { .. }
         | HerdrControlResult::IntegrationInstalled { .. }
+        | HerdrControlResult::IntegrationList { .. }
         | HerdrControlResult::PaneRead { .. } => Ok(ControlProjection::Unchanged),
     }
 }
@@ -1545,6 +1793,15 @@ mod tests {
         }
     }
 
+    fn snapshot_with_agent_status(status: HerdrAgentStatus) -> HerdrSessionSnapshot {
+        let mut value = snapshot();
+        value.panes[0].agent_status = status;
+        let mut agent = agent("p1", HerdrAgentKind::Codex, "thread");
+        agent.agent_status = status;
+        value.agents.push(agent);
+        value
+    }
+
     fn synced_state() -> HostState {
         let mut state = HostState::default();
         state.connection_installed(1);
@@ -1566,6 +1823,247 @@ mod tests {
             display_agent: None,
             state_labels: None,
         }
+    }
+
+    #[test]
+    fn offline_cache_is_only_emitted_for_fresh_metadata_and_tracks_native_updates() {
+        assert!(
+            HostState::default()
+                .projection()
+                .offline_cache_blob
+                .is_none()
+        );
+        let mut state = synced_state();
+        let synced_blob = state.projection().offline_cache_blob.unwrap();
+        let cached = crate::app_core::offline::decode(&synced_blob).unwrap();
+        assert_eq!(cached.snapshot, state.snapshot);
+        assert_eq!(cached.last_synced_at_ms, Some(10));
+
+        state.apply_event(1, status_event(HerdrAgentStatus::Working), 20);
+        let updated_blob = state.projection().offline_cache_blob.unwrap();
+        let cached = crate::app_core::offline::decode(&updated_blob).unwrap();
+        assert_ne!(updated_blob, synced_blob);
+        assert_eq!(cached.snapshot, state.snapshot);
+        assert_eq!(cached.last_synced_at_ms, Some(20));
+
+        state.mark_reconnecting("offline".to_owned());
+        assert!(state.projection().offline_cache_blob.is_none());
+        state.mark_disconnected();
+        assert!(state.projection().offline_cache_blob.is_none());
+    }
+
+    #[test]
+    fn offline_cache_preserves_agent_identity_workspace_metadata_and_layouts() {
+        let mut snapshot = snapshot_with_agent_status(HerdrAgentStatus::Working);
+        snapshot.layouts.push(layout("w1", "t1", "p1"));
+        snapshot.panes[0].scroll = Some(scroll_info(3.0));
+        snapshot.workspaces[0].tokens = Some(HashMap::from([("branch".into(), "main".into())]));
+        snapshot.workspaces[0].worktree = Some(HerdrWorkspaceWorktreeInfo {
+            repo_key: "repo".into(),
+            repo_name: "Repo".into(),
+            repo_root: "/repo".into(),
+            checkout_path: "/repo/worktree".into(),
+            is_linked_worktree: true,
+        });
+        let mut state = HostState::default();
+        state.connection_installed(1);
+        let token = state.begin_sync(1);
+        assert_eq!(
+            state.complete_sync(token, snapshot, 10),
+            ApplyResult::Applied
+        );
+
+        let cached =
+            crate::app_core::offline::decode(&state.projection().offline_cache_blob.unwrap())
+                .unwrap();
+        assert_eq!(cached.snapshot, state.snapshot);
+        let snapshot = cached.snapshot.unwrap();
+        assert_eq!(
+            snapshot.agents[0].agent_session,
+            snapshot.panes[0].agent_session
+        );
+        assert!(snapshot.panes[0].agent_session.is_some());
+        assert_eq!(snapshot.layouts.len(), 1);
+    }
+
+    fn scroll_info(offset: f64) -> crate::herdr_api::HerdrPaneScrollInfo {
+        crate::herdr_api::HerdrPaneScrollInfo {
+            offset_from_bottom: offset,
+            max_offset_from_bottom: 100.0,
+            viewport_rows: 30.0,
+        }
+    }
+
+    fn scroll_event(offset: f64) -> HerdrEvent {
+        HerdrEvent::PaneScrollChanged {
+            workspace_id: "w1".to_owned(),
+            pane_id: "p1".to_owned(),
+            scroll: scroll_info(offset),
+        }
+    }
+
+    #[test]
+    fn scroll_events_update_only_the_pane_and_preserve_readiness() {
+        let mut state = synced_state();
+        let mut expected = state.snapshot.clone().unwrap();
+        expected.panes[0].scroll = Some(scroll_info(3.0));
+        assert_eq!(
+            state.apply_event(1, scroll_event(3.0), 11),
+            ApplyResult::Applied
+        );
+        assert_eq!(state.snapshot, Some(expected));
+        assert_eq!(state.freshness, HostFreshness::Fresh);
+        assert_eq!(state.sync_status, HostSyncStatus::Synced);
+        assert!(!state.needs_resync);
+        assert!(state.take_agent_status_transitions().is_empty());
+
+        state.mark_needs_resync("event delivery gap".to_owned());
+        state.apply_event(1, scroll_event(4.0), 12);
+        assert_eq!(state.freshness, HostFreshness::Stale);
+        assert!(state.needs_resync);
+    }
+
+    #[test]
+    fn scroll_events_replay_over_an_in_flight_host_snapshot() {
+        let mut state = synced_state();
+        let token = state.begin_sync(1);
+        state.apply_event(1, scroll_event(3.0), 11);
+        assert_eq!(
+            state.complete_sync(token, snapshot(), 12),
+            ApplyResult::Applied
+        );
+        assert_eq!(
+            state.snapshot.unwrap().panes[0].scroll,
+            Some(scroll_info(3.0))
+        );
+    }
+
+    #[test]
+    fn pane_get_seeds_only_scroll_without_replacing_newer_agent_status() {
+        let mut state = synced_state();
+        let token = state.begin_pane_scroll_read("term-p1").unwrap();
+        let mut response = state.snapshot.as_ref().unwrap().panes[0].clone();
+        response.scroll = Some(scroll_info(3.0));
+        response.focused = false;
+        state.apply_event(1, status_event(HerdrAgentStatus::Working), 11);
+        state.take_agent_status_transitions();
+        let mut expected = state.snapshot.clone().unwrap();
+        expected.panes[0].scroll = response.scroll.clone();
+        assert!(state.complete_pane_scroll_read(token, &response));
+        assert_eq!(state.snapshot, Some(expected));
+        assert_eq!(state.freshness, HostFreshness::Fresh);
+        assert_eq!(state.sync_status, HostSyncStatus::Synced);
+        assert!(!state.needs_resync);
+        assert!(state.take_agent_status_transitions().is_empty());
+    }
+
+    #[test]
+    fn late_pane_get_cannot_overwrite_scroll_events_or_replacement_snapshots() {
+        let mut state = synced_state();
+        let token = state.begin_pane_scroll_read("term-p1").unwrap();
+        let mut response = state.snapshot.as_ref().unwrap().panes[0].clone();
+        response.scroll = Some(scroll_info(3.0));
+        state.apply_event(1, scroll_event(8.0), 11);
+        assert!(!state.complete_pane_scroll_read(token, &response));
+        assert_eq!(
+            state.snapshot.as_ref().unwrap().panes[0].scroll,
+            Some(scroll_info(8.0))
+        );
+
+        let token = state.begin_pane_scroll_read("term-p1").unwrap();
+        let sync = state.begin_sync(1);
+        state.complete_sync(sync, snapshot(), 12);
+        assert!(!state.complete_pane_scroll_read(token, &response));
+
+        let token = state.begin_pane_scroll_read("term-p1").unwrap();
+        let mut focused = response.clone();
+        focused.scroll = Some(scroll_info(8.0));
+        state.apply_control_result(
+            1,
+            &HerdrControlRequest::PaneFocus {
+                pane_id: "p1".to_owned(),
+            },
+            &HerdrControlResult::PaneInfo { pane: focused },
+        );
+        assert!(!state.complete_pane_scroll_read(token, &response));
+
+        let token = state.begin_pane_scroll_read("term-p1").unwrap();
+        state.mark_reconnecting("SSH lost".to_owned());
+        state.connection_installed(2);
+        assert!(!state.complete_pane_scroll_read(token, &response));
+    }
+
+    #[test]
+    fn initial_snapshots_establish_blocked_and_done_baselines_without_transitions() {
+        for status in [HerdrAgentStatus::Blocked, HerdrAgentStatus::Done] {
+            let mut state = HostState::default();
+            state.connection_installed(1);
+            let token = state.begin_sync(1);
+            assert_eq!(
+                state.complete_sync(token, snapshot_with_agent_status(status), 10),
+                ApplyResult::Applied
+            );
+            assert!(state.take_agent_status_transitions().is_empty());
+            assert_eq!(state.agent_statuses.get("p1"), Some(&status));
+        }
+    }
+
+    #[test]
+    fn reconnect_and_resync_snapshots_do_not_create_status_transitions() {
+        let mut state = HostState::default();
+        state.connection_installed(1);
+        let token = state.begin_sync(1);
+        state.complete_sync(
+            token,
+            snapshot_with_agent_status(HerdrAgentStatus::Blocked),
+            10,
+        );
+
+        state.mark_reconnecting("connection lost".to_owned());
+        state.connection_installed(2);
+        let token = state.begin_sync(2);
+        state.complete_sync(
+            token,
+            snapshot_with_agent_status(HerdrAgentStatus::Blocked),
+            20,
+        );
+        assert!(state.take_agent_status_transitions().is_empty());
+
+        let token = state.begin_sync(2);
+        state.complete_sync(
+            token,
+            snapshot_with_agent_status(HerdrAgentStatus::Done),
+            30,
+        );
+        assert!(state.take_agent_status_transitions().is_empty());
+        assert_eq!(
+            state.agent_statuses.get("p1"),
+            Some(&HerdrAgentStatus::Done)
+        );
+    }
+
+    #[test]
+    fn reconnect_snapshot_replaces_stale_status_without_a_transition() {
+        let mut state = synced_state();
+        state.apply_event(1, status_event(HerdrAgentStatus::Working), 20);
+        state.take_agent_status_transitions();
+        state.apply_event(1, status_event(HerdrAgentStatus::Unknown), 21);
+        state.take_agent_status_transitions();
+
+        state.mark_reconnecting("connection lost".to_owned());
+        state.connection_installed(2);
+        let token = state.begin_sync(2);
+        state.complete_sync(
+            token,
+            snapshot_with_agent_status(HerdrAgentStatus::Blocked),
+            30,
+        );
+
+        assert!(state.take_agent_status_transitions().is_empty());
+        assert_eq!(
+            state.agent_statuses.get("p1"),
+            Some(&HerdrAgentStatus::Blocked)
+        );
     }
 
     #[test]
@@ -1591,6 +2089,40 @@ mod tests {
     }
 
     #[test]
+    fn leaving_and_reentering_blocked_emits_a_new_transition() {
+        let mut state = synced_state();
+        state.apply_event(1, status_event(HerdrAgentStatus::Working), 20);
+        state.take_agent_status_transitions();
+        state.apply_event(1, status_event(HerdrAgentStatus::Blocked), 21);
+        state.take_agent_status_transitions();
+
+        state.apply_event(1, status_event(HerdrAgentStatus::Working), 22);
+        let working = state.take_agent_status_transitions();
+        state.apply_event(1, status_event(HerdrAgentStatus::Blocked), 23);
+        let blocked_again = state.take_agent_status_transitions();
+
+        assert_eq!(working.len(), 1);
+        assert_eq!(working[0].previous, Some(HerdrAgentStatus::Blocked));
+        assert_eq!(working[0].current, Some(HerdrAgentStatus::Working));
+        assert_eq!(blocked_again.len(), 1);
+        assert_eq!(blocked_again[0].previous, Some(HerdrAgentStatus::Working));
+        assert_eq!(blocked_again[0].current, Some(HerdrAgentStatus::Blocked));
+    }
+
+    #[test]
+    fn working_to_done_event_emits_one_transition() {
+        let mut state = synced_state();
+        state.apply_event(1, status_event(HerdrAgentStatus::Working), 20);
+        state.take_agent_status_transitions();
+
+        state.apply_event(1, status_event(HerdrAgentStatus::Done), 21);
+        let transitions = state.take_agent_status_transitions();
+        assert_eq!(transitions.len(), 1);
+        assert_eq!(transitions[0].previous, Some(HerdrAgentStatus::Working));
+        assert_eq!(transitions[0].current, Some(HerdrAgentStatus::Done));
+    }
+
+    #[test]
     fn newer_status_events_win_over_an_in_flight_blocked_snapshot() {
         for final_status in [
             HerdrAgentStatus::Working,
@@ -1598,17 +2130,13 @@ mod tests {
             HerdrAgentStatus::Idle,
         ] {
             let mut state = synced_state();
-            let mut blocked = snapshot();
-            blocked.panes[0].agent_status = HerdrAgentStatus::Blocked;
-            blocked
-                .agents
-                .push(agent("p1", HerdrAgentKind::Codex, "thread"));
-            blocked.agents[0].agent_status = HerdrAgentStatus::Blocked;
+            let blocked = snapshot_with_agent_status(HerdrAgentStatus::Blocked);
             let initial = state.begin_sync(1);
             state.complete_sync(initial, blocked.clone(), 11);
             state.take_agent_status_transitions();
             let token = state.begin_sync(1);
             state.apply_event(1, status_event(final_status), 12);
+            assert!(state.take_agent_status_transitions().is_empty());
             assert_eq!(
                 state.complete_sync(token, blocked, 13),
                 ApplyResult::Applied
@@ -1649,7 +2177,12 @@ mod tests {
         state.take_agent_status_transitions();
         let token = state.begin_sync(1);
         state.apply_event(1, status_event(HerdrAgentStatus::Blocked), 21);
-        state.complete_sync(token, snapshot(), 22);
+        assert!(state.take_agent_status_transitions().is_empty());
+        state.complete_sync(
+            token,
+            snapshot_with_agent_status(HerdrAgentStatus::Working),
+            22,
+        );
 
         let transitions = state.take_agent_status_transitions();
         let resync = state.begin_sync(1);
@@ -1663,7 +2196,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_event_is_ignored_and_pane_disappearance_is_cleared_once() {
+    fn stale_event_is_ignored_and_snapshot_pane_disappearance_resets_baseline() {
         let mut state = synced_state();
         state.apply_event(1, status_event(HerdrAgentStatus::Working), 20);
         state.take_agent_status_transitions();
@@ -1683,11 +2216,75 @@ mod tests {
         empty.tabs.clear();
         empty.panes.clear();
         state.complete_sync(token, empty, 22);
-        let cleared = state.take_agent_status_transitions();
+        assert!(state.take_agent_status_transitions().is_empty());
+        assert!(state.agent_statuses.is_empty());
+    }
 
-        assert_eq!(cleared.len(), 1);
-        assert_eq!(cleared[0].previous, Some(HerdrAgentStatus::Working));
-        assert_eq!(cleared[0].current, None);
+    #[test]
+    fn live_pane_creation_and_removal_only_emit_the_observed_removal() {
+        let mut state = synced_state();
+        state.apply_event(
+            1,
+            HerdrEvent::PaneCreated {
+                pane: pane("p2", "w1", "t1", HerdrAgentStatus::Blocked),
+            },
+            20,
+        );
+        assert!(state.take_agent_status_transitions().is_empty());
+
+        state.apply_event(
+            1,
+            HerdrEvent::PaneClosed {
+                workspace_id: "w1".to_owned(),
+                pane_id: "p2".to_owned(),
+            },
+            21,
+        );
+        let transitions = state.take_agent_status_transitions();
+        assert_eq!(transitions.len(), 1);
+        assert_eq!(transitions[0].pane_id, "p2");
+        assert_eq!(transitions[0].previous, Some(HerdrAgentStatus::Blocked));
+        assert_eq!(transitions[0].current, None);
+    }
+
+    #[test]
+    fn buffered_event_after_initial_snapshot_baseline_emits_a_transition() {
+        let mut state = HostState::default();
+        state.connection_installed(1);
+        let token = state.begin_sync(1);
+        assert!(matches!(
+            state.apply_event(1, status_event(HerdrAgentStatus::Blocked), 11),
+            ApplyResult::NeedsResync(_)
+        ));
+        assert!(state.take_agent_status_transitions().is_empty());
+
+        assert_eq!(
+            state.complete_sync(
+                token,
+                snapshot_with_agent_status(HerdrAgentStatus::Working),
+                12,
+            ),
+            ApplyResult::Applied
+        );
+        let transitions = state.take_agent_status_transitions();
+        assert_eq!(transitions.len(), 1);
+        assert_eq!(transitions[0].previous, Some(HerdrAgentStatus::Working));
+        assert_eq!(transitions[0].current, Some(HerdrAgentStatus::Blocked));
+    }
+
+    #[test]
+    fn buffered_status_equal_to_snapshot_baseline_does_not_emit_a_transition() {
+        let mut state = HostState::default();
+        state.connection_installed(1);
+        let token = state.begin_sync(1);
+        state.apply_event(1, status_event(HerdrAgentStatus::Blocked), 11);
+
+        state.complete_sync(
+            token,
+            snapshot_with_agent_status(HerdrAgentStatus::Blocked),
+            12,
+        );
+        assert!(state.take_agent_status_transitions().is_empty());
     }
 
     #[test]
@@ -1868,6 +2465,32 @@ mod tests {
         normalize_snapshot(&mut value);
         assert_eq!(value.tabs[0].agent_status, HerdrAgentStatus::Blocked);
         assert_eq!(value.workspaces[0].agent_status, HerdrAgentStatus::Blocked);
+    }
+
+    #[test]
+    fn normalization_preserves_unknown_status_and_empty_parent_defaults() {
+        let mut value = snapshot();
+        value.tabs.push(tab("empty-tab", "w1"));
+        value.workspaces.push(workspace("empty-workspace"));
+        for status in [
+            HerdrAgentStatus::Unknown,
+            HerdrAgentStatus::Idle,
+            HerdrAgentStatus::Working,
+            HerdrAgentStatus::Done,
+            HerdrAgentStatus::Blocked,
+        ] {
+            value.panes[0].agent_status = status;
+            normalize_snapshot(&mut value);
+            assert_eq!(value.tabs[0].agent_status, status);
+            assert_eq!(value.workspaces[0].agent_status, status);
+            assert_eq!(value.tabs[1].agent_status, HerdrAgentStatus::Unknown);
+            assert_eq!(value.workspaces[1].agent_status, HerdrAgentStatus::Unknown);
+        }
+
+        value.panes.clear();
+        normalize_snapshot(&mut value);
+        assert_eq!(value.tabs[0].agent_status, HerdrAgentStatus::Unknown);
+        assert_eq!(value.workspaces[0].agent_status, HerdrAgentStatus::Unknown);
     }
 
     #[test]

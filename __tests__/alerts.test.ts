@@ -18,6 +18,7 @@ jest.mock('react-native', () => ({
 jest.mock('../src/services/backgroundMonitoring', () => ({
   armPersistentAgentAlert: jest.fn(),
   dismissPersistentAgentAlert: jest.fn(),
+  watchSpeechShake: jest.fn(),
 }));
 jest.mock('../src/i18n', () => ({
   __esModule: true,
@@ -43,7 +44,7 @@ import {
   dismissAgentAlertsForTab,
   prepareAlerts,
 } from '../src/services/alerts';
-import { armPersistentAgentAlert, dismissPersistentAgentAlert } from '../src/services/backgroundMonitoring';
+import { armPersistentAgentAlert, dismissPersistentAgentAlert, watchSpeechShake } from '../src/services/backgroundMonitoring';
 import { setChatSpeechFocus } from '../src/services/chatSpeechFocus';
 
 const agent: AgentInfo = {
@@ -65,16 +66,102 @@ beforeEach(() => {
   jest.mocked(Notifications.dismissNotificationAsync).mockResolvedValue();
   jest.mocked(armPersistentAgentAlert).mockResolvedValue();
   jest.mocked(dismissPersistentAgentAlert).mockResolvedValue();
+  jest.mocked(watchSpeechShake).mockReturnValue(jest.fn());
 });
 
-test('does not announce the focused chat twice while it is being read aloud', async () => {
-  setChatSpeechFocus({ hostId: 'host-1', paneId: agent.pane_id });
-  await alertAgent(agent, true, { hostId: 'host-1', paneId: agent.pane_id });
+test.each(['brief', 'regular'] as const)(
+  'delivers a %s notification for the focused chat without interrupting chat speech',
+  async delivery => {
+    const target = { hostId: 'host-1', paneId: agent.pane_id };
+    setChatSpeechFocus(target);
+
+    await alertAgent(agent, true, target, 'work', delivery);
+
+    expect(Speech.speak).not.toHaveBeenCalled();
+    expect(Speech.stop).not.toHaveBeenCalled();
+    expect(Notifications.scheduleNotificationAsync).toHaveBeenCalledTimes(1);
+    expect(Notifications.scheduleNotificationAsync).toHaveBeenCalledWith({
+      content: expect.objectContaining({
+        data: { ...target, agentAlertLevel: delivery },
+      }),
+      trigger: { channelId: `agent-state-${delivery}-v1` },
+    });
+    const request = jest.mocked(Notifications.scheduleNotificationAsync).mock.calls[0][0];
+    if (delivery === 'brief') {
+      expect(request.content.vibrate).toEqual([0, 200]);
+      expect(request.content.sound).toBe('default');
+    } else {
+      expect(request.content).not.toHaveProperty('vibrate');
+      expect(request.content).not.toHaveProperty('sound');
+    }
+    expect(armPersistentAgentAlert).not.toHaveBeenCalled();
+    expect(Notifications.dismissNotificationAsync).not.toHaveBeenCalled();
+  },
+);
+
+test('delivers a persistent alert when the spoken chat agent becomes blocked without status TTS', async () => {
+  const target = { hostId: 'host-1', paneId: agent.pane_id };
+  setChatSpeechFocus(target);
+
+  await alertAgent({ ...agent, agent_status: 'blocked' }, true, target, 'work');
+
   expect(Speech.speak).not.toHaveBeenCalled();
-  expect(Notifications.scheduleNotificationAsync).not.toHaveBeenCalled();
-  await alertAgent(agent, true, { hostId: 'other-host', paneId: agent.pane_id }, 'other', 'regular');
-  expect(Speech.speak).not.toHaveBeenCalled();
+  expect(Speech.stop).not.toHaveBeenCalled();
   expect(Notifications.scheduleNotificationAsync).toHaveBeenCalledTimes(1);
+  expect(Notifications.scheduleNotificationAsync).toHaveBeenCalledWith({
+    content: expect.objectContaining({
+      title: 'work · codex needs you',
+      body: 'Agent is blocked',
+      data: { ...target, agentAlertLevel: 'persistent' },
+      sound: 'default',
+      vibrate: expect.arrayContaining([300, 100, 2000]),
+    }),
+    trigger: { channelId: 'agent-state-v3' },
+  });
+  expect(armPersistentAgentAlert).toHaveBeenCalledWith(
+    'notification-1',
+    'agent-state-v3',
+    30_000,
+  );
+  expect(Notifications.dismissNotificationAsync).not.toHaveBeenCalled();
+});
+
+test.each([
+  { hostId: 'other-host', paneId: agent.pane_id },
+  { hostId: 'host-1', paneId: 'other-pane' },
+])('delivers notifications for $hostId/$paneId while another chat owns speech', async target => {
+  setChatSpeechFocus({ hostId: 'host-1', paneId: agent.pane_id });
+
+  await alertAgent({ ...agent, pane_id: target.paneId }, true, target, 'other', 'regular');
+
+  expect(Speech.speak).not.toHaveBeenCalled();
+  expect(Speech.stop).not.toHaveBeenCalled();
+  expect(Notifications.scheduleNotificationAsync).toHaveBeenCalledTimes(1);
+  expect(Notifications.scheduleNotificationAsync).toHaveBeenCalledWith(expect.objectContaining({
+    content: expect.objectContaining({
+      data: { ...target, agentAlertLevel: 'regular' },
+    }),
+  }));
+});
+
+test('keeps a pending persistent notification when chat speech focuses its pane', async () => {
+  const target = { hostId: 'host-1', paneId: agent.pane_id };
+  let finishScheduling: ((identifier: string) => void) | undefined;
+  jest.mocked(Notifications.scheduleNotificationAsync).mockReturnValueOnce(new Promise(resolve => {
+    finishScheduling = resolve;
+  }));
+  const pendingAlert = alertAgent(agent, false, target);
+
+  setChatSpeechFocus(target);
+  finishScheduling?.('focused-notification');
+  await pendingAlert;
+
+  expect(Notifications.dismissNotificationAsync).not.toHaveBeenCalled();
+  expect(armPersistentAgentAlert).toHaveBeenCalledWith(
+    'focused-notification',
+    'agent-state-v3',
+    30_000,
+  );
 });
 
 test('delays the noisy notification and persistent alert until speech finishes', async () => {
@@ -111,6 +198,42 @@ test('posts the notification immediately when speech is disabled', async () => {
   expect(Speech.stop).not.toHaveBeenCalled();
   expect(Speech.speak).not.toHaveBeenCalled();
   expect(Notifications.scheduleNotificationAsync).toHaveBeenCalledTimes(1);
+  expect(watchSpeechShake).not.toHaveBeenCalled();
+});
+
+test('shaking stops an announcement and prevents its pending alert from ringing', async () => {
+  const stopWatching = jest.fn();
+  jest.mocked(watchSpeechShake).mockReturnValueOnce(stopWatching);
+  const pending = alertAgent(agent, true, {
+    hostId: 'host-1',
+    paneId: agent.pane_id,
+  });
+  await Promise.resolve();
+  await Promise.resolve();
+
+  jest.mocked(watchSpeechShake).mock.calls[0][0]();
+  await pending;
+
+  expect(Speech.stop).toHaveBeenCalledTimes(2);
+  expect(stopWatching).toHaveBeenCalledTimes(1);
+  expect(Notifications.scheduleNotificationAsync).not.toHaveBeenCalled();
+  expect(armPersistentAgentAlert).not.toHaveBeenCalled();
+});
+
+test('finishing an announcement removes its shake watcher', async () => {
+  const stopWatching = jest.fn();
+  jest.mocked(watchSpeechShake).mockReturnValueOnce(stopWatching);
+  const pending = alertAgent(agent, true, {
+    hostId: 'host-1',
+    paneId: agent.pane_id,
+  }, undefined, 'regular');
+  await Promise.resolve();
+  await Promise.resolve();
+
+  jest.mocked(Speech.speak).mock.calls[0][1]?.onDone?.();
+  await pending;
+
+  expect(stopWatching).toHaveBeenCalledTimes(1);
 });
 
 test('uses the configured persistent alert timeout', async () => {

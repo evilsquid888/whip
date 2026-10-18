@@ -1,11 +1,15 @@
-import { AlertCircle, Bot, Ellipsis, LockKeyhole, LogIn, LogOut, Network, Plus, Server, ServerOff, Trash2 } from 'lucide-react-native';
+import { AlertCircle, Bot, Ellipsis, Globe2, LockKeyhole, LogIn, LogOut, Network, Plus, Server, ServerOff, Trash2 } from 'lucide-react-native';
 import { useEffect, useRef, useState } from 'react';
 import { PanResponder, Platform, ScrollView, View } from 'react-native';
 import Animated, { cancelAnimation, useAnimatedStyle, useSharedValue, withSpring } from 'react-native-reanimated';
 import { useTranslation } from 'react-i18next';
 import type { TFunction } from 'i18next';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
+import { supportsBrowserControl } from '@/src/browser/native';
+import { browserRegistry } from '@/src/browser/registry';
 import { orderByConnectionAndAgentStatusPriority } from '@/src/herdQueue';
+import { bottomNavigationInset } from '@/src/lib/floatingChrome';
 import { DEFAULT_SSH_PORT, hostDisplayName } from '@/src/lib/hostProfiles';
 import type { HostRuntimeSummary } from '@/src/lib/hostRuntimeSummary';
 import { DEFAULT_SPRING_CONFIG } from '@/src/lib/motion';
@@ -16,6 +20,7 @@ import {
   shouldOpenHostSwipe,
 } from '@/src/lib/hostSwipeActions';
 import type { CredentialRecoveryStatus } from '@/src/services/credentialVault';
+import { bestEffortCleanup } from '@/src/services/backgroundOperations';
 import { statusColor, useTheme } from '@/src/theme';
 import type { HostProfile } from '@/src/types';
 import { AgentStatusMedallion, hapticPress, HerdrMark, IconButton, ScreenHeader, StatusBadge, WhipMark } from './app-ui';
@@ -45,6 +50,7 @@ interface Props {
 export function HostsScreen({ hosts, connectingHostIds = [], error, activeHostId, connectedHostIds = [], latencyMsByHostId = {}, runtimeByHostId = {}, credentialRecovery, credentialRecoveryBusy, onAdd, onConnect, onDelete, onDisconnect, onEdit, onUnlockCredentials }: Props) {
   const { t } = useTranslation();
   const { colors } = useTheme();
+  const { bottom } = useSafeAreaInsets();
   const connectingHostIdSet = new Set(connectingHostIds);
   const connectedHostIdSet = new Set(connectedHostIds);
   const hostsById = new Map(hosts.map(host => [host.id, host]));
@@ -59,7 +65,14 @@ export function HostsScreen({ hosts, connectingHostIds = [], error, activeHostId
         title="Whip"
         subtitle={t('hosts.subtitle')}
         left={<WhipMark size={40} />}
-        right={<IconButton icon={Plus} accessibilityLabel={t('hosts.add')} onPress={onAdd} />}
+        right={
+          <View className="flex-row items-center gap-2">
+            {supportsBrowserControl() && (
+              <IconButton icon={Globe2} accessibilityLabel={t('terminal.openBrowser')} onPress={() => bestEffortCleanup(browserRegistry.openLocal(), 'browser-open-local')} />
+            )}
+            <IconButton icon={Plus} accessibilityLabel={t('hosts.add')} onPress={onAdd} />
+          </View>
+        }
       />
 
       {error ? (
@@ -89,7 +102,9 @@ export function HostsScreen({ hosts, connectingHostIds = [], error, activeHostId
         </View>
       ) : null}
 
-      <ScrollView className="flex-1">
+      <ScrollView
+        className="flex-1"
+        contentContainerStyle={{ paddingBottom: bottomNavigationInset(bottom) }}>
         <View className="flex-grow p-4 pb-6">
           {hosts.length === 0 ? (
             <View className="min-h-[440px] flex-1 items-center justify-center px-7">
@@ -126,7 +141,6 @@ export function HostsScreen({ hosts, connectingHostIds = [], error, activeHostId
                           <Button
                             accessibilityLabel={t('hosts.connectTo', { host: displayName })}
                             className="h-auto min-h-[88px] min-w-0 flex-1 self-stretch justify-start gap-3 rounded-none px-3 py-3 sm:h-auto"
-                            disabled={connecting}
                             size="content"
                             variant="ghost"
                             onPress={hapticPress(() => {

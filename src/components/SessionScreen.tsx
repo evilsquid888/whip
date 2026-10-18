@@ -18,7 +18,6 @@ import {
 import {
   ActivityIndicator,
   AppState,
-  Linking,
   Modal,
   Platform,
   ScrollView,
@@ -26,7 +25,13 @@ import {
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useTranslation } from 'react-i18next';
+import { readCachedAgentTranscript } from 'react-native-whip-ssh';
 import WebView from 'react-native-webview';
+import { browserRegistry } from '../browser/registry';
+import { supportsBrowserControl } from '../browser/native';
+import { OpenBrowserButton } from '../browser/OpenBrowserButton';
+import { BrowserTunnelingSetting } from '../browser/BrowserTunnelingSetting';
+import { browserLibrary } from '../browser/library';
 import {
   orderByAgentStatusPriority,
   tabAgentStateChangeSequence,
@@ -34,6 +39,7 @@ import {
 import {
   terminalControlBarInset,
   terminalSessionChromeHeight,
+  type TerminalSessionChromeLayout,
 } from '@/src/lib/floatingChrome';
 import { runWithInFlightGuard } from '@/src/lib/inFlightSubmission';
 import { cn } from '@/src/lib/utils';
@@ -51,6 +57,8 @@ import {
   type TranscriptFileLinkTarget,
 } from '@/src/lib/transcriptLinks';
 import type { TerminalRenderTarget } from '@/src/lib/terminalRenderer';
+import type { ComposerDraftRequest } from '../lib/composerDraftRequest';
+import type { TerminalComposerStore } from '../lib/terminalComposerStore';
 import { TerminalResidencyEndReason, type TerminalResidencyEnd } from '../lib/terminalResidency';
 import {
   resolveTerminalVolumeKeyAction,
@@ -65,7 +73,10 @@ import {
   agentChatControlState,
   chatAgentForPane,
   chatAgentDisplayName,
+  type ChatAgent,
 } from '../lib/agentChatSession';
+import { agentChatStateFromNative } from '../lib/nativeAgentTranscript';
+import { agentChatCache } from '../services/agentChatCache';
 import {
   AgentChatPresentationPhase,
   chatPresentationLoading,
@@ -99,10 +110,7 @@ import {
   recordAgentChatDiagnostic,
 } from '../services/agentChatDiagnostics';
 import { terminalTabSelectionStarted } from '../services/performanceTrace';
-import {
-  bestEffortCleanup,
-  reportBackgroundFailure,
-} from '../services/backgroundOperations';
+import { reportBackgroundFailure } from '../services/backgroundOperations';
 import type { TerminalSessionsState } from '../terminalSessions';
 import type { TerminalSessionStatus } from '../terminalSessions';
 import type { TerminalPreferences } from '../services/devicePreferences';
@@ -113,7 +121,7 @@ import {
   statusColor,
   useTheme,
 } from '../theme';
-import type { HerdrSnapshot, PaneInfo, TabInfo } from '../types';
+import type { AgentStatus, HerdrSnapshot, PaneInfo, TabInfo } from '../types';
 import { AnimatedAgentStatusGlyph, hapticPress } from './app-ui';
 import { AgentIdentityWarningSheet } from './AgentIdentityWarningSheet';
 import { AppAlertPopup, type AppAlertContent } from './AppAlertPopup';
@@ -129,18 +137,18 @@ import {
 } from './ResourceEditorSheet';
 import { Button } from './ui/button';
 import { Input } from './ui/input';
-import { Switch } from './ui/switch';
 import { Text } from './ui/text';
 import { TerminalBackground, TerminalScreen } from './TerminalScreen';
 import { AgentChatView } from './AgentChatView';
 import { useAppGlassEnabled } from './GlassSurface';
 
 interface Props {
+  hostId: string;
   hostSessionId: string;
   visible: boolean;
   ttsEnabled: boolean;
   snapshot: HerdrSnapshot;
-  client: HerdrClient;
+  client: HerdrClient | null;
   terminalState: TerminalSessionsState;
   terminalTargets: readonly TerminalRenderTarget[];
   appBackgroundImageUri: string | null;
@@ -150,6 +158,9 @@ interface Props {
   onRefresh: () => Promise<void>;
   onOpenPane: (pane: PaneInfo) => void;
   onActivateTerminal: (pane: PaneInfo) => void;
+  onOpenSshShell: (title?: string) => void;
+  onSelectSshShell: (terminalId: string) => void;
+  onRenameSshShell: (terminalId: string, title: string) => void;
   onCloseTerminal: (terminalId: string) => void;
   onTerminalStatus: (
     hostSessionId: string,
@@ -167,16 +178,25 @@ interface Props {
   terminalControlUsage: TerminalControlUsage;
   terminalHistory: readonly string[];
   onOpenFiles: (terminalId: string, target?: TranscriptFileLinkTarget) => void;
-  getComposerDraft: (terminalId: string) => string;
-  onComposerDraftChange: (terminalId: string, value: string) => void;
+  composerDraftRequest?: ComposerDraftRequest;
+  onComposerDraftConsumed?: (id: number) => void;
+  composerStore: TerminalComposerStore;
   onTerminalControlUse: (control: TerminalControlId) => void;
   onTerminalHistoryEntry: (entry: string) => void;
-  onTerminalOpenLinksInAppChange: (value: boolean) => void;
   onInteraction: (tabId: string) => void;
   onExit: () => void;
 }
 
-type EditorMode = 'tab' | 'rename-tab' | 'rename-pane';
+type EditorMode = 'tab' | 'ssh-tab' | 'rename-tab' | 'rename-ssh-tab' | 'rename-pane';
+
+interface TerminalTab {
+  id: string;
+  label: string;
+  agentStatus: AgentStatus;
+  status?: TerminalSessionStatus;
+  paneCount: number;
+  herdrTab?: TabInfo;
+}
 type PendingFocus = {
   previousId: string | null;
 };
@@ -188,6 +208,7 @@ interface BrowserWebViewHandle {
 const BROWSER_WEBVIEW_STYLE = { flex: 1 } as const;
 
 export function SessionScreen({
+  hostId,
   hostSessionId,
   visible,
   ttsEnabled,
@@ -201,6 +222,9 @@ export function SessionScreen({
   latencyWarningActive,
   onRefresh,
   onActivateTerminal,
+  onOpenSshShell,
+  onSelectSshShell,
+  onRenameSshShell,
   onCloseTerminal,
   onTerminalStatus,
   onTerminalFontSizeChange,
@@ -208,11 +232,11 @@ export function SessionScreen({
   terminalControlUsage,
   terminalHistory,
   onOpenFiles,
-  getComposerDraft,
-  onComposerDraftChange,
+  composerStore,
+  composerDraftRequest,
+  onComposerDraftConsumed,
   onTerminalControlUse,
   onTerminalHistoryEntry,
-  onTerminalOpenLinksInAppChange,
   onInteraction,
   onExit,
 }: Props) {
@@ -231,10 +255,23 @@ export function SessionScreen({
     useState<CreatedTabFocusResult | null>(null);
   const [editorMode, setEditorMode] = useState<EditorMode | null>(null);
   const [editingPaneId, setEditingPaneId] = useState<string | null>(null);
+  const [editingSshTerminalId, setEditingSshTerminalId] = useState<string | null>(null);
   const [name, setName] = useState('');
   const [busy, setBusy] = useState(false);
-  const [terminalSessionChromeVisible, setTerminalSessionChromeVisible] =
-    useState(true);
+  const [savedChat, setSavedChat] = useState<{
+    paneId: string;
+    agent: ChatAgent;
+    state: AgentChatState;
+  } | null>(null);
+  const [savedChatOpen, setSavedChatOpen] = useState(false);
+  const [savedChatLoading, setSavedChatLoading] = useState(false);
+  const [savedChatError, setSavedChatError] = useState<string | null>(null);
+  const savedChatGeneration = useRef(0);
+  const [terminalSessionChrome, setTerminalSessionChrome] =
+    useState<TerminalSessionChromeLayout>(() => ({
+      bottom: terminalControlBarInset(safeAreaInsets.bottom),
+      visible: true,
+    }));
   const [appAlert, setAppAlert] = useState<AppAlertContent | null>(null);
   const [linkScanRequest, setLinkScanRequest] = useState(0);
   const [linksOpen, setLinksOpen] = useState(false);
@@ -265,7 +302,6 @@ export function SessionScreen({
     dispose: () => void;
   } | null>(null);
   const browserWebView = useRef<BrowserWebViewHandle | null>(null);
-  const tunnelPreviewRef = useRef<string | null>(null);
   const browserRequestRef = useRef(0);
   const pendingPaneFocus = useRef<string | null>(null);
   const lastActivePaneId = useRef<string | null>(null);
@@ -281,6 +317,9 @@ export function SessionScreen({
   const lastActiveChatDiagnosticRef = useRef('');
   const reportedChatFailureGenerationsRef = useRef(new Set<number>());
   const mutationInFlight = useRef(false);
+  const completionAcknowledgements = useRef(
+    new Map<string, NonNullable<HerdrClient['activeNative']>>(),
+  );
 
   const nextChatPresentationGeneration = useCallback(() => {
     chatPresentationGenerationRef.current += 1;
@@ -329,19 +368,20 @@ export function SessionScreen({
     tabs.find(item => item.focused) ||
     tabs[0];
   const editorTitle =
-    editorMode === 'rename-tab'
+    editorMode === 'rename-tab' || editorMode === 'rename-ssh-tab'
       ? t('session.renameTab')
       : editorMode === 'rename-pane'
       ? t('session.renamePane')
       : t('session.newTab');
   const editorContext =
-    editorMode === 'rename-pane'
+    editorMode === 'ssh-tab' || editorMode === 'rename-ssh-tab'
+      ? t('terminal.sshShell')
+      : editorMode === 'rename-pane'
       ? selectedTab?.label || selectedTab?.tab_id
       : workspace?.label || workspace?.workspace_id;
   const panes = selectableResources.panes.filter(
     item => item.tab_id === selectedTab?.tab_id,
   );
-  const sessionChromeInset = terminalSessionChromeHeight(panes.length);
   const serverWorkspace =
     snapshot.workspaces.find(item => item.focused) || snapshot.workspaces[0];
   const serverTab =
@@ -373,11 +413,83 @@ export function SessionScreen({
   const activeTerminalSession = terminalState.sessions.find(
     session => session.terminalId === terminalState.activeTerminalId,
   );
+  const sshTabsVisible = activeTerminalSession?.kind === 'ssh' || !workspace;
+  const sessionChromeInset = terminalSessionChromeHeight(
+    sshTabsVisible ? 0 : panes.length,
+  );
+  const visibleTabs: TerminalTab[] = sshTabsVisible
+    ? terminalState.sessions
+        .filter(session => session.kind === 'ssh')
+        .map(session => ({
+          id: session.terminalId,
+          label: session.title,
+          agentStatus: 'idle',
+          status: session.status,
+          paneCount: 1,
+        }))
+    : tabs.map(tab => ({
+        id: tab.tab_id,
+        label: tab.label || tab.tab_id,
+        agentStatus: tab.agent_status,
+        status: terminalState.sessions.find(session =>
+          selectableResources.panes.some(
+            pane => pane.tab_id === tab.tab_id && pane.terminal_id === session.terminalId,
+          ),
+        )?.status,
+        paneCount: tab.pane_count,
+        herdrTab: tab,
+      }));
+  const selectedVisibleTabId = sshTabsVisible
+    ? terminalState.activeTerminalId
+    : selectedTab?.tab_id;
   const activePane = activePaneForTerminal(
     selectableResources.panes,
     terminalState.sessions,
     terminalState.activeTerminalId,
   );
+  const activePaneId = activePane?.pane_id;
+  const activePaneWorkspaceId = activePane?.workspace_id;
+  const activePaneTabId = activePane?.tab_id;
+  useEffect(() => {
+    if (client || !activePaneId) return;
+    setWorkspaceId(activePaneWorkspaceId || '');
+    setTabId(activePaneTabId || '');
+  }, [activePaneId, activePaneTabId, activePaneWorkspaceId, client]);
+  useEffect(() => {
+    savedChatGeneration.current += 1;
+    setSavedChatOpen(false);
+    setSavedChat(null);
+    setSavedChatError(null);
+    setSavedChatLoading(false);
+  }, [activePane?.pane_id, hostSessionId]);
+  const openSavedChat = async () => {
+    const agent = chatAgentForPane(activePane);
+    const sessionId = activePane?.agent_session?.value;
+    const generation = ++savedChatGeneration.current;
+    setSavedChatOpen(true);
+    setSavedChatError(null);
+    if (!activePane || !agent || !sessionId) {
+      setSavedChatError(t('cachedHost.empty'));
+      return;
+    }
+    if (savedChat?.paneId === activePane?.pane_id) return;
+    setSavedChatLoading(true);
+    try {
+      const chats = await agentChatCache.listNative();
+      const chat = chats.find(item => item.namespace === hostSessionId
+        && item.agent === agent && item.sessionId === sessionId);
+      if (!chat) throw new Error(t('cachedHost.empty'));
+      const blob = await agentChatCache.loadNative(chat.key);
+      if (!blob) throw new Error(t('savedChats.missing'));
+      if (generation !== savedChatGeneration.current) return;
+      const restored = agentChatStateFromNative(readCachedAgentTranscript(agent, sessionId, blob));
+      setSavedChat({ paneId: activePane.pane_id, agent, state: restored });
+    } catch (error) {
+      if (generation === savedChatGeneration.current) setSavedChatError(String(error));
+    } finally {
+      if (generation === savedChatGeneration.current) setSavedChatLoading(false);
+    }
+  };
   const activeTarget =
     terminalTargets.find(
       target =>
@@ -402,6 +514,22 @@ export function SessionScreen({
       }));
     },
   });
+  const liveChatResumeRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!client) liveChatResumeRef.current = null;
+  }, [client]);
+  useEffect(() => {
+    if (!savedChatOpen || !client || !activeTarget || !visible) return;
+    if (liveChatResumeRef.current === activeTarget.key) return;
+    liveChatResumeRef.current = activeTarget.key;
+    reportBackgroundFailure(chatOpen.open(), 'saved-chat-live-resume');
+  }, [activeTarget, chatOpen, client, savedChatOpen, visible]);
+  useEffect(() => {
+    if (savedChatOpen && chatPresentationVisible(activeChatView?.presentation)) {
+      setSavedChatOpen(false);
+      setSavedChat(null);
+    }
+  }, [activeChatView?.presentation, savedChatOpen]);
   const cancelChatOpen = chatOpen.cancel;
   const pendingChatOpenTerminalId = chatOpen.pendingTerminalId;
   const visibleAppAlert = appAlert || (chatOpen.notice?.type === 'error' ? chatOpen.notice : null);
@@ -410,17 +538,20 @@ export function SessionScreen({
     (restoringChat &&
       !chatPresentationVisible(activeChatView?.presentation)) ||
     chatPresentationLoading(activeChatView?.presentation) ||
-    pendingChatOpenTerminalId === activeTerminalSession?.terminalId;
+    pendingChatOpenTerminalId === activeTerminalSession?.terminalId ||
+    savedChatLoading;
   const activeChatControl = agentChatControlState(
     activePane,
     busy,
     chatControlLoading,
   );
-  const followServerFocus = shouldFollowServerTerminalFocus(
-    visible,
-    activePane?.pane_id || null,
-  );
-  const chatVisible = chatPresentationVisible(activeChatView?.presentation) || restoringChat;
+  const followServerFocus = activeTerminalSession?.kind !== 'ssh' &&
+    shouldFollowServerTerminalFocus(visible, activePane?.pane_id || null);
+  const chatVisible = savedChatOpen
+    || chatPresentationVisible(activeChatView?.presentation) || restoringChat;
+  const activeSavedChat = savedChat?.paneId === activePane?.pane_id ? savedChat : null;
+  const voiceChatState = savedChatOpen ? activeSavedChat?.state : activeChatView?.state;
+  const voiceChatKey = savedChatOpen ? activeSavedChat?.state.sessionId : activeChatView?.binding.bindingToken;
   const onChatSpeechError = useCallback((error: unknown) => {
     setAppAlert({ title: 'Could not read chat aloud', message: String(error) });
   }, []);
@@ -465,6 +596,19 @@ export function SessionScreen({
     chatPresentationRequested(activeChatView.presentation)
       ? activeTarget.key
       : null;
+  const activeChatNative = activeChatKey ? client?.activeNative : null;
+  const activeCodexChatPaneId = activeChatKey && chatAgentForPane(activePane) === 'codex'
+    ? activePane?.pane_id : null;
+  const activeCodexChatStatus = activeCodexChatPaneId ? activePane?.agent_status : null;
+  useEffect(() => {
+    if (!activeChatNative || !activeCodexChatPaneId) return;
+    // Herdr may omit a session-only event for /resume. Read once on Chat
+    // entry/foreground and agent activity; Rust reconciles identity safely.
+    reportBackgroundFailure(activeChatNative.requestHerdrApi({
+      method: 'pane.get',
+      params: { pane_id: activeCodexChatPaneId },
+    }), 'agent-chat-identity-refresh');
+  }, [activeChatKey, activeChatNative, activeCodexChatPaneId, activeCodexChatStatus]);
   const activeViewportIdentity =
     chatViewportCandidates.find(item => item.key === activeChatKey)?.identity ??
     null;
@@ -522,17 +666,35 @@ export function SessionScreen({
     );
     const interactionTabId = pane?.tab_id || selectedTab?.tab_id;
     if (interactionTabId) onInteraction(interactionTabId);
-  };
 
-  const closeActiveTunnel = () => {
-    const previewId = tunnelPreviewRef.current;
-    tunnelPreviewRef.current = null;
-    if (previewId !== null) {
-      bestEffortCleanup(
-        client.native.stopPreview(previewId),
-        'web-tunnel-close',
-      );
-    }
+    if (
+      !visible || !appActive || target.hostSessionId !== hostSessionId ||
+      pane?.agent_status !== 'done'
+    ) return;
+    const native = client?.activeNative;
+    if (!native || completionAcknowledgements.current.get(target.key) === native) return;
+    const host = native.hostState();
+    const livePane = host.snapshot?.panes.find(
+      item => item.terminal_id === target.session.terminalId,
+    );
+    if (
+      host.syncStatus !== 'synced' || host.freshness !== 'fresh' ||
+      livePane?.pane_id !== pane?.pane_id || livePane?.agent_status !== 'done'
+    ) return;
+
+    // Acknowledge through Herdr so every client receives its seen/idle status.
+    completionAcknowledgements.current.set(target.key, native);
+    reportBackgroundFailure(
+      native.requestHerdrApi({
+        method: 'pane.focus',
+        params: { pane_id: livePane.pane_id },
+      }).finally(() => {
+        if (completionAcknowledgements.current.get(target.key) === native) {
+          completionAcknowledgements.current.delete(target.key);
+        }
+      }),
+      'session-completion-acknowledge',
+    );
   };
 
   const scanTerminalLinks = () => {
@@ -542,7 +704,6 @@ export function SessionScreen({
     setTerminalLinks([]);
     setLinksError(null);
     setLinksBusy(true);
-    closeActiveTunnel();
     setLinkScanRequest(value => value + 1);
   };
 
@@ -551,7 +712,6 @@ export function SessionScreen({
     setLinksOpen(false);
     setBrowserUrl(null);
     setBrowserCanGoBack(false);
-    closeActiveTunnel();
   };
 
   const leaveBrowser = () => {
@@ -559,35 +719,43 @@ export function SessionScreen({
     setBrowserUrl(null);
     setBrowserCanGoBack(false);
     setBrowserLoading(false);
-    closeActiveTunnel();
   };
 
-  const openTerminalLink = async (value: string) => {
+  const openNativeBrowser = async () => {
+    if (!supportsBrowserControl() || !client) return undefined;
+    await browserRegistry.loadArchive();
+    const shared = browserRegistry.forPane(client.native.runtimeId, activePane?.pane_id);
+    const sessionId = shared?.identity.sessionId || 'manual-' + hostSessionId + '-' + (activePane?.terminal_id || 'shell');
+    const entry = shared || browserRegistry.ensure({
+      runtimeId: client.native.runtimeId,
+      sessionId,
+      paneId: activePane?.pane_id || '',
+      terminalId: activePane?.terminal_id || '',
+    }, client.native, false);
+    if (!entry.controller.tabs.length) entry.controller.newTab();
+    browserRegistry.open(entry.identity.sessionId);
+    setLinksOpen(false);
+    return entry;
+  };
+  const openWebLink = async (value: string) => {
     const request = ++browserRequestRef.current;
     setLinksBusy(true);
     setLinksError(null);
     try {
-      closeActiveTunnel();
       const target = terminalWebLinkTarget(value);
-      if (!terminalPreferences.openLinksInApp) {
-        await Linking.openURL(target.url);
+      const entry = await openNativeBrowser();
+      if (entry) {
+        await browserRegistry.openLink(entry.identity.sessionId, target.url);
         return;
       }
-      const tunnel = target.requiresSshTunnel
-        ? await client.native.startWebPreview(target.url)
-        : null;
-      if (request !== browserRequestRef.current) {
-        if (tunnel) {
-          bestEffortCleanup(
-            client.native.stopPreview(tunnel.id),
-            'stale-web-tunnel-close',
-          );
-        }
-        return;
+      setLinksOpen(true);
+      await browserLibrary.load();
+      if (browserLibrary.tunneling(hostId)) {
+        throw new Error(t('browser.tunnelingUnavailable'));
       }
-      if (tunnel) tunnelPreviewRef.current = tunnel.id;
+      if (request !== browserRequestRef.current) return;
       setBrowserDisplayUrl(target.url);
-      setBrowserUrl(tunnel?.url || target.url);
+      setBrowserUrl(target.url);
       setBrowserCanGoBack(false);
       setBrowserLoading(true);
     } catch (reason) {
@@ -597,17 +765,13 @@ export function SessionScreen({
     }
   };
 
+  const handleOpenWebLink = (url: string) => {
+    reportBackgroundFailure(openWebLink(url), 'web-link-open');
+  };
+
   useEffect(
     () => () => {
       browserRequestRef.current += 1;
-      const previewId = tunnelPreviewRef.current;
-      tunnelPreviewRef.current = null;
-      if (previewId !== null) {
-        bestEffortCleanup(
-          client.native.stopPreview(previewId),
-          'web-tunnel-unmount',
-        );
-      }
     },
     [client],
   );
@@ -675,7 +839,7 @@ export function SessionScreen({
         updateChatRestoreIntent(key);
       }
     }
-    if (activeTarget && activeId && !next.has(activeId) && chatRestoreIntentsRef.current.has(activeId)) {
+    if (client && activeTarget && activeId && !next.has(activeId) && chatRestoreIntentsRef.current.has(activeId)) {
       const transcriptKey = chatRestoreIntentsRef.current.get(activeId);
       try {
         const projection = agentTranscriptService.activate(hostSessionId, activeTarget.session.terminalId, client.native);
@@ -988,7 +1152,7 @@ export function SessionScreen({
     activateServerPane(serverPaneId);
   }, [followServerFocus, pendingCreatedPaneId, serverPaneId]);
 
-  const run = async (action: () => Promise<unknown>): Promise<boolean> => {
+  const run = async (action: () => unknown): Promise<boolean> => {
     try {
       return await runWithInFlightGuard(mutationInFlight, async () => {
         setBusy(true);
@@ -1013,6 +1177,7 @@ export function SessionScreen({
     setWorkspaceId(item.workspace_id);
     setTabId(item.tab_id);
     if (nextPane) onActivateTerminal(nextPane);
+    if (!client) return;
     reportBackgroundFailure(
       run(async () => {
         if (item.workspace_id !== workspace?.workspace_id) {
@@ -1030,18 +1195,26 @@ export function SessionScreen({
     );
   };
 
+  const chooseVisibleTab = (item: TerminalTab) => {
+    if (item.herdrTab) chooseTab(item.herdrTab);
+    else {
+      terminalTabSelectionStarted(item.id);
+      onSelectSshShell(item.id);
+    }
+  };
+
   const tabNavigationContextRef = useRef({
-    tabs,
-    selectedTab,
+    tabs: visibleTabs,
+    selectedId: selectedVisibleTabId,
   });
   tabNavigationContextRef.current = {
-    tabs,
-    selectedTab,
+    tabs: visibleTabs,
+    selectedId: selectedVisibleTabId,
   };
-  const chooseTabRef = useRef(chooseTab);
-  chooseTabRef.current = chooseTab;
+  const chooseTabRef = useRef(chooseVisibleTab);
+  chooseTabRef.current = chooseVisibleTab;
 
-  const handleVolumeKey = useEffectEvent((key: TerminalVolumeKey) => {
+  const handleVolumeKey = (key: TerminalVolumeKey) => {
     if (!visible) return;
     const configured =
       key === 'up'
@@ -1051,20 +1224,23 @@ export function SessionScreen({
     if (action?.type !== 'terminal-tab') return;
     const context = tabNavigationContextRef.current;
     const currentIndex = context.tabs.findIndex(
-      item => item.tab_id === context.selectedTab?.tab_id,
+      item => item.id === context.selectedId,
     );
     const targetTab = context.tabs[currentIndex + action.direction];
     if (targetTab) chooseTabRef.current(targetTab);
-  });
+  };
+  const volumeKeyHandlerRef = useRef(handleVolumeKey);
+  volumeKeyHandlerRef.current = handleVolumeKey;
 
   useEffect(() => {
-    const subscription = addTerminalVolumeKeyListener(handleVolumeKey);
+    const subscription = addTerminalVolumeKeyListener(key => volumeKeyHandlerRef.current(key));
     return () => subscription.remove();
   }, []);
 
   const choosePane = (pane: PaneInfo) => {
     terminalTabSelectionStarted(pane.terminal_id);
     onActivateTerminal(pane);
+    if (!client) return;
     reportBackgroundFailure(
       run(() =>
         client.native.requestHerdrApi({
@@ -1077,9 +1253,16 @@ export function SessionScreen({
   };
 
   const create = async () => {
+    if (!client) return;
     if (mutationInFlight.current) return;
     let succeeded = true;
-    if (editorMode === 'rename-tab' && selectedTab) {
+    if (editorMode === 'ssh-tab') {
+      succeeded = await run(() => onOpenSshShell(name));
+    } else if (editorMode === 'rename-ssh-tab' && editingSshTerminalId) {
+      succeeded = await run(() =>
+        onRenameSshShell(editingSshTerminalId, name.trim() || t('terminal.sshShell')),
+      );
+    } else if (editorMode === 'rename-tab' && selectedTab) {
       succeeded = await run(() =>
         client.native.requestHerdrApi({
           method: 'tab.rename',
@@ -1122,6 +1305,7 @@ export function SessionScreen({
     if (!succeeded) pendingFocus.current = null;
     setName('');
     setEditingPaneId(null);
+    setEditingSshTerminalId(null);
     setEditorMode(null);
   };
 
@@ -1133,7 +1317,15 @@ export function SessionScreen({
     setEditorMode('rename-tab');
   };
 
+  const openRenameSshTab = (item: TerminalTab) => {
+    chooseVisibleTab(item);
+    setName(item.label);
+    setEditingSshTerminalId(item.id);
+    setEditorMode('rename-ssh-tab');
+  };
+
   const closeTab = async (item: TabInfo | undefined = selectedTab) => {
+    if (!client) return;
     if (!item) return;
     // Herdr focuses a surviving tab after closing the current one.
     pendingPaneFocus.current = null;
@@ -1160,6 +1352,7 @@ export function SessionScreen({
   };
 
   const closePane = async (pane: PaneInfo) => {
+    if (!client) return;
     if (editingPaneId === pane.pane_id) {
       setEditingPaneId(null);
       setEditorMode(null);
@@ -1175,6 +1368,7 @@ export function SessionScreen({
   const closeEditor = () => {
     setName('');
     setEditingPaneId(null);
+    setEditingSshTerminalId(null);
     setEditorMode(null);
   };
 
@@ -1205,6 +1399,14 @@ export function SessionScreen({
   };
 
   const closeActiveChat = useCallback(() => {
+    if (savedChatOpen) {
+      setSavedChatOpen(false);
+      setSavedChat(null);
+      savedChatGeneration.current += 1;
+      liveChatResumeRef.current = null;
+      cancelChatOpen();
+      return;
+    }
     const terminalId = activeTerminalSession?.terminalId;
     if (!terminalId) return;
     cancelChatOpen();
@@ -1217,9 +1419,10 @@ export function SessionScreen({
         ...view, presentation: closeChatPresentation(view.presentation),
       });
     });
-  }, [activeTerminalSession?.terminalId, activeTarget, cancelChatOpen, updateChatRestoreIntent]);
+  }, [activeTerminalSession?.terminalId, activeTarget, cancelChatOpen, savedChatOpen, updateChatRestoreIntent]);
 
   const openAgentChat = () => {
+    if (!client) return openSavedChat();
     if (activeChatView && chatPresentationRequested(activeChatView.presentation)) return;
     if (activeTarget && activeChatView) {
       try {
@@ -1269,16 +1472,16 @@ export function SessionScreen({
       <TerminalBackground preferences={terminalPreferences} />
       <View
         className="absolute inset-x-0 z-30"
-        style={{ bottom: terminalControlBarInset(safeAreaInsets.bottom) }}
+        style={{ bottom: terminalSessionChrome.bottom }}
       >
         <View
-          accessibilityElementsHidden={!terminalSessionChromeVisible}
+          accessibilityElementsHidden={!terminalSessionChrome.visible}
           importantForAccessibility={
-            terminalSessionChromeVisible ? 'auto' : 'no-hide-descendants'
+            terminalSessionChrome.visible ? 'auto' : 'no-hide-descendants'
           }
-          pointerEvents={terminalSessionChromeVisible ? 'auto' : 'none'}
+          pointerEvents={terminalSessionChrome.visible ? 'auto' : 'none'}
           className="h-[55px] flex-row border-b border-border bg-transparent"
-          style={terminalSessionChromeVisible ? undefined : { display: 'none' }}
+          style={terminalSessionChrome.visible ? undefined : { display: 'none' }}
         >
           <Button
             accessibilityLabel={t('session.backToHerd')}
@@ -1295,130 +1498,114 @@ export function SessionScreen({
               color={colors.text}
             />
           </Button>
-          {workspace ? (
-            <>
-              <ScrollView
-                className="min-w-0 flex-1"
-                horizontal
-                showsHorizontalScrollIndicator={false}
-                contentContainerClassName="items-center px-1.5 gap-[5px]"
-              >
-                {tabs.map(item => {
-                  const active = item.tab_id === selectedTab?.tab_id;
-                  const itemPanes = selectableResources.panes.filter(
-                    pane => pane.tab_id === item.tab_id,
-                  );
-                  const itemSession = terminalState.sessions.find(session =>
-                    itemPanes.some(
-                      pane => pane.terminal_id === session.terminalId,
-                    ),
-                  );
-                  const label = item.label || item.tab_id;
-                  return (
-                    <View
-                      key={item.tab_id}
-                      className={cn(
-                        'h-11 max-w-[170px] flex-row items-center overflow-hidden rounded-full border',
-                        isIpad && 'max-w-[230px]',
+          <ScrollView
+            className="min-w-0 flex-1"
+            horizontal
+            showsHorizontalScrollIndicator={false}
+            contentContainerClassName="items-center px-1.5 gap-[5px]"
+          >
+            {visibleTabs.map(item => {
+              const active = item.id === selectedVisibleTabId;
+              const label = item.label;
+              return (
+                <View
+                  key={item.id}
+                  className={cn(
+                    'h-11 max-w-[170px] flex-row items-center overflow-hidden rounded-full border',
+                    isIpad && 'max-w-[230px]',
+                  )}
+                  style={sessionTabGlassStyle(active, colors)}
+                >
+                  <Button
+                    accessibilityLabel={t('session.openTab', {
+                      tab: label,
+                    })}
+                    className={cn(
+                      'h-11 min-w-0 flex-shrink justify-start gap-2 rounded-none px-[11px] py-0 pr-1 active:bg-transparent active:opacity-70 dark:active:bg-transparent',
+                      isIpad && 'px-3',
+                    )}
+                    variant="ghost"
+                    onPress={hapticPress(() => chooseVisibleTab(item))}
+                    onLongPress={client ? hapticPress(() => item.herdrTab
+                      ? openRenameTab(item.herdrTab) : openRenameSshTab(item)) : undefined}
+                  >
+                    {item.herdrTab ? <AnimatedAgentStatusGlyph
+                      status={item.agentStatus}
+                      color={sessionTabStatusColor(
+                        item.agentStatus,
+                        item.status,
+                        colors,
                       )}
-                      style={sessionTabGlassStyle(active, colors)}
+                      size={isIpad ? 16 : 12}
+                    /> : <SquareTerminal
+                      size={isIpad ? 16 : 12}
+                      color={sessionTabStatusColor(item.agentStatus, item.status, colors)}
+                    />}
+                    <Text
+                      numberOfLines={1}
+                      className={cn(
+                        'max-w-[94px] pb-0.5 text-[11px] font-semibold leading-[18px] text-muted-foreground',
+                        isIpad && 'max-w-[140px] text-[14px] leading-5',
+                        active && 'text-primary-foreground',
+                      )}
                     >
-                      <Button
-                        accessibilityLabel={t('session.openTab', {
-                          tab: label,
-                        })}
+                      {label}
+                    </Text>
+                    {item.paneCount > 1 && (
+                      <Text
                         className={cn(
-                          'h-11 min-w-0 flex-shrink justify-start gap-2 rounded-none px-[11px] py-0 pr-1 active:bg-transparent active:opacity-70 dark:active:bg-transparent',
-                          isIpad && 'px-3',
+                          'font-mono text-[8px] text-muted-foreground',
+                          isIpad && 'text-[11px]',
+                          active && 'text-primary-foreground',
                         )}
-                        variant="ghost"
-                        onPress={hapticPress(() => chooseTab(item))}
-                        onLongPress={hapticPress(() => openRenameTab(item))}
                       >
-                        <AnimatedAgentStatusGlyph
-                          status={item.agent_status}
-                          color={sessionTabStatusColor(
-                            item.agent_status,
-                            itemSession?.status,
-                            colors,
-                          )}
-                          size={isIpad ? 16 : 12}
-                        />
-                        <Text
-                          numberOfLines={1}
-                          className={cn(
-                            'max-w-[94px] pb-0.5 text-[11px] font-semibold leading-[18px] text-muted-foreground',
-                            isIpad && 'max-w-[140px] text-[14px] leading-5',
-                            active && 'text-primary-foreground',
-                          )}
-                        >
-                          {label}
-                        </Text>
-                        {item.pane_count > 1 && (
-                          <Text
-                            className={cn(
-                              'font-mono text-[8px] text-muted-foreground',
-                              isIpad && 'text-[11px]',
-                              active && 'text-primary-foreground',
-                            )}
-                          >
-                            {item.pane_count}
-                          </Text>
-                        )}
-                      </Button>
-                      <Button
-                        accessibilityLabel={t('session.closeTab', {
-                          tab: label,
-                        })}
-                        className="size-11 rounded-none px-0 active:bg-transparent active:opacity-70 dark:active:bg-transparent"
-                        variant="ghost"
-                        onPress={hapticPress(() => closeTab(item))}
-                      >
-                        <X
-                          size={isIpad ? 18 : 14}
-                          color={
-                            active ? colors.onPrimary : colors.textSecondary
-                          }
-                        />
-                      </Button>
-                    </View>
-                  );
-                })}
-              </ScrollView>
-              <Button
-                accessibilityLabel={t('session.newTab')}
-                className={cn(
-                  'h-[55px] items-center justify-center rounded-none px-0 py-0',
-                  Platform.OS === 'ios' ? 'w-14' : 'w-11',
-                )}
-                disabled={busy}
-                size="content"
-                variant="ghost"
-                onPress={hapticPress(() => setEditorMode('tab'))}
-              >
-                <Plus
-                  size={Platform.OS === 'ios' ? 23 : 16}
-                  color={colors.text}
-                />
-              </Button>
-            </>
-          ) : activeTerminalSession?.kind === 'ssh' ? (
-            <>
-              <Text className="flex-1 self-center px-2 font-mono text-[11px] font-semibold text-foreground">
-                {t('terminal.sshShell')}
-              </Text>
-              <Button
-                accessibilityLabel={t('terminal.closeSession')}
-                className="h-[55px] w-11 rounded-none px-0"
-                variant="ghost"
-                onPress={hapticPress(() =>
-                  onCloseTerminal(activeTerminalSession.terminalId),
-                )}
-              >
-                <X size={17} color={colors.text} />
-              </Button>
-            </>
-          ) : null}
+                        {item.paneCount}
+                      </Text>
+                    )}
+                  </Button>
+                  <Button
+                    accessibilityLabel={t('session.closeTab', {
+                      tab: label,
+                    })}
+                    className="size-11 rounded-none px-0 active:bg-transparent active:opacity-70 dark:active:bg-transparent"
+                    disabled={!client}
+                    variant="ghost"
+                    onPress={hapticPress(() => item.herdrTab
+                      ? closeTab(item.herdrTab) : onCloseTerminal(item.id))}
+                  >
+                    <X
+                      size={isIpad ? 18 : 14}
+                      color={
+                        active ? colors.onPrimary : colors.textSecondary
+                      }
+                    />
+                  </Button>
+                </View>
+              );
+            })}
+          </ScrollView>
+          {client && (
+            <OpenBrowserButton
+              runtimeId={client.native.runtimeId}
+              paneId={activePane?.pane_id}
+            />
+          )}
+          {client && <Button
+            accessibilityLabel={t('session.newTab')}
+            className={cn(
+              'h-[55px] items-center justify-center rounded-none px-0 py-0',
+              Platform.OS === 'ios' ? 'w-14' : 'w-11',
+            )}
+            disabled={busy}
+            size="content"
+            variant="ghost"
+            onPress={hapticPress(() => setEditorMode(sshTabsVisible ? 'ssh-tab' : 'tab'))}
+          >
+            <Plus
+              size={Platform.OS === 'ios' ? 23 : 16}
+              color={colors.text}
+            />
+          </Button>}
         </View>
 
         <ResourceEditorSheet
@@ -1452,7 +1639,9 @@ export function SessionScreen({
                 reportBackgroundFailure(create(), 'session-resource-create');
               }}
               placeholder={
-                editorMode === 'tab'
+                editorMode === 'ssh-tab'
+                  ? t('terminal.sshShell')
+                  : editorMode === 'tab'
                   ? t('herd.tabNamePlaceholder')
                   : t('herd.labelOptional')
               }
@@ -1461,7 +1650,7 @@ export function SessionScreen({
           </ResourceEditorField>
         </ResourceEditorSheet>
 
-        {terminalSessionChromeVisible && selectedTab && panes.length > 1 && (
+        {terminalSessionChrome.visible && !sshTabsVisible && selectedTab && panes.length > 1 && (
           <View className="h-11 flex-row border-b border-border bg-transparent">
             <ScrollView
               horizontal
@@ -1485,7 +1674,7 @@ export function SessionScreen({
                       className="h-11 min-w-0 flex-shrink justify-start gap-1.5 rounded-none px-2 py-0"
                       variant="ghost"
                       onPress={hapticPress(() => choosePane(pane))}
-                      onLongPress={hapticPress(() => openRenamePane(pane))}
+                      onLongPress={client ? hapticPress(() => openRenamePane(pane)) : undefined}
                     >
                       <View
                         className="size-[5px] rounded-full"
@@ -1506,7 +1695,7 @@ export function SessionScreen({
                         {label}
                       </Text>
                     </Button>
-                    <Button
+                    {client && <Button
                       accessibilityLabel={t('session.closePane', {
                         pane: label,
                       })}
@@ -1519,7 +1708,7 @@ export function SessionScreen({
                         size={13}
                         color={active ? colors.onPrimary : colors.textSecondary}
                       />
-                    </Button>
+                    </Button>}
                   </View>
                 );
               })}
@@ -1539,15 +1728,16 @@ export function SessionScreen({
             targets={terminalTargets}
             compact
             sessionChromeInset={sessionChromeInset}
-            onSessionChromeVisibilityChange={setTerminalSessionChromeVisible}
+            onSessionChromeLayoutChange={setTerminalSessionChrome}
             latencyMs={latencyMs}
             latencyWarningActive={latencyWarningActive}
-            visible={visible && Boolean(activeTarget)}
+            visible={visible && (Boolean(activeTarget) || !client)}
             preferences={terminalPreferences}
             controlUsage={terminalControlUsage}
             historyEntries={terminalHistory}
-            getComposerDraft={getComposerDraft}
-            onComposerDraftChange={onComposerDraftChange}
+            composerStore={composerStore}
+            composerDraftRequest={composerDraftRequest}
+            onComposerDraftConsumed={onComposerDraftConsumed}
             linkScanRequest={linkScanRequest}
             pasteRequest={
               pasteRequest &&
@@ -1587,9 +1777,38 @@ export function SessionScreen({
                 : undefined
             }
             chatViewEnabled={chatVisible}
+            voiceContext={chatVisible && voiceChatState && voiceChatKey
+              ? {
+                  key: `${savedChatOpen ? 'saved' : 'live'}:${voiceChatKey}`,
+                  messages: voiceChatState.transcript.messages,
+                }
+              : undefined}
             renderViewportOverlay={
-              mountedChatViews.length
-                ? (insets, latestButtonBottom) =>
+              savedChatOpen
+                ? (insets, latestButtonBottom, search) => (
+                    <View className="absolute inset-0 bg-background">
+                      {activeSavedChat ? (
+                        <AgentChatView
+                          state={activeSavedChat.state}
+                          imageClient={client ?? undefined}
+                          agent={activeSavedChat.agent}
+                          agentStatus="idle"
+                          contentInsets={insets}
+                          latestButtonBottom={latestButtonBottom}
+                          searchOpen={search.open}
+                          onCloseSearch={search.onClose}
+                          onOpenFile={() => setSavedChatError(t('savedChats.filesUnavailable'))}
+                          onOpenWebLink={handleOpenWebLink}
+                        />
+                      ) : savedChatLoading ? (
+                        <ActivityIndicator className="mt-10" />
+                      ) : (
+                        <Text className="px-5 py-5 text-sm text-muted-foreground">{savedChatError || t('cachedHost.empty')}</Text>
+                      )}
+                    </View>
+                  )
+                : mountedChatViews.length
+                ? (insets, latestButtonBottom, search) =>
                     mountedChatViews.map(
                       ({ key, view: chatView, identity }) => {
                         const selected = key === activeTarget?.key;
@@ -1598,11 +1817,15 @@ export function SessionScreen({
                           active &&
                           chatPresentationVisible(chatView.presentation);
                         const terminalId = chatView.binding.terminalId;
+                        const chatClient = terminalTargets.find(target => target.key === key)?.client;
                         return (
                           <ScreenUpdates key={identity} active={active}>
                             {() => (
                               <View
                                 key={key}
+                                // Keep retained chats under a stable native parent when shown/hidden.
+                                collapsable={false}
+                                testID="agent-chat-layer"
                                 className="absolute inset-0"
                                 style={{ opacity: shown ? 1 : 0 }}
                                 pointerEvents={shown ? 'auto' : 'none'}
@@ -1617,6 +1840,7 @@ export function SessionScreen({
                                     chatView.presentation.generation,
                                   ].join(':')}
                                   state={chatView.state}
+                                  imageClient={chatClient}
                                   active={active}
                                   savedViewport={viewportRetention.snapshots.get(
                                     identity,
@@ -1635,7 +1859,10 @@ export function SessionScreen({
                                   }
                                   contentInsets={insets}
                                   latestButtonBottom={latestButtonBottom}
+                                  searchOpen={search.open}
+                                  onCloseSearch={search.onClose}
                                   onOpenFile={openChatFile}
+                                  onOpenWebLink={handleOpenWebLink}
                                   onInitialViewportReady={() => {
                                     const generation =
                                       chatView.presentation.generation;
@@ -1708,13 +1935,7 @@ export function SessionScreen({
                 />
               ) : undefined
             }
-            onOpenLink={link => {
-              if (terminalPreferences.openLinksInApp) setLinksOpen(true);
-              reportBackgroundFailure(
-                openTerminalLink(link),
-                'terminal-link-open',
-              );
-            }}
+            onOpenLink={handleOpenWebLink}
             onLinksScanned={links => {
               setTerminalLinks(links);
               setLinksBusy(false);
@@ -1788,7 +2009,7 @@ export function SessionScreen({
               </Text>
             </View>
           )}
-        <AttachmentPasteSheet
+        {client && <AttachmentPasteSheet
           client={client}
           visible={attachmentsOpen}
           onClose={() => setAttachmentsOpen(false)}
@@ -1805,7 +2026,7 @@ export function SessionScreen({
               dispose: attachment.dispose,
             }));
           }}
-        />
+        />}
         <AgentIntegrationInstallSheet
           integration={chatOpen.notice?.type === 'integration' ? chatOpen.notice.integration : null}
           onCancel={chatOpen.dismissNotice}
@@ -1910,21 +2131,28 @@ export function SessionScreen({
                     <X size={19} color={colors.text} />
                   </Button>
                 </View>
-                <View className="min-h-[66px] flex-row items-center border-b border-border px-4 py-3">
-                  <View className="min-w-0 flex-1 pr-4">
-                    <Text className="text-[14px] font-semibold text-foreground">
-                      {t('terminal.openLinksInApp')}
-                    </Text>
-                    <Text className="mt-0.5 text-[10px] leading-[14px] text-muted-foreground">
-                      {t('terminal.openLinksInAppCopy')}
-                    </Text>
+                {client && (
+                  <View className="border-b border-border px-4 py-3">
+                    <BrowserTunnelingSetting runtimeId={client.native.runtimeId} />
                   </View>
-                  <Switch
-                    accessibilityLabel={t('terminal.openLinksInApp')}
-                    checked={terminalPreferences.openLinksInApp}
-                    onCheckedChange={onTerminalOpenLinksInAppChange}
-                  />
-                </View>
+                )}
+                {client && supportsBrowserControl() && (
+                  <View className="border-b border-border px-4 py-3">
+                    <Button
+                      accessibilityLabel={t('terminal.openBrowser')}
+                      variant="secondary"
+                      onPress={async () => {
+                        try {
+                          await openNativeBrowser();
+                        } catch (reason) {
+                          setLinksError(reason instanceof Error ? reason.message : 'Could not open browser.');
+                        }
+                      }}
+                    >
+                      <Text>{t('terminal.openBrowser')}</Text>
+                    </Button>
+                  </View>
+                )}
                 {linksBusy ? (
                   <View className="flex-1 items-center justify-center gap-3 p-8">
                     <ActivityIndicator color={colors.primary} />
@@ -1953,7 +2181,7 @@ export function SessionScreen({
                           key={`${link}-${index}`}
                           className="h-auto min-h-[66px] flex-row justify-start gap-3 rounded-none border-b border-border px-0 py-3"
                           variant="ghost"
-                          onPress={() => openTerminalLink(link)}
+                          onPress={() => handleOpenWebLink(link)}
                         >
                           <View className="size-9 items-center justify-center rounded-full bg-muted">
                             <Globe2 size={17} color={colors.text} />
@@ -1966,11 +2194,6 @@ export function SessionScreen({
                               >
                                 {target.hostname}
                               </Text>
-                              {target.requiresSshTunnel && (
-                                <Text className="rounded-full bg-primary px-2 py-0.5 font-mono text-[7px] font-black text-primary-foreground">
-                                  {t('terminal.sshTunnel')}
-                                </Text>
-                              )}
                             </View>
                             <Text
                               numberOfLines={2}

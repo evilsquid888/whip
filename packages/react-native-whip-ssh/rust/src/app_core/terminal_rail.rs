@@ -1,9 +1,12 @@
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::herdr_api::{HerdrPaneInfo, HerdrSessionSnapshot};
 use crate::host_runtime::HostTerminalState;
 
 pub const SSH_SHELL_TERMINAL_ID: &str = "__whip_ssh_shell__";
+static NEXT_SSH_SHELL_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum TerminalKind {
@@ -34,20 +37,142 @@ pub struct TerminalEntryView {
 pub struct TerminalRailView {
     pub terminals: Vec<TerminalEntryView>,
     pub active_terminal_id: Option<String>,
+    pub resume_blob: String,
+}
+
+const RESUME_VERSION: u32 = 1;
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalResume {
+    version: u32,
+    terminal_ids: Vec<String>,
+    active_terminal_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LegacyResume {
+    sessions: Vec<serde_json::Value>,
+    active_terminal_id: Option<String>,
+}
+
+impl TerminalResume {
+    fn decode(blob: Option<&str>) -> Self {
+        let Some(blob) = blob else {
+            return Self::default();
+        };
+        if let Ok(resume) = serde_json::from_str::<Self>(blob) {
+            return if resume.version == RESUME_VERSION {
+                resume
+            } else {
+                Self::default()
+            };
+        }
+        // Older clients stored pane/title/font metadata alongside terminal IDs.
+        // Only identity and selection belong to the rail.
+        serde_json::from_str::<LegacyResume>(blob).map_or_else(
+            |_| Self::default(),
+            |legacy| Self {
+                version: RESUME_VERSION,
+                terminal_ids: legacy
+                    .sessions
+                    .iter()
+                    .filter_map(|entry| {
+                        entry
+                            .get("terminalId")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned)
+                    })
+                    .collect(),
+                active_terminal_id: legacy.active_terminal_id,
+            },
+        )
+    }
 }
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct TerminalRail {
     terminals: Vec<TerminalEntryView>,
     active_terminal_id: Option<String>,
+    pending_resume: Option<TerminalResume>,
 }
 
 impl TerminalRail {
+    pub(super) fn seed_cached(&mut self, snapshot: &HerdrSessionSnapshot) {
+        let active = snapshot
+            .panes
+            .iter()
+            .find(|pane| Some(pane.pane_id.as_str()) == snapshot.focused_pane_id.as_deref())
+            .or_else(|| snapshot.panes.iter().find(|pane| pane.focused));
+        self.restore(
+            snapshot
+                .panes
+                .iter()
+                .filter(|pane| !pane.terminal_id.is_empty())
+                .map(|pane| pane.terminal_id.clone())
+                .collect(),
+            active.map(|pane| pane.terminal_id.clone()),
+            snapshot,
+        );
+        self.mark_cached();
+    }
+
+    pub(super) fn mark_cached(&mut self) {
+        for terminal in &mut self.terminals {
+            if terminal.kind == TerminalKind::Herdr {
+                terminal.state = TerminalUiState::Disconnected;
+                terminal.error = None;
+                terminal.reconnect_attempt = 0;
+            }
+        }
+    }
+
     pub(super) fn view(&self) -> TerminalRailView {
         TerminalRailView {
             terminals: self.terminals.clone(),
             active_terminal_id: self.active_terminal_id.clone(),
+            resume_blob: self.resume_blob(),
         }
+    }
+
+    fn resume_blob(&self) -> String {
+        if let Some(resume) = &self.pending_resume {
+            return serde_json::to_string(resume).unwrap_or_default();
+        }
+        let terminal_ids: Vec<_> = self
+            .terminals
+            .iter()
+            .filter(|terminal| terminal.kind == TerminalKind::Herdr)
+            .map(|terminal| terminal.terminal_id.clone())
+            .collect();
+        let active_terminal_id = self
+            .active_terminal_id
+            .clone()
+            .filter(|active| terminal_ids.contains(active))
+            .or_else(|| terminal_ids.first().cloned());
+        // This record contains only strings, integers and options; serialization cannot fail.
+        serde_json::to_string(&TerminalResume {
+            version: RESUME_VERSION,
+            terminal_ids,
+            active_terminal_id,
+        })
+        .unwrap_or_default()
+    }
+
+    pub(super) fn restore_blob(
+        &mut self,
+        blob: Option<&str>,
+        snapshot: &HerdrSessionSnapshot,
+    ) -> bool {
+        let resume = TerminalResume::decode(blob);
+        self.restore(resume.terminal_ids, resume.active_terminal_id, snapshot)
+    }
+
+    pub(super) fn defer_restore(&mut self, blob: Option<&str>) {
+        let mut resume = TerminalResume::decode(blob);
+        resume.version = RESUME_VERSION;
+        self.pending_resume = Some(resume);
     }
 
     pub(super) fn restore(
@@ -56,6 +181,17 @@ impl TerminalRail {
         active_terminal_id: Option<String>,
         snapshot: &HerdrSessionSnapshot,
     ) -> bool {
+        self.pending_resume = None;
+        let shells: Vec<_> = self
+            .terminals
+            .iter()
+            .filter(|terminal| terminal.kind == TerminalKind::Ssh)
+            .cloned()
+            .collect();
+        let active_shell = self
+            .active_terminal_id
+            .clone()
+            .filter(|id| shells.iter().any(|terminal| terminal.terminal_id == *id));
         let panes_by_terminal: HashMap<_, _> = snapshot
             .panes
             .iter()
@@ -94,6 +230,10 @@ impl TerminalRail {
         {
             self.open_pane(focused);
         }
+        self.terminals.extend(shells);
+        if active_shell.is_some() {
+            self.active_terminal_id = active_shell;
+        }
         true
     }
 
@@ -119,27 +259,44 @@ impl TerminalRail {
     }
 
     pub(super) fn open_ssh_shell(&mut self, title: String) -> bool {
-        if let Some(existing) = self
-            .terminals
-            .iter_mut()
-            .find(|terminal| terminal.kind == TerminalKind::Ssh)
-        {
-            let changed = existing.title != title
-                || self.active_terminal_id.as_deref() != Some(SSH_SHELL_TERMINAL_ID);
-            existing.title = title;
-            self.active_terminal_id = Some(SSH_SHELL_TERMINAL_ID.to_owned());
-            return changed;
-        }
+        let id = NEXT_SSH_SHELL_ID.fetch_add(1, Ordering::Relaxed);
+        let terminal_id = format!("{SSH_SHELL_TERMINAL_ID}:{id}");
         self.terminals.push(TerminalEntryView {
-            terminal_id: SSH_SHELL_TERMINAL_ID.to_owned(),
-            pane_id: SSH_SHELL_TERMINAL_ID.to_owned(),
+            terminal_id: terminal_id.clone(),
+            pane_id: terminal_id.clone(),
             title,
             kind: TerminalKind::Ssh,
             state: TerminalUiState::Connecting,
             error: None,
             reconnect_attempt: 0,
         });
-        self.active_terminal_id = Some(SSH_SHELL_TERMINAL_ID.to_owned());
+        self.active_terminal_id = Some(terminal_id);
+        true
+    }
+
+    pub(super) fn select_ssh_shell(&mut self, terminal_id: &str) -> bool {
+        if self.active_terminal_id.as_deref() == Some(terminal_id)
+            || !self.terminals.iter().any(|terminal| {
+                terminal.kind == TerminalKind::Ssh && terminal.terminal_id == terminal_id
+            })
+        {
+            return false;
+        }
+        self.active_terminal_id = Some(terminal_id.to_owned());
+        true
+    }
+
+    pub(super) fn rename_ssh_shell(&mut self, terminal_id: &str, title: String) -> bool {
+        let Some(terminal) = self.terminals.iter_mut().find(|terminal| {
+            terminal.kind == TerminalKind::Ssh && terminal.terminal_id == terminal_id
+        }) else {
+            return false;
+        };
+        let title = title.trim();
+        if title.is_empty() || terminal.title == title {
+            return false;
+        }
+        title.clone_into(&mut terminal.title);
         true
     }
 
@@ -162,6 +319,10 @@ impl TerminalRail {
     }
 
     pub(super) fn reconcile(&mut self, snapshot: &HerdrSessionSnapshot) -> bool {
+        if let Some(resume) = self.pending_resume.take() {
+            self.restore(resume.terminal_ids, resume.active_terminal_id, snapshot);
+            return true;
+        }
         let panes_by_terminal: HashMap<_, _> = snapshot
             .panes
             .iter()
@@ -353,15 +514,67 @@ mod tests {
         let mut rail = TerminalRail::default();
         rail.open_pane(&pane("gone", "pane-gone", "gone"));
         rail.open_ssh_shell("SSH shell".to_owned());
+        let shell_id = rail.active_terminal_id.clone();
         rail.active_terminal_id = Some("gone".to_owned());
 
         rail.reconcile(&snapshot(Vec::new()));
 
         assert_eq!(rail.terminals.len(), 1);
         assert_eq!(rail.terminals[0].kind, TerminalKind::Ssh);
-        assert_eq!(
-            rail.active_terminal_id.as_deref(),
-            Some(SSH_SHELL_TERMINAL_ID)
+        assert_eq!(rail.active_terminal_id, shell_id);
+    }
+
+    #[test]
+    fn ssh_tabs_have_independent_identity_selection_titles_and_lifecycle() {
+        let mut rail = TerminalRail::default();
+        rail.open_ssh_shell("Build".to_owned());
+        let first = rail.active_terminal_id.clone().unwrap();
+        rail.open_ssh_shell("Logs".to_owned());
+        let second = rail.active_terminal_id.clone().unwrap();
+        assert_ne!(first, second);
+        rail.update_lifecycle(&first, HostTerminalState::Attached, false, None, 0);
+        assert!(rail.select_ssh_shell(&first));
+        assert!(rail.rename_ssh_shell(&second, " Server logs ".to_owned()));
+        assert_eq!(rail.terminals[0].state, TerminalUiState::Connected);
+        assert_eq!(rail.terminals[1].state, TerminalUiState::Connecting);
+        assert_eq!(rail.terminals[0].title, "Build");
+        assert_eq!(rail.terminals[1].title, "Server logs");
+        assert_eq!(rail.active_terminal_id.as_deref(), Some(first.as_str()));
+
+        assert!(!rail.select_ssh_shell("missing"));
+        assert!(!rail.rename_ssh_shell(&first, "  ".to_owned()));
+        assert!(rail.close(&first));
+        assert_eq!(rail.active_terminal_id.as_deref(), Some(second.as_str()));
+        rail.open_ssh_shell("Replacement".to_owned());
+        assert_ne!(rail.active_terminal_id.as_deref(), Some(first.as_str()));
+        rail.close(&second);
+        assert_eq!(rail.terminals.len(), 1);
+        let remaining = rail.active_terminal_id.clone().unwrap();
+        rail.close(&remaining);
+        assert!(rail.terminals.is_empty());
+        assert!(rail.active_terminal_id.is_none());
+    }
+
+    #[test]
+    fn restoring_herdr_tabs_preserves_open_ssh_tabs_and_their_selection() {
+        let mut rail = TerminalRail::default();
+        rail.open_ssh_shell("Build".to_owned());
+        rail.open_ssh_shell("Logs".to_owned());
+        let active = rail.active_terminal_id.clone();
+        let shells = rail.terminals.clone();
+        let mut focused_pane = pane("herdr", "pane", "Agent");
+        focused_pane.focused = true;
+        let host = snapshot(vec![focused_pane]);
+        rail.restore_blob(None, &host);
+        assert_eq!(&rail.terminals[1..], &shells);
+        assert_eq!(rail.active_terminal_id, active);
+        rail.reconcile(&snapshot(Vec::new()));
+        assert_eq!(rail.terminals, shells);
+        assert_eq!(rail.active_terminal_id, active);
+        assert!(
+            TerminalResume::decode(Some(&rail.view().resume_blob))
+                .terminal_ids
+                .is_empty()
         );
     }
 
@@ -384,6 +597,96 @@ mod tests {
         assert_eq!(rail.terminals[0].state, TerminalUiState::Connected);
         assert_eq!(rail.terminals[0].reconnect_attempt, 0);
         assert_eq!(rail.terminals[0].error, None);
+    }
+
+    #[test]
+    fn resume_waits_for_an_authoritative_snapshot() {
+        let mut rail = TerminalRail::default();
+        rail.defer_restore(Some(
+            r#"{"version":1,"terminalIds":["one","two"],"activeTerminalId":"two"}"#,
+        ));
+        let resume = TerminalResume::decode(Some(&rail.view().resume_blob));
+        assert_eq!(resume.terminal_ids, ["one", "two"]);
+        assert!(rail.terminals.is_empty());
+        rail.reconcile(&snapshot(vec![pane(
+            "two",
+            "current-pane",
+            "current-title",
+        )]));
+        assert_eq!(rail.terminals.len(), 1);
+        assert_eq!(rail.terminals[0].pane_id, "current-pane");
+        assert_eq!(rail.active_terminal_id.as_deref(), Some("two"));
+    }
+
+    #[test]
+    fn deferred_resume_keeps_a_shell_opened_while_waiting() {
+        let mut rail = TerminalRail::default();
+        rail.defer_restore(Some(
+            r#"{"version":1,"terminalIds":["one"],"activeTerminalId":"one"}"#,
+        ));
+        rail.open_ssh_shell("SSH shell".to_owned());
+        let shell_id = rail.active_terminal_id.clone().unwrap();
+        rail.update_lifecycle(&shell_id, HostTerminalState::Attached, false, None, 0);
+        rail.reconcile(&snapshot(vec![pane("one", "pane-one", "one")]));
+        assert_eq!(rail.terminals.len(), 2);
+        assert_eq!(rail.terminals[1].state, TerminalUiState::Connected);
+        assert_eq!(rail.active_terminal_id.as_deref(), Some(shell_id.as_str()));
+    }
+
+    #[test]
+    fn resume_round_trip_rebuilds_metadata_and_excludes_ssh() {
+        let mut rail = TerminalRail::default();
+        rail.open_pane(&pane("one", "old-pane", "old-title"));
+        rail.open_pane(&pane("two", "pane-two", "two"));
+        rail.open_ssh_shell("SSH shell".to_owned());
+        let blob = rail.view().resume_blob;
+        let mut restored = TerminalRail::default();
+        restored.restore_blob(
+            Some(&blob),
+            &snapshot(vec![
+                pane("one", "new-pane", "new-title"),
+                pane("two", "pane-two", "two"),
+            ]),
+        );
+        assert_eq!(restored.terminals.len(), 2);
+        assert_eq!(restored.terminals[0].pane_id, "new-pane");
+        assert_eq!(restored.terminals[0].title, "new-title");
+        assert_eq!(restored.active_terminal_id.as_deref(), Some("one"));
+        assert_eq!(restored.view().resume_blob, blob);
+        restored.update_lifecycle(
+            "one",
+            HostTerminalState::Failed,
+            true,
+            Some("lost".to_owned()),
+            2,
+        );
+        assert_eq!(restored.view().resume_blob, blob);
+    }
+
+    #[test]
+    fn legacy_resume_migrates_identity_and_selection_only() {
+        let mut rail = TerminalRail::default();
+        rail.restore_blob(Some(r#"{"sessions":[null,{"terminalId":"one","paneId":"old","title":"old","fontSize":12},{"terminalId":"one"},{"terminalId":"missing"},{"terminalId":"two"}],"activeTerminalId":"two"}"#),
+            &snapshot(vec![pane("one", "pane-one", "one"), pane("two", "pane-two", "two")]));
+        assert_eq!(rail.terminals.len(), 2);
+        assert_eq!(rail.active_terminal_id.as_deref(), Some("two"));
+        let resume = TerminalResume::decode(Some(&rail.view().resume_blob));
+        assert_eq!(resume.terminal_ids, ["one", "two"]);
+        assert_eq!(rail.terminals[0].pane_id, "pane-one");
+    }
+
+    #[test]
+    fn corrupt_or_unsupported_resume_cannot_restore_terminals() {
+        for blob in [
+            None,
+            Some("not json"),
+            Some(r#"{"version":2,"terminalIds":["one"],"activeTerminalId":"one"}"#),
+        ] {
+            let mut rail = TerminalRail::default();
+            rail.restore_blob(blob, &snapshot(vec![pane("one", "pane-one", "one")]));
+            assert!(rail.terminals.is_empty());
+            assert_eq!(rail.active_terminal_id, None);
+        }
     }
 
     #[test]

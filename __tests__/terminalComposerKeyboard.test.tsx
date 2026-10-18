@@ -1,5 +1,7 @@
-import { useImperativeHandle, type ComponentProps, type Ref } from 'react';
+import { useContext, useImperativeHandle, type ComponentProps, type ReactNode, type Ref } from 'react';
 import { act, create, type ReactTestInstance, type ReactTestRenderer } from 'react-test-renderer';
+import * as Haptics from 'expo-haptics';
+import Clipboard from '@react-native-clipboard/clipboard';
 import {
   Keyboard,
   Platform,
@@ -9,9 +11,27 @@ import {
 
 import { TerminalScreen } from '../src/components/TerminalScreen';
 import { AgentChatView } from '../src/components/AgentChatView';
+jest.mock('react-native-whip-ssh/src/chatSearch', () => ({
+  NativeChatSearchIndex: jest.fn().mockImplementation(() => ({
+    setDocuments: jest.fn(),
+    search: jest.fn((query: string) => ({ query, matches: [], selected: undefined, truncated: false })),
+    dispose: jest.fn(),
+  })),
+}));
 import { emptyTranscript } from '../src/agentChat';
-import { terminalControlBarInset } from '../src/lib/floatingChrome';
+import { SCROLL_IDLE_MS } from '../src/hooks/useScrollActivity';
+import {
+  TERMINAL_CURSOR_CLEARANCE,
+  terminalControlBarInset,
+  terminalSessionChromeHeight,
+} from '../src/lib/floatingChrome';
 import { setTerminalKeyboardOverlay } from '../src/services/terminalSoftInput';
+import { uploadPastedComposerImage } from '../src/services/composerImagePaste';
+import { TerminalComposerStore } from '../src/lib/terminalComposerStore';
+import { ChatComposerSelection } from '../src/components/ChatComposerSelection';
+
+jest.mock('../src/services/composerImagePaste', () => ({ uploadPastedComposerImage: jest.fn() }));
+jest.mock('../src/services/attachmentPaste', () => ({ discardClipboardAttachment: jest.fn() }));
 
 jest.mock('react-native-css-interop/jsx-runtime', () =>
   jest.requireActual('react/jsx-runtime'),
@@ -45,11 +65,16 @@ jest.mock('react-native-reanimated', () => ({
 jest.mock('@rn-primitives/portal', () => ({ Portal: 'Portal' }));
 jest.mock('@shopify/flash-list', () => ({ FlashList: 'FlashList' }));
 jest.mock('react-native-code-highlighter', () => 'CodeHighlighter');
+jest.mock('react-syntax-highlighter/dist/esm/default-highlight', () =>
+  jest.requireActual('react-syntax-highlighter/dist/cjs/default-highlight'),
+);
 jest.mock('react-syntax-highlighter/dist/esm/styles/hljs', () => ({
   atomOneDarkReasonable: {},
   atomOneLight: {},
 }));
 jest.mock('../src/components/MarkdownText', () => ({ MarkdownText: 'MarkdownText' }));
+jest.mock('../src/components/SelectableChatText', () => ({ SelectableChatText: 'SelectableChatText' }));
+jest.mock('../src/services/remoteFileTransfer', () => ({ cacheRemoteFile: jest.fn() }));
 jest.mock(
   'lucide-react-native',
   () => new Proxy({}, { get: (_target, name) => String(name) }),
@@ -66,8 +91,10 @@ jest.mock('../src/components/TerminalRendererHost', () => ({
 jest.mock('../src/components/MessageComposer', () => ({
   MessageComposer: MockMessageComposer,
   ComposerInput: 'ComposerInput',
+  ComposerVoiceButton: 'ComposerVoiceButton',
 }));
 jest.mock('../src/components/GlassSurface', () => ({
+  GlassSurface: 'GlassSurface',
   useAppGlassEnabled: () => false,
 }));
 jest.mock('../src/components/OverlayScrollbar', () => ({
@@ -87,10 +114,13 @@ jest.mock('../src/components/ui/text', () => ({ Text: 'Text' }));
 jest.mock('../src/theme', () => ({
   colors: {},
   useTheme: () => ({ colors: {} }),
-  appGlassControlStyle: () => ({}),
+  latestButtonStyle: () => ({}),
 }));
 jest.mock('../src/services/volumeKeys', () => ({
-  addTerminalVolumeKeyListener: () => ({ remove: jest.fn() }),
+  addTerminalVolumeKeyListener: (listener: (key: 'up' | 'down') => void) => {
+    mockVolumeKeyListeners.add(listener);
+    return { remove: () => mockVolumeKeyListeners.delete(listener) };
+  },
 }));
 jest.mock('../src/services/terminalSoftInput', () => ({
   setTerminalKeyboardOverlay: jest.fn(async () => {}),
@@ -100,21 +130,32 @@ jest.mock('../src/services/operationalDiagnostics', () => ({
   operationalErrorDetails: () => ({}),
 }));
 
-const mockComposerHandle = { focus: jest.fn(), blur: jest.fn() };
-function MockMessageComposer(composerProps: { inputRef: Ref<unknown> }) {
+const mockComposerHandle = { focus: jest.fn(), blur: jest.fn(), clear: jest.fn(), setNativeProps: jest.fn(), setSelection: jest.fn() };
+const mockVolumeKeyListeners = new Set<(key: 'up' | 'down') => void>();
+function MockMessageComposer(composerProps: { inputRef: Ref<unknown>; beforeInput?: ReactNode }) {
   useImperativeHandle(composerProps.inputRef, () => mockComposerHandle);
-  return require('react/jsx-runtime').jsx('MessageComposer', composerProps);
+  return require('react/jsx-runtime').jsx('MessageComposer', { ...composerProps, children: composerProps.beforeInput });
 }
 const terminalHandle = {
+  paste: jest.fn(),
+  input: jest.fn(() => true),
+  submitPastes: jest.fn(async (): Promise<void> => undefined),
   fit: jest.fn(),
   focus: jest.fn(),
   blur: jest.fn(),
   setKeyboardEnabled: jest.fn(),
   setForcedMouseInput: jest.fn(),
   clearSearch: jest.fn(),
+  search: jest.fn(),
   cancelPendingResumeScroll: jest.fn(),
+  changeFontSize: jest.fn(),
+  scroll: jest.fn(),
 };
-const chatListHandle = { scrollToEnd: jest.fn(), scrollToOffset: jest.fn() };
+const chatListHandle = {
+  scrollToEnd: jest.fn(),
+  scrollToOffset: jest.fn(),
+  getAbsoluteLastScrollOffset: jest.fn(() => 0),
+};
 const screenHeight = 800;
 const keyboardHeight = 300;
 const controlBarHeight = terminalControlBarInset(34);
@@ -151,7 +192,6 @@ const props: Props = {
     xtermCacheCapacity: 4,
     cursorBlink: true,
     doubleTapAction: 'none',
-    openLinksInApp: false,
     pauseResizeInBackground: false,
     visualHints: false,
     backgroundImageUri: null,
@@ -162,8 +202,7 @@ const props: Props = {
   chatViewEnabled: false,
   onControlUse: jest.fn(),
   onHistoryEntry: jest.fn(),
-  getComposerDraft: () => '',
-  onComposerDraftChange: jest.fn(),
+  composerStore: new TerminalComposerStore(),
   onFontSizeChange: jest.fn(),
   onClose: jest.fn(),
   onStatus: jest.fn(),
@@ -253,8 +292,10 @@ function scrollEvent(offset: number) {
 }
 
 beforeEach(() => {
+  props.composerStore = new TerminalComposerStore();
   jest.useFakeTimers();
   jest.clearAllMocks();
+  mockVolumeKeyListeners.clear();
   listeners = new Map();
   jest.mocked(Keyboard.metrics).mockReturnValue(undefined);
   jest.mocked(Keyboard.isVisible).mockReturnValue(false);
@@ -266,6 +307,258 @@ beforeEach(() => {
       typeof Keyboard.addListener
     >;
   });
+});
+
+test('volume keys use the latest terminal action and ignore hidden terminals', () => {
+  const fontPreferences = { ...props.preferences, volumeUpAction: 'font-size' as const };
+  const scrollPreferences = { ...props.preferences, volumeUpAction: 'scroll' as const };
+  mount({ preferences: fontPreferences });
+
+  act(() => { for (const listener of mockVolumeKeyListeners) listener('up'); });
+  expect(terminalHandle.changeFontSize).toHaveBeenCalledWith(1);
+
+  act(() => renderer.update(<TerminalScreen {...props} preferences={scrollPreferences} />));
+  act(() => { for (const listener of mockVolumeKeyListeners) listener('up'); });
+  expect(terminalHandle.scroll).toHaveBeenCalledWith('up', 1);
+  expect(terminalHandle.changeFontSize).toHaveBeenCalledTimes(1);
+
+  act(() => renderer.update(<TerminalScreen {...props} visible={false} preferences={scrollPreferences} />));
+  act(() => { for (const listener of mockVolumeKeyListeners) listener('up'); });
+  expect(terminalHandle.scroll).toHaveBeenCalledTimes(1);
+});
+
+test('terminal keys and modifier locking give selection feedback while composer typing stays quiet', async () => {
+  mount();
+
+  await press('upKey');
+  expect(props.onControlUse).toHaveBeenLastCalledWith('up');
+  expect(Haptics.selectionAsync).toHaveBeenCalledTimes(1);
+
+  await press('ctrlModifier');
+  expect(props.onControlUse).toHaveBeenLastCalledWith('ctrl');
+  expect(Haptics.selectionAsync).toHaveBeenCalledTimes(2);
+
+  act(() => { button('ctrlModifier').props.onLongPress(); });
+  expect(Haptics.selectionAsync).toHaveBeenCalledTimes(3);
+
+  await press('compose');
+  act(() => { ui('MessageComposer').props.onChangeText('hello'); });
+  expect(Haptics.selectionAsync).toHaveBeenCalledTimes(3);
+});
+
+test('the terminal Paste control does nothing when the clipboard has no text', async () => {
+  jest.mocked(Clipboard.getString).mockResolvedValueOnce('');
+  mount();
+  await press('paste');
+  expect(terminalHandle.paste).not.toHaveBeenCalled();
+  expect(props.onHistoryEntry).not.toHaveBeenCalled();
+});
+
+test('the terminal Paste control preserves deliberately copied null text', async () => {
+  jest.mocked(Clipboard.getString).mockResolvedValueOnce('null');
+  mount();
+  await press('paste');
+  expect(terminalHandle.paste).toHaveBeenCalledWith('null');
+  expect(props.onHistoryEntry).toHaveBeenCalledWith('null');
+});
+
+test.each([false, true])('composer reports message acceptance in terminal and chat (chat=%s)', async chatViewEnabled => {
+  mount({ chatViewEnabled });
+  await press('compose');
+
+  act(() => {
+    expect(ui('MessageComposer').props.actions.onSend()).toBe(false);
+  });
+  act(() => { ui('MessageComposer').props.onChangeText('hello'); });
+  await act(async () => {
+    expect(ui('MessageComposer').props.actions.onSend()).toBe(true);
+  });
+
+  expect(terminalHandle.submitPastes).toHaveBeenCalledTimes(1);
+  expect(props.composerStore.snapshot(target.key).text).toBe('');
+});
+
+test('batched native edits submit the latest text and keep the next draft', async () => {
+  mount();
+  await press('compose');
+  const input = ui('MessageComposer').props;
+  act(() => {
+    input.onChangeText('first edit');
+    input.onChangeText('latest edit');
+    expect(input.actions.onSend()).toBe(true);
+    input.onChangeText('next draft');
+  });
+  await act(async () => {});
+
+  expect(terminalHandle.submitPastes).toHaveBeenCalledWith(target, ['latest edit'], true);
+  expect(ui('MessageComposer').props.initialValue).toBe('next draft');
+  expect(props.composerStore.snapshot(target.key)).toMatchObject({ text: 'next draft', queue: [] });
+});
+
+test('a send finishing after remount cannot resend messages from the new screen', async () => {
+  let finishOld!: () => void;
+  let finishNew!: () => void;
+  terminalHandle.submitPastes
+    .mockImplementationOnce(() => new Promise<void>(resolve => { finishOld = resolve; }))
+    .mockImplementationOnce(() => new Promise<void>(resolve => { finishNew = resolve; }));
+  mount();
+  await press('compose');
+  act(() => {
+    ui('MessageComposer').props.onChangeText('old screen');
+    ui('MessageComposer').props.actions.onSend();
+  });
+  act(() => renderer.unmount());
+  mount();
+  await press('compose');
+  act(() => {
+    ui('MessageComposer').props.onChangeText('new screen');
+    ui('MessageComposer').props.actions.onSend();
+  });
+
+  await act(async () => finishOld());
+
+  expect(terminalHandle.submitPastes).toHaveBeenCalledTimes(2);
+  expect(props.composerStore.snapshot(target.key).queue).toEqual([
+    expect.objectContaining({ text: 'new screen', sending: true }),
+  ]);
+  await act(async () => finishNew());
+  expect(props.composerStore.snapshot(target.key).queue).toEqual([]);
+  expect(props.onHistoryEntry).toHaveBeenCalledTimes(1);
+  expect(props.onHistoryEntry).toHaveBeenCalledWith('new screen');
+});
+
+test('a scrollbar drag sees native scroll updates from the same event batch', () => {
+  const scrollTarget = {
+    ...target,
+    client: { terminal: { scrollTerminal: jest.fn(async () => '') } },
+    scroll: { offset_from_bottom: 0, max_offset_from_bottom: 100, viewport_rows: 24 },
+  } as unknown as Props['targets'][number];
+  mount({ activeTarget: scrollTarget, targets: [scrollTarget] });
+  const terminal = ui('TerminalRendererHost');
+  const scrollbar = ui('OverlayScrollbar');
+
+  act(() => {
+    terminal.props.onScroll(scrollTarget, 'up', 10);
+    scrollbar.props.onDragStart({ trackHeight: 400, thumbHeight: 80 });
+    scrollbar.props.onDrag({ dy: -32, trackHeight: 400, thumbHeight: 80 });
+    scrollbar.props.onDragEnd();
+  });
+
+  // Ten rows of scrolling plus ten rows of dragging leave 80 of 124 rows above.
+  expect(ui('OverlayScrollbar').props.topPercent).toBeCloseTo(80 / 124 * 100);
+});
+
+test('draft text stays with its tab across switches and screen remounts', async () => {
+  const other = { ...target, key: 'target-2', session: { ...target.session, terminalId: 'terminal-2' } };
+  const targets = [target, other];
+  mount({ targets });
+  await press('compose');
+  act(() => { ui('MessageComposer').props.onChangeText('first tab'); });
+  act(() => renderer.update(<TerminalScreen {...props} targets={targets} activeTarget={other} />));
+  await press('compose');
+  expect(ui('MessageComposer').props.initialValue).toBe('');
+  act(() => { ui('MessageComposer').props.onChangeText('second tab'); });
+  act(() => renderer.update(<TerminalScreen {...props} targets={targets} activeTarget={target} />));
+  await press('compose');
+  expect(ui('MessageComposer').props.initialValue).toBe('first tab');
+
+  act(() => renderer.unmount());
+  mount({ targets });
+  await press('compose');
+  expect(ui('MessageComposer').props.initialValue).toBe('first tab');
+  expect(props.composerStore.snapshot(other.key).text).toBe('second tab');
+});
+
+test('unqueue restores text and attachments into the current draft', async () => {
+  const offline = { ...target, session: { ...target.session, status: 'disconnected' as const } };
+  const dispose = jest.fn();
+  props.composerStore.setText(target.key, 'queued text');
+  props.composerStore.addAttachment(target.key, { id: 1, remotePath: '/remote/file', previewUri: null, dispose });
+  mount({ activeTarget: offline, targets: [offline] });
+  await press('compose');
+  act(() => { expect(ui('MessageComposer').props.actions.onSend()).toBe(true); });
+  expect(terminalHandle.submitPastes).not.toHaveBeenCalled();
+  expect(props.composerStore.snapshot(target.key)).toMatchObject({ text: '', attachments: [], queue: [expect.anything()] });
+  act(() => { ui('MessageComposer').props.onChangeText('new draft'); });
+
+  await press('unqueue');
+
+  expect(ui('MessageComposer').props.initialValue).toBe('queued text\nnew draft');
+  expect(mockComposerHandle.setNativeProps).toHaveBeenLastCalledWith({ text: 'queued text\nnew draft' });
+  expect(props.composerStore.snapshot(target.key)).toMatchObject({ queue: [], attachments: [expect.objectContaining({ remotePath: '/remote/file' })] });
+  expect(dispose).not.toHaveBeenCalled();
+  await press('removeAttachment');
+  expect(props.composerStore.snapshot(target.key).attachments).toEqual([]);
+  expect(dispose).toHaveBeenCalledTimes(1);
+});
+
+function pendingImageUpload() {
+  let resolve!: (attachment: { remotePath: string; previewUri: string; dispose: () => void }) => void;
+  const result = new Promise<{ remotePath: string; previewUri: string; dispose: () => void }>(accept => { resolve = accept; });
+  const cancel = jest.fn();
+  const dispose = jest.fn();
+  jest.mocked(uploadPastedComposerImage).mockReturnValue({ result, cancel });
+  return { resolve: () => resolve({ remotePath: '/remote/photo.png', previewUri: 'file:///photo.png', dispose }), cancel, dispose };
+}
+const pastedImage = { uri: 'file:///clipboard/photo.png', name: 'photo.png', mimeType: 'image/png' };
+
+test.each([false, true])('image paste previews and sends an attachment in terminal and chat (chat=%s)', async chatViewEnabled => {
+  const upload = pendingImageUpload();
+  mount({ chatViewEnabled });
+  await press('compose');
+  act(() => { ui('MessageComposer').props.onImagePaste(pastedImage); });
+  expect(ui('MessageComposer').props.actions.sendDisabled).toBe(true);
+  act(() => { expect(ui('MessageComposer').props.actions.onSend()).toBe(false); });
+  expect(terminalHandle.submitPastes).not.toHaveBeenCalled();
+  await act(async () => upload.resolve());
+  expect(ui('MessageComposer').props.actions.sendDisabled).toBe(false);
+  expect(ui('Image').props.source).toEqual({ uri: 'file:///photo.png' });
+  await act(async () => { expect(ui('MessageComposer').props.actions.onSend()).toBe(true); });
+  expect(terminalHandle.submitPastes).toHaveBeenCalledWith(target, ['/remote/photo.png'], true);
+  expect(upload.dispose).toHaveBeenCalledTimes(1);
+});
+
+test('an image pasted before switching chats stays with the original draft', async () => {
+  const upload = pendingImageUpload();
+  const other = { ...target, key: 'target-2', session: { ...target.session, terminalId: 'terminal-2' } };
+  const targets = [target, other];
+  mount({ targets });
+  await press('compose');
+  act(() => { ui('MessageComposer').props.onImagePaste(pastedImage); });
+  act(() => renderer.update(<TerminalScreen {...props} targets={targets} activeTarget={other} />));
+  await act(async () => upload.resolve());
+  await press('compose');
+  expect(renderer.root.findAll(node => String(node.type) === 'Image')).toHaveLength(0);
+  expect(upload.dispose).not.toHaveBeenCalled();
+  act(() => renderer.update(<TerminalScreen {...props} targets={targets} activeTarget={target} />));
+  await press('compose');
+  expect(ui('Image').props.source).toEqual({ uri: 'file:///photo.png' });
+});
+
+test.each(['remove-target', 'unmount'])('image upload is cancelled on %s and its late preview is discarded', async cleanup => {
+  const upload = pendingImageUpload();
+  mount();
+  await press('compose');
+  act(() => { ui('MessageComposer').props.onImagePaste(pastedImage); });
+  act(() => {
+    if (cleanup === 'unmount') renderer.unmount();
+    else renderer.update(<TerminalScreen {...props} activeTarget={null} targets={[]} />);
+  });
+  expect(upload.cancel).toHaveBeenCalledTimes(1);
+  await act(async () => upload.resolve());
+  expect(upload.dispose).toHaveBeenCalledTimes(1);
+});
+
+test('the expanded composer handles image paste and waits for its upload', async () => {
+  const upload = pendingImageUpload();
+  mount();
+  await press('compose');
+  await act(async () => ui('MessageComposer').props.actions.onExpand());
+  act(() => { ui('ComposerInput').props.onImagePaste(pastedImage); });
+  expect(button('sendBufferedInput').props.disabled).toBe(true);
+  await act(async () => upload.resolve());
+  expect(button('sendBufferedInput').props.disabled).toBe(false);
+  expect(ui('Image').props.source).toEqual({ uri: 'file:///photo.png' });
 });
 
 afterEach(() => {
@@ -283,6 +576,66 @@ test('Chat mode covers the terminal while the evicted transcript has no viewport
   expect(ui('TerminalRendererHost').props.onResidencyEnd).toBe(onResidencyEnd);
   act(() => renderer.update(<TerminalScreen {...props} />));
   expect(renderer.root.findAll(node => node.props.className === 'absolute inset-0 z-10 bg-background')).toHaveLength(0);
+});
+
+test('terminal search shares four-result pages, direct selection, and stale-result handling', async () => {
+  mount();
+  await press('find');
+  act(() => { ui('Input').props.onChangeText('needle'); });
+  const matches = Array.from({ length: 6 }, (_, index) => ({ before: `${index} `, matched: 'needle', after: '', leading: false, trailing: false }));
+  act(() => { ui('TerminalRendererHost').props.onSearchResult({ query: 'needle', caseSensitive: false, regex: false, matches, index: 0, invalid: false, truncated: false }); });
+  const results = () => renderer.root.findAll(node => String(node.type) === 'Pressable' && node.props.accessibilityLabel?.startsWith('Result '));
+  const searchButton = (label: string) => renderer.root.find(node => String(node.type) === 'Button' && node.props.accessibilityLabel === label);
+  expect(results()).toHaveLength(4);
+  act(() => { results()[2].props.onPress(); });
+  expect(terminalHandle.search).toHaveBeenLastCalledWith('needle', false, false, 0, 2);
+  act(() => { searchButton('Next results page').props.onPress(); });
+  expect(terminalHandle.search).toHaveBeenLastCalledWith('needle', false, false, 0, 4);
+  act(() => { ui('TerminalRendererHost').props.onSearchResult({ query: 'needle', caseSensitive: false, regex: false, matches, index: 4, invalid: false, truncated: false }); });
+  expect(results()).toHaveLength(2);
+  expect(results()[0].props.accessibilityLabel).toMatch(/^Result 5:/);
+  act(() => { searchButton('Match case').props.onPress(); });
+  expect(terminalHandle.search).toHaveBeenLastCalledWith('needle', true, false, 0);
+  expect(results()).toHaveLength(0);
+  expect(searchButton('Next match').props.disabled).toBe(true);
+});
+
+test.each(['opencode', 'codex', 'claude'] as const)('bottom rail Find searches %s chat and follows the visible view', async agent => {
+  const state = { sessionId: 'chat-1', status: 'stale' as const, transcript: emptyTranscript('chat-1') };
+  const renderChat: Props['renderViewportOverlay'] = (contentInsets, latestButtonBottom, search) => (
+    <AgentChatView agent={agent} agentStatus="idle" state={state} contentInsets={contentInsets}
+      latestButtonBottom={latestButtonBottom} searchOpen={search.open} onCloseSearch={search.onClose}
+      onOpenFile={jest.fn()} />
+  );
+  mount({ chatViewEnabled: true, renderViewportOverlay: renderChat });
+  expect(renderer.root.findAll(node => node.props.accessibilityLabel === 'Search conversation')).toHaveLength(0);
+  await press('find');
+  expect(ui('Input').props.accessibilityLabel).toBe('Search chat');
+  expect(button('find').props.accessibilityState.selected).toBe(true);
+  act(() => { ui('Input').props.onChangeText('needle'); });
+  act(() => jest.advanceTimersByTime(200));
+  expect(terminalHandle.search).not.toHaveBeenCalled();
+
+  act(() => { renderer.root.find(node => String(node.type) === 'Button' && node.props.accessibilityLabel === 'Close search').props.onPress(); });
+  expect(button('find').props.accessibilityState.selected).toBe(false);
+  expect(renderer.root.findAll(node => String(node.type) === 'Input')).toHaveLength(0);
+  await press('find');
+  await press('find');
+  expect(renderer.root.findAll(node => String(node.type) === 'Input')).toHaveLength(0);
+
+  await press('find');
+  act(() => renderer.update(<TerminalScreen {...props} renderViewportOverlay={renderChat} />));
+  expect(button('find').props.accessibilityState.selected).toBe(false);
+  expect(renderer.root.findAll(node => String(node.type) === 'Input')).toHaveLength(0);
+  await press('find');
+  expect(ui('Input').props.placeholder).toBe('Search terminal');
+  act(() => { ui('Input').props.onChangeText('terminal needle'); });
+  expect(terminalHandle.search).toHaveBeenLastCalledWith('terminal needle', false, false, 0);
+  act(() => renderer.update(<TerminalScreen {...props} chatViewEnabled renderViewportOverlay={renderChat} />));
+  expect(button('find').props.accessibilityState.selected).toBe(false);
+  await press('find');
+  expect(ui('Input').props.accessibilityLabel).toBe('Search chat');
+  expect(ui('Input').props.value).toBe('');
 });
 
 describe.each(['android', 'ios'] as const)(
@@ -305,11 +658,21 @@ describe.each(['android', 'ios'] as const)(
         />,
       });
       const list = ui('FlashList');
+      const chatRoot = renderer.root.findByProps({ testID: 'agent-chat-root' });
+      expect(chatRoot.props.pointerEvents).toBe('none');
       act(() => {
+        renderer.root.findByProps({ testID: 'agent-chat-viewport' }).props.onLayout({
+          nativeEvent: { layout: { height: 400 } },
+        });
         list.props.onLayout({ nativeEvent: { layout: { height: 400 } } });
         list.props.onContentSizeChange(400, 1000);
+        list.props.onLoad();
+      });
+      expect(chatRoot.props.pointerEvents).toBe('none');
+      act(() => {
         list.props.onScroll(scrollEvent(600));
       });
+      expect(chatRoot.props.pointerEvents).toBe('auto');
 
       for (const composing of [false, true, false]) {
         if (composing) {
@@ -321,7 +684,7 @@ describe.each(['android', 'ios'] as const)(
           expect(composer.props.showSoftInputOnFocus).toBe(true);
           expect(terminalHandle.setKeyboardEnabled).toHaveBeenLastCalledWith(false);
         } else if (renderer.root.findAllByType(MockMessageComposer).length) {
-          await act(async () => ui('MessageComposer').props.actions.onClose());
+          await press('compose');
           await act(async () => emitKeyboard(false));
         }
 
@@ -343,6 +706,8 @@ describe.each(['android', 'ios'] as const)(
           scrollbar.props.onDragEnd();
         });
         expect(chatListHandle.scrollToOffset).toHaveBeenLastCalledWith({ offset: 200, animated: false });
+        expect(renderer.root.findAll(node => node.props.accessibilityLabel === 'Jump to latest')).toHaveLength(0);
+        act(() => { jest.advanceTimersByTime(SCROLL_IDLE_MS); });
         const latest = renderer.root.find(node => node.props.accessibilityLabel === 'Jump to latest');
         expectTouchEnabled(latest);
         act(() => { latest.props.onPress(); });
@@ -372,13 +737,37 @@ describe.each(['android', 'ios'] as const)(
       const scrollbar = ui('OverlayScrollbar');
       expectTouchEnabled(scrollbar);
       const previousTop = scrollbar.props.topPercent;
+      const latestButtons = () => renderer.root.findAll(
+        node => node.props.accessibilityLabel === 'Jump to latest terminal output',
+      );
+      act(() => { terminal.props.onVisualScrollState(scrollTarget, false); });
+      expect(latestButtons()).toHaveLength(1);
+      act(() => {
+        terminal.props.onScrollActivity(scrollTarget, true);
+        jest.advanceTimersByTime(SCROLL_IDLE_MS);
+      });
+      expect(latestButtons()).toHaveLength(0);
       act(() => { terminal.props.onScroll(scrollTarget, 'up', 10); });
       expect(ui('OverlayScrollbar').props.topPercent).toBeLessThan(previousTop);
       act(() => {
+        terminal.props.onScrollActivity(scrollTarget, false);
+        jest.advanceTimersByTime(SCROLL_IDLE_MS - 1);
+      });
+      expect(latestButtons()).toHaveLength(0);
+      act(() => { jest.advanceTimersByTime(1); });
+      expect(latestButtons()).toHaveLength(1);
+      act(() => {
         scrollbar.props.onDragStart({ trackHeight: 400, thumbHeight: 80 });
         scrollbar.props.onDrag({ dy: -32, trackHeight: 400, thumbHeight: 80 });
-        scrollbar.props.onDragEnd();
       });
+      expect(latestButtons()).toHaveLength(0);
+      act(() => {
+        scrollbar.props.onDragEnd();
+        jest.advanceTimersByTime(SCROLL_IDLE_MS);
+      });
+      expect(latestButtons()).toHaveLength(1);
+      act(() => { terminal.props.onVisualScrollState(scrollTarget, true); });
+      expect(latestButtons()).toHaveLength(0);
       expect(scrollTerminal).toHaveBeenCalledWith('terminal-1', 'up', 10);
       expect(terminalHandle.setKeyboardEnabled).toHaveBeenLastCalledWith(false);
       expect(terminalHandle.focus).not.toHaveBeenCalled();
@@ -386,7 +775,7 @@ describe.each(['android', 'ios'] as const)(
       expect(Keyboard.dismiss).not.toHaveBeenCalled();
       expect(setTerminalKeyboardOverlay).toHaveBeenLastCalledWith('terminal-1', true);
 
-      await act(async () => ui('MessageComposer').props.actions.onClose());
+      await press('compose');
       await act(async () => emitKeyboard(false));
       expectTouchEnabled(terminal);
       expectTouchEnabled(ui('OverlayScrollbar'));
@@ -429,7 +818,7 @@ describe.each(['android', 'ios'] as const)(
         expect(mockComposerHandle.focus).toHaveBeenCalledTimes(1);
         expect(terminalHandle.fit).not.toHaveBeenCalled();
 
-        await act(async () => composer.props.actions.onClose());
+        await press('compose');
         // Closing waits for the actual hide before removing the floating composer.
         expect(ui('MessageComposer').parent?.props.style.bottom).toBe(
           controlBarHeight + keyboardHeight,
@@ -450,46 +839,85 @@ describe.each(['android', 'ios'] as const)(
       },
     );
 
-    test('input toggles during show and hide keep composer geometry until the IME hides', async () => {
-      mount();
+    test.each([1, 2])('composer clears the %s-pane rail and reclaims its space while the keyboard is visible', async paneCount => {
+      const sessionChromeInset = terminalSessionChromeHeight(paneCount);
+      const onSessionChromeLayoutChange = jest.fn();
+      const renderViewportOverlay = jest.fn(() => null);
+      mount({ sessionChromeInset, onSessionChromeLayoutChange, renderViewportOverlay });
       await press('compose');
       await press('disableKeyboard');
+      expect(ui('MessageComposer').parent?.props.style.bottom).toBe(
+        controlBarHeight + sessionChromeInset,
+      );
       emitKeyboard(true);
       expect(ui('MessageComposer').parent?.props.style.bottom).toBe(
         controlBarHeight + keyboardHeight,
       );
+      expect(onSessionChromeLayoutChange).toHaveBeenLastCalledWith({
+        bottom: controlBarHeight + keyboardHeight, visible: false,
+      });
       await press('enableKeyboard');
       await press('disableKeyboard');
       expect(ui('MessageComposer').parent?.props.style.bottom).toBe(
         controlBarHeight + keyboardHeight,
       );
+
+      const measuredControlHeight = controlBarHeight + 8;
+      const measuredComposerHeight = 102;
+      act(() => {
+        renderer.root.findByProps({ className: 'absolute inset-x-0 bottom-0 z-30' })
+          .props.onLayout({ nativeEvent: { layout: { height: measuredControlHeight } } });
+        ui('MessageComposer').parent?.props.onLayout({
+          nativeEvent: { layout: { height: measuredComposerHeight } },
+        });
+      });
+      expect(ui('MessageComposer').parent?.props.style.bottom).toBe(
+        measuredControlHeight + keyboardHeight,
+      );
+      expect(onSessionChromeLayoutChange).toHaveBeenLastCalledWith({
+        bottom: measuredControlHeight + keyboardHeight, visible: false,
+      });
+      expect(renderViewportOverlay).toHaveBeenLastCalledWith(
+        { top: 0, bottom: measuredControlHeight + keyboardHeight + measuredComposerHeight },
+        expect.any(Number),
+        expect.any(Object),
+      );
+
       emitKeyboard(false);
       expect(ui('MessageComposer').parent?.props.style.bottom).toBe(
-        controlBarHeight,
+        measuredControlHeight + sessionChromeInset,
       );
+      expect(onSessionChromeLayoutChange).toHaveBeenLastCalledWith({
+        bottom: measuredControlHeight, visible: true,
+      });
       act(() => jest.advanceTimersByTime(100));
       expect(terminalHandle.fit).not.toHaveBeenCalled();
     });
 
-    test('the direct keyboard slides the same canvas until native hide completes without fitting', async () => {
+    test('the direct keyboard shifts the canvas to keep the reported cursor visible without fitting', async () => {
       mount();
       const terminal = ui('TerminalRendererHost');
       expect(terminal.parent?.props.collapsable).toBe(false);
       await press('enableKeyboard');
       emitKeyboard(true);
+      expect(ui('TerminalRendererHost').parent?.props.style).toBeUndefined();
+      const cursorBottom = 700;
+      act(() => { void ui('TerminalRendererHost').props.onCursorGeometry(target, cursorBottom, screenHeight); });
+      const cursorShift = cursorBottom + TERMINAL_CURSOR_CLEARANCE
+        - (screenHeight - keyboardHeight - controlBarHeight);
       expect(ui('TerminalRendererHost').parent?.props.style).toEqual({
-        transform: [{ translateY: -keyboardHeight }],
+        transform: [{ translateY: -cursorShift }],
       });
       // Repeated show events measure the stationary outer viewport.
       emitKeyboard(true);
       expect(ui('TerminalRendererHost').parent?.props.style).toEqual({
-        transform: [{ translateY: -keyboardHeight }],
+        transform: [{ translateY: -cursorShift }],
       });
       act(() => jest.advanceTimersByTime(100));
       expect(terminalHandle.fit).not.toHaveBeenCalled();
       await press('disableKeyboard');
       expect(ui('TerminalRendererHost').parent?.props.style).toEqual({
-        transform: [{ translateY: -keyboardHeight }],
+        transform: [{ translateY: -cursorShift }],
       });
       emitKeyboard(false);
       expect(ui('TerminalRendererHost').parent?.props.style).toBeUndefined();
@@ -502,3 +930,59 @@ describe.each(['android', 'ios'] as const)(
     });
   },
 );
+
+test('diff questions append to the draft and open the composer without pasting into the terminal', () => {
+  const consumed = jest.fn();
+  const request = { id: 101, terminalId: target.session.terminalId, text: 'Please explain this diff:\n-old\n+new' };
+  props.composerStore.setText(target.key, 'Existing question');
+  const overrides = { composerDraftRequest: request, onComposerDraftConsumed: consumed };
+  mount(overrides);
+  expect(ui('MessageComposer').props.initialValue).toBe(`Existing question\n\n${request.text}`);
+  const draft = props.composerStore.snapshot(target.key);
+  expect(draft.text).toBe(`Existing question\n\n${request.text}`);
+  expect(consumed).toHaveBeenCalledWith(request.id);
+  expect(props.onHistoryEntry).not.toHaveBeenCalled();
+  act(() => renderer.update(<TerminalScreen {...props} {...overrides} composerDraftRequest={{ ...request }} />));
+  expect(consumed).toHaveBeenCalledTimes(1);
+  expect(props.composerStore.snapshot(target.key)).toBe(draft);
+});
+
+test('diff draft requests wait for the originating terminal', () => {
+  const consumed = jest.fn();
+  mount({ composerDraftRequest: { id: 102, terminalId: 'another-terminal', text: 'private diff' }, onComposerDraftConsumed: consumed });
+  expect(renderer.root.findAllByType(MockMessageComposer)).toHaveLength(0);
+  expect(props.composerStore.snapshot(target.key).text).toBe('');
+  expect(consumed).not.toHaveBeenCalled();
+});
+
+test('terminal selections append to an existing draft and open the composer for editing', () => {
+  props.composerStore.setText(target.key, 'Existing draft');
+  mount();
+  const add = ui('TerminalRendererHost').props.onAddToComposer;
+  act(() => { add(target, 'selected\ntext'); });
+  expect(ui('MessageComposer').props.initialValue).toBe('Existing draft\n\nselected\ntext');
+  expect(props.composerStore.snapshot(target.key).text).toBe('Existing draft\n\nselected\ntext');
+  act(() => { add(target, 'another selection'); });
+  expect(mockComposerHandle.setNativeProps).toHaveBeenLastCalledWith({ text: 'Existing draft\n\nselected\ntext\n\nanother selection' });
+  expect(mockComposerHandle.focus).toHaveBeenCalled();
+  expect(props.onHistoryEntry).not.toHaveBeenCalled();
+  act(() => { add({ ...target, key: 'another-pane' }, 'wrong pane'); });
+  expect(props.composerStore.snapshot('another-pane').text).toBe('');
+});
+
+test('chat selections use the same composer draft and stop accepting events when chat is hidden', () => {
+  function ChatSelection() {
+    const add = useContext(ChatComposerSelection);
+    return <button onClick={() => add?.('selected reply')} />;
+  }
+  const renderViewportOverlay = () => <ChatSelection />;
+  mount({ chatViewEnabled: true, renderViewportOverlay });
+  const select = renderer.root.findByType('button').props.onClick;
+  act(() => { select(); });
+  expect(props.composerStore.snapshot(target.key).text).toBe('selected reply');
+  expect(ui('MessageComposer').props.initialValue).toBe('selected reply');
+  act(() => renderer.update(<TerminalScreen {...props} chatViewEnabled={false} renderViewportOverlay={renderViewportOverlay} />));
+  act(() => { renderer.root.findByType('button').props.onClick(); });
+  expect(props.composerStore.snapshot(target.key).text).toBe('selected reply');
+  expect(props.onHistoryEntry).not.toHaveBeenCalled();
+});

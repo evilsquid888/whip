@@ -11,7 +11,7 @@ import {
   TerminalRendererHost,
   type TerminalRendererHandle,
 } from '../src/components/TerminalRendererHost';
-import type { TerminalFrame } from '../src/lib/terminalBridge';
+import type { TerminalControlEvent, TerminalFrame } from '../src/lib/terminalBridge';
 import type { TerminalRenderTarget } from '../src/lib/terminalRenderer';
 import { MIN_XTERM_CACHE_CAPACITY } from '../src/lib/terminalRendererLru';
 import type { TerminalPreferences } from '../src/services/devicePreferences';
@@ -85,7 +85,6 @@ const preferences: TerminalPreferences = {
   xtermCacheCapacity: 4,
   cursorBlink: true,
   doubleTapAction: 'none',
-  openLinksInApp: false,
   pauseResizeInBackground: false,
   visualHints: false,
   backgroundImageUri: null,
@@ -114,8 +113,10 @@ describe('TerminalRendererHost lifecycle', () => {
     onLinksScanned: jest.fn(),
     onOpenLink: jest.fn(),
     onPaste: jest.fn(),
+    onAddToComposer: jest.fn(),
     onBufferModeChange: jest.fn(),
     onVisualScrollState: jest.fn(),
+    onScrollActivity: jest.fn(),
     onProtocolStateChange: jest.fn(),
     onTitleChange: jest.fn(),
     onFontSizeChange: jest.fn(),
@@ -137,6 +138,7 @@ describe('TerminalRendererHost lifecycle', () => {
     let nextAttachmentId = 0;
     let frameHandler: ((frame: TerminalFrame) => void) | null = null;
     let closedHandler: ((reason?: string) => void) | undefined;
+    let controlHandler: ((event: TerminalControlEvent) => void) | undefined;
     const closeTerminalBridge = jest.fn((terminalId: string) => {
       retained.delete(terminalId);
     });
@@ -149,10 +151,12 @@ describe('TerminalRendererHost lifecycle', () => {
         terminalId: string,
         onFrame: (frame: TerminalFrame) => void,
         onClosed?: (reason?: string) => void,
+        onControl?: (event: TerminalControlEvent) => void,
       ) => {
         retained.add(terminalId);
         frameHandler = onFrame;
         closedHandler = onClosed;
+        controlHandler = onControl;
         return { testAttachmentId: ++nextAttachmentId };
       },
     );
@@ -177,12 +181,14 @@ describe('TerminalRendererHost lifecycle', () => {
       },
       native: {
         requestHerdrApi: jest.fn(async () => ({ type: 'ok' as const })),
+        readTerminalSelection: jest.fn(async () => 'server selection'),
         submitPastes: jest.fn(async () => undefined),
       },
       closeTerminalBridge,
       detachTerminal,
       isTerminalBridgeRetained,
       emitFrame: (frame: TerminalFrame) => frameHandler?.(frame),
+      emitControl: (event: TerminalControlEvent) => controlHandler?.(event),
       disconnect: (terminalId = 'term-1') => {
         retained.delete(terminalId);
         closedHandler?.('Transport disconnected');
@@ -254,12 +260,17 @@ describe('TerminalRendererHost lifecycle', () => {
     const injected: string[] = [];
     const handle = createRef<TerminalRendererHandle>();
     const requestFocus = jest.fn();
-    const renderHost = (target: TerminalRenderTarget, renderingEnabled = true, visible = true) => (
+    const renderHost = (
+      target: TerminalRenderTarget,
+      renderingEnabled = true,
+      visible = true,
+      fontSize = preferences.fontSize,
+    ) => (
       <TerminalRendererHost
         ref={handle}
         {...eventCallbacks}
         activeTarget={target}
-        preferences={{ ...preferences, pauseResizeInBackground, xtermCacheCapacity }}
+        preferences={{ ...preferences, fontSize, pauseResizeInBackground, xtermCacheCapacity }}
         targets={targets}
         visible={visible}
         renderingEnabled={renderingEnabled}
@@ -305,8 +316,41 @@ describe('TerminalRendererHost lifecycle', () => {
     const setPresentation = async (renderingEnabled: boolean, visible = true) => {
       await act(async () => { renderer.update(renderHost(activeTarget, renderingEnabled, visible)); });
     };
-    return { activateTarget, setPresentation, eventCallbacks, handle, injected, requestFocus, webView };
+    const setFontPreference = async (
+      fontSize: number,
+      target = activeTarget,
+    ) => {
+      await act(async () => {
+        renderer.update(renderHost(target, true, true, fontSize));
+        await Promise.resolve();
+      });
+    };
+    return {
+      activateTarget,
+      setPresentation,
+      setFontPreference,
+      eventCallbacks,
+      handle,
+      injected,
+      requestFocus,
+      webView,
+    };
   };
+
+  test('reads context for its requesting pane and drops it after switching panes', async () => {
+    const scroll = { offset_from_bottom: 0, max_offset_from_bottom: 0, viewport_rows: 24 };
+    const client = createClient({ 'term-1': scroll, 'term-2': scroll });
+    const first = createTarget('term-1', client, scroll);
+    const second = createTarget('term-2', client, scroll);
+    const { handle, webView, activateTarget } = await mountReadyHost(first, [first, second]);
+    const context = handle.current!.readContext();
+    await sendRendererMessage(webView, { type: 'dictation-context', key: first.key, requestId: 1, text: 'WhipSsh terminal context' });
+    expect(await context).toBe('WhipSsh terminal context');
+    const stale = handle.current!.readContext();
+    await activateTarget(second);
+    await sendRendererMessage(webView, { type: 'dictation-context', key: first.key, requestId: 2, text: 'Old pane text' });
+    expect(await stale).toBe('');
+  });
 
   test('pauses painting under chat without releasing the terminal, then restores presentation', async () => {
     const scroll = { offset_from_bottom: 0, max_offset_from_bottom: 100, viewport_rows: 24 };
@@ -378,6 +422,73 @@ describe('TerminalRendererHost lifecycle', () => {
     expect(injected).toContain(`window.herdrActivate(${JSON.stringify(first.key)}); true;`);
   });
 
+  test('a global font preference change resets every persisted pane zoom', async () => {
+    const scroll = { offset_from_bottom: 0, max_offset_from_bottom: 100, viewport_rows: 24 };
+    const client = createClient({
+      'term-1': scroll,
+      'term-2': scroll,
+      'term-3': scroll,
+      'term-4': scroll,
+      'term-5': scroll,
+    });
+    const first = createTarget('term-1', client, scroll);
+    const second = createTarget('term-2', client, scroll);
+    const third = createTarget('term-3', client, scroll);
+    const unzoomed = createTarget('term-4', client, scroll);
+    const nonresidentUnzoomed = createTarget('term-5', client, scroll);
+    first.session.fontSize = 10;
+    second.session.fontSize = 12;
+    third.session.fontSize = 14;
+    const {
+      activateTarget,
+      eventCallbacks,
+      injected,
+      setFontPreference,
+    } = await mountReadyHost(
+      first,
+      [first, second, third, unzoomed, nonresidentUnzoomed],
+    );
+    await activateTarget(unzoomed);
+    eventCallbacks.onFontSizeChange.mockClear();
+    injected.length = 0;
+
+    await setFontPreference(16, second);
+
+    expect(eventCallbacks.onFontSizeChange.mock.calls).toEqual([
+      [first, 16],
+      [second, 16],
+      [third, 16],
+    ]);
+    for (const target of [second, unzoomed]) {
+      expect(injected.some(script =>
+        script.includes(`window.herdrConfigure(${JSON.stringify(target.key)}`)
+        && script.includes('"fontSize":16'),
+      )).toBe(true);
+    }
+
+    eventCallbacks.onFontSizeChange.mockClear();
+    await setFontPreference(16, second);
+    expect(eventCallbacks.onFontSizeChange).not.toHaveBeenCalled();
+  });
+
+  test('a global font preference change replaces a locally pending pane zoom', async () => {
+    const scroll = { offset_from_bottom: 0, max_offset_from_bottom: 100, viewport_rows: 24 };
+    const client = createClient({ 'term-1': scroll });
+    const target = createTarget('term-1', client, scroll);
+    const { eventCallbacks, setFontPreference, webView } = await mountReadyHost(target);
+
+    await sendRendererMessage(webView, {
+      type: 'font-size-change',
+      key: target.key,
+      fontSize: 20,
+    });
+    eventCallbacks.onFontSizeChange.mockClear();
+
+    await setFontPreference(16);
+
+    expect(eventCallbacks.onFontSizeChange).toHaveBeenCalledWith(target, 16);
+  });
+
   test('ordinary fit resize requests use native geometry deduplication', async () => {
     const scroll = { offset_from_bottom: 0, max_offset_from_bottom: 0, viewport_rows: 24 };
     const client = createClient({ 'term-1': scroll });
@@ -412,6 +523,23 @@ describe('TerminalRendererHost lifecycle', () => {
     expect(client.resizeTerminal).toHaveBeenCalledTimes(2);
   });
 
+  test('forwards and replays application mouse capture when the WebView reloads', async () => {
+    const scroll = { offset_from_bottom: 0, max_offset_from_bottom: 0, viewport_rows: 24 };
+    const client = createClient({ 'term-1': scroll });
+    const target = createTarget('term-1', client, scroll);
+    const { webView, injected } = await mountReadyHost(target);
+    const captureScript = `window.herdrSetApplicationMouseCapture(${JSON.stringify(target.key)}, true);`;
+
+    act(() => client.emitControl({ type: 'mouse-capture', enabled: true }));
+    expect(injected.at(-1)).toContain(captureScript);
+    injected.length = 0;
+    await sendRendererMessage(webView, { type: 'ready' });
+    expect(injected.some(script => script.includes(captureScript))).toBe(true);
+
+    act(() => client.emitControl({ type: 'mouse-capture', enabled: false }));
+    expect(injected.at(-1)).toContain(`window.herdrSetApplicationMouseCapture(${JSON.stringify(target.key)}, false);`);
+  });
+
   test('copies terminal text and pastes clipboard text through the maintained native module', async () => {
     const scroll = { offset_from_bottom: 0, max_offset_from_bottom: 0, viewport_rows: 24 };
     const client = createClient({ 'term-1': scroll });
@@ -429,6 +557,106 @@ describe('TerminalRendererHost lifecycle', () => {
       params: { pane_id: target.session.paneId, text, keys: [] },
     });
     expect(eventCallbacks.onPaste).toHaveBeenCalledWith(target, text);
+  });
+
+  test('application clipboard replies pass through the pending selection guard', async () => {
+    const scroll = { offset_from_bottom: 0, max_offset_from_bottom: 0, viewport_rows: 24 };
+    const client = createClient({ 'term-1': scroll });
+    const target = createTarget('term-1', client, scroll);
+    const { webView, injected } = await mountReadyHost(target);
+    const text = 'Hi! What would you like to work on?';
+    jest.mocked(Clipboard.setString).mockClear();
+    act(() => client.emitControl({ type: 'clipboard-write', text }));
+    expect(injected.at(-1)).toContain(`window.herdrClipboardWrite(${JSON.stringify(target.key)}, ${JSON.stringify(text)});`);
+    expect(Clipboard.setString).not.toHaveBeenCalled();
+
+    await sendRendererMessage(webView, { type: 'clipboard-write', key: target.key, text });
+    expect(Clipboard.setString).toHaveBeenCalledWith(text);
+  });
+
+  test('a renderer clipboard request with no text sends no terminal input', async () => {
+    const scroll = { offset_from_bottom: 0, max_offset_from_bottom: 0, viewport_rows: 24 };
+    const client = createClient({ 'term-1': scroll });
+    const target = createTarget('term-1', client, scroll);
+    const { webView, eventCallbacks } = await mountReadyHost(target);
+    client.native.requestHerdrApi.mockClear();
+    jest.mocked(Clipboard.getString).mockResolvedValueOnce('');
+
+    await sendRendererMessage(webView, { type: 'clipboard-read', key: target.key });
+
+    expect(client.native.requestHerdrApi).not.toHaveBeenCalled();
+    expect(eventCallbacks.onPaste).not.toHaveBeenCalled();
+  });
+
+  test('reads Herdr selections on the server before completing clipboard copy', async () => {
+    const scroll = { offset_from_bottom: 0, max_offset_from_bottom: 0, viewport_rows: 2 };
+    const client = createClient({ 'term-1': scroll });
+    const target = createTarget('term-1', client, scroll);
+    const { webView, injected } = await mountReadyHost(target);
+    const selection = {
+      columns: 12, text: 'abcdefghijkl\nmnop', rows: ['abcdefghijkl', 'mnop'], offsetFromBottom: 0,
+      startRow: 0, startColumn: 0, endRow: 1, endColumn: 4,
+    };
+    client.native.readTerminalSelection.mockResolvedValueOnce('abcdefghijklmnop\nreal newline');
+    jest.mocked(Clipboard.setString).mockClear();
+    await sendRendererMessage(webView, { type: 'selection-copy', key: target.key, requestId: 17, selection });
+    expect(client.native.readTerminalSelection).toHaveBeenCalledWith('term-1', 'pane-term-1', selection);
+    expect(injected.at(-1)).toContain('window.herdrSelectionCopied("host-1:term-1", 17, "abcdefghijklmnop\\nreal newline");');
+    expect(Clipboard.setString).not.toHaveBeenCalled();
+  });
+
+  test('routes selected text to the active composer without clipboard or terminal writes', async () => {
+    const scroll = { offset_from_bottom: 0, max_offset_from_bottom: 0, viewport_rows: 2 };
+    const client = createClient({ 'term-1': scroll, 'term-2': scroll });
+    const target = createTarget('term-1', client, scroll);
+    const other = createTarget('term-2', client, scroll);
+    const { webView, eventCallbacks, setPresentation } = await mountReadyHost(target, [target, other]);
+    jest.mocked(Clipboard.setString).mockClear();
+    client.native.requestHerdrApi.mockClear();
+    const message = { type: 'composer-add', key: target.key, text: 'selected\ntext' };
+    await sendRendererMessage(webView, message);
+    expect(eventCallbacks.onAddToComposer).toHaveBeenCalledWith(target, message.text);
+    expect(Clipboard.setString).not.toHaveBeenCalled();
+    expect(client.native.requestHerdrApi).not.toHaveBeenCalled();
+    expect(eventCallbacks.onInput).not.toHaveBeenCalled();
+    eventCallbacks.onAddToComposer.mockClear();
+    await sendRendererMessage(webView, { ...message, key: other.key });
+    await sendRendererMessage(webView, { ...message, text: 123 });
+    await sendRendererMessage(webView, { ...message, text: '' });
+    await setPresentation(false);
+    await sendRendererMessage(webView, message);
+    await setPresentation(true, false);
+    await sendRendererMessage(webView, message);
+    expect(eventCallbacks.onAddToComposer).not.toHaveBeenCalled();
+  });
+
+  test('returns a failed server copy to the renderer for local fallback', async () => {
+    const scroll = { offset_from_bottom: 0, max_offset_from_bottom: 0, viewport_rows: 2 };
+    const client = createClient({ 'term-1': scroll });
+    const target = createTarget('term-1', client, scroll);
+    const { webView, injected, eventCallbacks } = await mountReadyHost(target);
+    client.native.readTerminalSelection.mockRejectedValueOnce(new Error('stale_content'));
+    jest.mocked(Clipboard.setString).mockClear();
+    await sendRendererMessage(webView, {
+      type: 'selection-copy', key: target.key, requestId: 18,
+      selection: { columns: 12, text: 'text', rows: ['text', ''], startRow: 0, startColumn: 0, endRow: 0, endColumn: 4, offsetFromBottom: 0 },
+    });
+    expect(injected.at(-1)).toContain('window.herdrSelectionCopied("host-1:term-1", 18, null);');
+    expect(Clipboard.setString).not.toHaveBeenCalled();
+    expect(eventCallbacks.onError).not.toHaveBeenCalled();
+  });
+
+  test('rejects malformed selection coordinates before reaching the native runtime', async () => {
+    const scroll = { offset_from_bottom: 0, max_offset_from_bottom: 0, viewport_rows: 2 };
+    const client = createClient({ 'term-1': scroll });
+    const target = createTarget('term-1', client, scroll);
+    const { webView, injected } = await mountReadyHost(target);
+    await sendRendererMessage(webView, {
+      type: 'selection-copy', key: target.key, requestId: 19,
+      selection: { columns: 12, text: 'text', rows: ['text'], startRow: -1, startColumn: 0, endRow: 0, endColumn: 4, offsetFromBottom: 0 },
+    });
+    expect(client.native.readTerminalSelection).not.toHaveBeenCalled();
+    expect(injected.at(-1)).toContain('window.herdrSelectionCopied("host-1:term-1", 19, null);');
   });
 
   test('closes the native bridge when a terminal target is removed', () => {
@@ -744,6 +972,21 @@ describe('TerminalRendererHost lifecycle', () => {
     const { eventCallbacks, webView } = await mountReadyHost(target);
 
     await sendRendererMessage(webView, {
+      type: 'scroll-activity',
+      key: target.key,
+      scrolling: true,
+    });
+    await sendRendererMessage(webView, {
+      type: 'scroll-activity',
+      key: target.key,
+      scrolling: false,
+    });
+    expect(eventCallbacks.onScrollActivity.mock.calls).toEqual([
+      [target, true],
+      [target, false],
+    ]);
+
+    await sendRendererMessage(webView, {
       type: 'visual-scroll-state',
       key: target.key,
       atVisualBottom: false,
@@ -1047,6 +1290,33 @@ describe('TerminalRendererHost lifecycle', () => {
     for (const target of targets) {
       expect(client.isTerminalBridgeRetained(target.session.terminalId)).toBe(false);
     }
+  });
+
+  test('SSH tabs retain their shells and renderers beyond the cache capacity', async () => {
+    const scroll = { offset_from_bottom: 0, max_offset_from_bottom: 0, viewport_rows: 24 };
+    const client = createClient({});
+    const targets = Array.from({ length: MIN_XTERM_CACHE_CAPACITY + 1 }, (_, index) => {
+      const target = createTarget(`__whip_ssh_shell__:${index + 1}`, client, scroll);
+      return { ...target, session: { ...target.session, kind: 'ssh' as const } };
+    });
+    const { activateTarget, webView, injected } = await mountReadyHost(
+      targets[0], targets, true, MIN_XTERM_CACHE_CAPACITY,
+    );
+    for (const target of targets.slice(1)) {
+      await activateTarget(target);
+      await sendRendererMessage(webView, { type: 'terminal-ready', key: target.key });
+      await sendRendererMessage(webView, {
+        type: 'resize', source: 'fit', key: target.key,
+        cols: 80, rows: 24, cellWidthPx: 8, cellHeightPx: 16,
+      });
+    }
+    await activateTarget(targets[0]);
+    await emitAppState('background');
+    expect(client.openTerminal).toHaveBeenCalledTimes(targets.length);
+    expect(client.detachTerminal).not.toHaveBeenCalled();
+    expect(client.closeTerminalBridge).not.toHaveBeenCalled();
+    expect(client.releaseTerminal).not.toHaveBeenCalled();
+    expect(injected.some(script => script.includes('window.herdrRemove('))).toBe(false);
   });
 
   test('in-app visibility changes do not enter the resume restore path', async () => {

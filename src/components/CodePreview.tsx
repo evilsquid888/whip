@@ -1,4 +1,3 @@
-import CodeHighlighter from 'react-native-code-highlighter';
 import {
   atomOneDarkReasonable,
   atomOneLight,
@@ -19,6 +18,8 @@ import { remoteCodeLanguage } from '@/src/lib/remoteFiles';
 import { terminalFontFamily } from '@/src/lib/terminalFonts';
 import type { RemoteContentIdentity } from '@/src/services/remoteContentProgress';
 import { useTheme } from '@/src/theme';
+import { LineNumberGutter } from './LineNumberGutter';
+import { SyntaxCodeText } from './SyntaxCodeText';
 
 const CODE_FONT_SIZE = 12;
 const CODE_LINE_HEIGHT = 18;
@@ -48,26 +49,22 @@ function HighlightedCode({
   contentWidth,
 }: Omit<PreviewProps, 'progressIdentity'> & { contentHeight?: number; contentWidth?: number }) {
   const { isDark } = useTheme();
+  const appearance = isDark ? atomOneDarkReasonable : atomOneLight;
+  const background = appearance.hljs.background;
   return (
-    <CodeHighlighter
-      codeContainerStyle={contentWidth === undefined ? undefined : { width: contentWidth }}
-      hljsStyle={isDark ? atomOneDarkReasonable : atomOneLight}
-      language={remoteCodeLanguage(filename)}
-      scrollViewProps={{
-        scrollEnabled: contentWidth === undefined,
-        style: contentWidth === undefined
-          ? undefined
-          : { width: contentWidth, height: contentHeight },
-        contentContainerStyle: [
-          styles.highlightContent,
-          contentWidth === undefined
-            ? undefined
-            : { width: contentWidth, minHeight: contentHeight },
-        ],
-      }}
-      textStyle={styles.codeText}>
-      {content || ' '}
-    </CodeHighlighter>
+    <ScrollView
+      horizontal
+      scrollEnabled={contentWidth === undefined}
+      style={contentWidth === undefined ? undefined : { width: contentWidth, height: contentHeight }}
+      contentContainerStyle={[
+        styles.highlightContent,
+        { backgroundColor: typeof background === 'string' ? background : undefined },
+        contentWidth === undefined ? undefined : { width: contentWidth, minHeight: contentHeight },
+      ]}>
+      <Text selectable style={[styles.codeText, { color: appearance.hljs.color }]}>
+        <SyntaxCodeText content={content || ' '} language={remoteCodeLanguage(filename)} isDark={isDark} />
+      </Text>
+    </ScrollView>
   );
 }
 
@@ -81,7 +78,12 @@ export function CodePreview({ content, filename, initialLine, progressIdentity }
       {...scrollProgress}
       className="flex-1 bg-background"
       contentContainerStyle={styles.verticalContent}>
-      <HighlightedCode content={content} filename={filename} />
+      <View style={styles.previewRow}>
+        <LineNumberGutter content={content} style={[styles.codeText, styles.previewLineNumbers]} />
+        <View style={styles.codeScroller}>
+          <HighlightedCode content={content} filename={filename} />
+        </View>
+      </View>
     </ScrollView>
   );
 }
@@ -254,6 +256,15 @@ export function CodeEditor({ editable, filename, onChangeText, progressIdentity,
 }
 
 const styles = StyleSheet.create({
+  previewRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+  },
+  previewLineNumbers: {
+    marginLeft: CODE_PADDING,
+    paddingTop: CODE_PADDING,
+    paddingBottom: CODE_PADDING,
+  },
   verticalContent: {
     flexGrow: 1,
   },

@@ -9,12 +9,14 @@ use serde_json::Value;
 use super::rollout_wire::{
     CommandExecution, Compacted, DynamicToolCall, Event, FileChange, FileChangeItem, ItemEvent,
     McpToolCall, RolloutRecord, TurnAborted, TurnComplete, TurnItem, TurnStarted, decode_turn_item,
-    interactive_response_notice,
+    interactive_response_notice, question_reply_text,
 };
 use crate::agent_transcript::{
     AgentField, AgentFileDiff, AgentMessageRole, AgentNoticeLevel, AgentScalarValue,
-    AgentToolState, AgentToolStatus, AgentTranscriptMessage, AgentTranscriptPart,
-    AgentTranscriptTurn, AgentTurnStatus, injected_user_context,
+    AgentTokenUsage, AgentToolState, AgentToolStatus, AgentTranscriptDetails,
+    AgentTranscriptMessage, AgentTranscriptPart, AgentTranscriptTurn, AgentTurnOutcome,
+    AgentTurnStatus, CodexUsageTracker, injected_user_context, question_tool_input,
+    questions_from_input, tool_duration, tool_input_json, transcript_questions, user_prompt_parts,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -46,6 +48,9 @@ struct ProtocolDriftCounters {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CodexRolloutReducer {
+    model: Option<String>,
+    provider: Option<String>,
+    usage_tracker: CodexUsageTracker,
     messages: Vec<AgentTranscriptMessage>,
     message_indexes: HashMap<String, usize>,
     message_turns: HashMap<String, String>,
@@ -69,6 +74,10 @@ pub(crate) struct CodexProjectionChanges {
 }
 
 impl CodexRolloutReducer {
+    pub(crate) fn resume_provider(&mut self, provider: Option<String>) {
+        self.provider = provider;
+    }
+
     pub(crate) fn messages(&self) -> &[AgentTranscriptMessage] {
         &self.messages
     }
@@ -89,7 +98,22 @@ impl CodexRolloutReducer {
                 if let Some(turn_id) = context.turn_id.as_ref().filter(|id| !id.is_empty()) {
                     self.context_turn_id = Some(turn_id.clone());
                 }
+                self.model.clone_from(&context.model);
+                if let Some(turn_id) = context
+                    .turn_id
+                    .as_ref()
+                    .or(self.active_turn_id.as_ref())
+                    .cloned()
+                {
+                    let index = self.ensure_turn(&turn_id);
+                    let details = self.turns[index]
+                        .details
+                        .get_or_insert_with(AgentTranscriptDetails::default);
+                    details.model.clone_from(&self.model);
+                    details.provider.clone_from(&self.provider);
+                }
             }
+            RolloutRecord::SessionMeta(meta) => self.provider.clone_from(&meta.model_provider),
             RolloutRecord::Compacted(compacted) => self.accept_compacted(compacted, at, sequence),
             RolloutRecord::Unknown { kind, value } => {
                 self.drift.unsupported_rollout_types =
@@ -105,9 +129,7 @@ impl CodexRolloutReducer {
                     let _ = value;
                 }
             }
-            RolloutRecord::SessionMeta(_)
-            | RolloutRecord::AppServerLike(_)
-            | RolloutRecord::KnownIrrelevant => {}
+            RolloutRecord::AppServerLike(_) | RolloutRecord::KnownIrrelevant => {}
         }
         self.take_changes()
     }
@@ -140,10 +162,26 @@ impl CodexRolloutReducer {
                 let _ = value;
             }
             Event::Legacy(payload) => {
-                if let Some(text) = payload
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .and_then(interactive_response_notice)
+                if payload["type"] == "token_count" {
+                    let usage = self.usage_tracker.accept(payload);
+                    let turn_id = self
+                        .active_turn_id
+                        .clone()
+                        .or_else(|| self.context_turn_id.clone())
+                        .or_else(|| self.turns.last().map(|turn| turn.id.clone()));
+                    if let (Some(usage), Some(turn_id)) = (usage, turn_id) {
+                        let index = self.ensure_turn(&turn_id);
+                        self.turns[index]
+                            .details
+                            .get_or_insert_with(AgentTranscriptDetails::default)
+                            .usage
+                            .get_or_insert_with(AgentTokenUsage::default)
+                            .add(&usage);
+                    }
+                    return;
+                }
+                if let Some((text, questions)) =
+                    payload.as_object().and_then(interactive_response_notice)
                     && let Some(turn_id) = payload
                         .get("turn_id")
                         .and_then(Value::as_str)
@@ -158,8 +196,9 @@ impl CodexRolloutReducer {
                         AgentTranscriptPart::Notice {
                             id: format!("notice:{sequence}"),
                             level: AgentNoticeLevel::Info,
-                            text: text.to_owned(),
+                            text,
                             timestamp_ms: at,
+                            questions,
                         },
                         at,
                         at,
@@ -188,9 +227,15 @@ impl CodexRolloutReducer {
         turn.completed_at_ms = seconds_to_millis(completed.completed_at).or(at);
         if let Some(error) = &completed.error {
             turn.status = AgentTurnStatus::Error;
+            turn.details
+                .get_or_insert_with(AgentTranscriptDetails::default)
+                .outcome = Some(AgentTurnOutcome::Failed);
             self.set_turn_error(&completed.turn_id, error.message.clone());
         } else if turn.status != AgentTurnStatus::Interrupted {
             turn.status = AgentTurnStatus::Idle;
+            turn.details
+                .get_or_insert_with(AgentTranscriptDetails::default)
+                .outcome = Some(AgentTurnOutcome::Completed);
         }
         if self.active_turn_id.as_deref() == Some(&completed.turn_id) {
             self.active_turn_id = None;
@@ -208,6 +253,9 @@ impl CodexRolloutReducer {
         let index = self.ensure_turn(&turn_id);
         let turn = &mut self.turns[index];
         turn.status = AgentTurnStatus::Interrupted;
+        turn.details
+            .get_or_insert_with(AgentTranscriptDetails::default)
+            .outcome = Some(AgentTurnOutcome::Interrupted);
         turn.started_at_ms = seconds_to_millis(aborted.started_at).or(turn.started_at_ms);
         turn.completed_at_ms = seconds_to_millis(aborted.completed_at).or(at);
         if self.active_turn_id.as_deref() == Some(&turn_id) {
@@ -252,22 +300,20 @@ impl CodexRolloutReducer {
                     })
                     .collect::<Vec<_>>()
                     .join("\n");
+                let text = question_reply_text(&text).unwrap_or(text);
                 if !text.trim().is_empty() && !injected_user_context(&text) {
                     let id = item.id;
                     self.put_message(
                         &event.turn_id,
                         AgentTranscriptMessage {
+                            details: None,
                             id: id.clone(),
                             role: AgentMessageRole::User,
                             parent_id: None,
                             created_at_ms: started_at.or(completed_at),
                             completed_at_ms: completed_at,
                             error: None,
-                            parts: vec![AgentTranscriptPart::Text {
-                                id: id.clone(),
-                                text: text.trim().to_owned(),
-                                timestamp_ms: completed_at.or(started_at),
-                            }],
+                            parts: user_prompt_parts(&id, text.trim(), completed_at.or(started_at)),
                             diffs: Vec::new(),
                         },
                     );
@@ -278,6 +324,27 @@ impl CodexRolloutReducer {
                 }
             }
             TurnItem::AgentMessage(item) => {
+                // Codex persists async question tool calls as AgentMessage items.
+                // The Markdown content mirrors the structured questions; render
+                // the question tool once, using the call ID retained by the item.
+                if item.delivery.as_deref() == Some("async")
+                    && !transcript_questions(Some(&item.questions)).is_empty()
+                {
+                    self.put_tool(
+                        &event.turn_id,
+                        item.id,
+                        "request_user_input_async".to_owned(),
+                        AgentToolStatus::Completed,
+                        vec![string_field("questions", item.questions.to_string())],
+                        None,
+                        None,
+                        None,
+                        Vec::new(),
+                        started_at,
+                        completed_at,
+                    );
+                    return;
+                }
                 let _phase = item.phase.as_deref();
                 let text = item
                     .content
@@ -383,17 +450,20 @@ impl CodexRolloutReducer {
                     completed_at,
                 );
             }
-            TurnItem::ContextCompaction(item) => self.put_assistant_part(
-                &event.turn_id,
-                AgentTranscriptPart::Notice {
-                    id: item.id,
-                    level: AgentNoticeLevel::Info,
-                    text: "Context compacted".to_owned(),
-                    timestamp_ms: completed_at.or(started_at),
-                },
-                started_at.or(completed_at),
-                completed_at,
-            ),
+            TurnItem::ContextCompaction(item) => {
+                self.put_assistant_part(
+                    &event.turn_id,
+                    AgentTranscriptPart::Notice {
+                        id: item.id,
+                        level: AgentNoticeLevel::Info,
+                        text: "Context compacted".to_owned(),
+                        timestamp_ms: completed_at.or(started_at),
+                        questions: Vec::new(),
+                    },
+                    started_at.or(completed_at),
+                    completed_at,
+                );
+            }
             TurnItem::Unknown { kind, value } => {
                 self.drift.unsupported_turn_item_types =
                     self.drift.unsupported_turn_item_types.saturating_add(1);
@@ -401,6 +471,32 @@ impl CodexRolloutReducer {
                 let _ = value;
             }
             TurnItem::KnownIrrelevant => {}
+        }
+        self.update_tool_details(event);
+    }
+
+    fn update_tool_details(&mut self, event: &ItemEvent) {
+        let input_json = tool_input_json(
+            event
+                .item
+                .get("arguments")
+                .or_else(|| event.item.get("input"))
+                .or_else(|| event.item.get("action"))
+                .or_else(|| event.item.get("changes")),
+        );
+        let duration_ms = tool_duration(&event.item);
+        if let Some(id) = event.item.get("id").and_then(Value::as_str)
+            && let Some(index) = self.assistant_part_message_index(&event.turn_id, id)
+            && let Some(AgentTranscriptPart::Tool { state, .. }) = self.messages[index]
+                .parts
+                .iter_mut()
+                .find(|part| part_id(part) == id)
+        {
+            if input_json.is_some() {
+                state.input_json = input_json;
+            }
+            state.duration_ms = duration_ms.or(state.duration_ms);
+            self.dirty_messages.push(index);
         }
     }
 
@@ -569,10 +665,9 @@ impl CodexRolloutReducer {
         completed_at: Option<u64>,
     ) {
         let previous = self
-            .message_indexes
-            .get(&format!("assistant:{turn_id}"))
+            .assistant_part_message_index(turn_id, &id)
             .and_then(|index| {
-                self.messages[*index]
+                self.messages[index]
                     .parts
                     .iter()
                     .find(|part| part_id(part) == id)
@@ -593,8 +688,13 @@ impl CodexRolloutReducer {
             return;
         }
         let started_at = started_at.or_else(|| previous.and_then(|state| state.started_at_ms));
+        let input_json = previous.and_then(|state| state.input_json.clone());
+        let duration_ms = completed_at
+            .zip(started_at)
+            .and_then(|(end, start)| end.checked_sub(start));
         let terminal = matches!(status, AgentToolStatus::Completed | AgentToolStatus::Error);
-        self.put_assistant_part(
+        let input = question_tool_input(&tool, input);
+        let message_index = self.put_assistant_part(
             turn_id,
             AgentTranscriptPart::Tool {
                 id: id.clone(),
@@ -602,7 +702,10 @@ impl CodexRolloutReducer {
                 tool,
                 timestamp_ms: started_at.or(completed_at),
                 state: AgentToolState {
+                    duration_ms,
+                    input_json,
                     status,
+                    questions: questions_from_input(&input),
                     input,
                     output,
                     error,
@@ -619,7 +722,7 @@ impl CodexRolloutReducer {
             terminal.then_some(completed_at).flatten(),
         );
         if !files.is_empty() {
-            self.merge_turn_diffs(turn_id, &files);
+            self.merge_turn_diffs(turn_id, message_index, &files);
         }
     }
 
@@ -640,6 +743,7 @@ impl CodexRolloutReducer {
                 level: AgentNoticeLevel::Info,
                 text: "Context compacted".to_owned(),
                 timestamp_ms: at,
+                questions: Vec::new(),
             },
             at,
             at,
@@ -653,9 +757,11 @@ impl CodexRolloutReducer {
         }
         let index = self.turns.len();
         self.turns.push(AgentTranscriptTurn {
+            details: None,
             id: turn_id.to_owned(),
             user_message_id: None,
             assistant_message_ids: Vec::new(),
+            message_ids: Vec::new(),
             status: AgentTurnStatus::Idle,
             started_at_ms: None,
             completed_at_ms: None,
@@ -674,10 +780,41 @@ impl CodexRolloutReducer {
         }
         self.message_turns
             .insert(message.id.clone(), turn_id.to_owned());
+        let turn_index = self.ensure_turn(turn_id);
+        self.turns[turn_index].message_ids.push(message.id.clone());
         self.message_indexes
             .insert(message.id.clone(), self.messages.len());
         self.messages.push(message);
         self.dirty_messages.push(self.messages.len() - 1);
+    }
+
+    fn assistant_part_message_index(&self, turn_id: &str, id: &str) -> Option<usize> {
+        let turn = self.turns.get(*self.turn_indexes.get(turn_id)?)?;
+        turn.assistant_message_ids
+            .iter()
+            .filter_map(|message_id| self.message_indexes.get(message_id).copied())
+            .find(|index| {
+                self.messages[*index]
+                    .parts
+                    .iter()
+                    .any(|part| part_id(part) == id)
+            })
+    }
+
+    fn current_assistant_message_id(&self, turn_index: usize) -> String {
+        let turn = &self.turns[turn_index];
+        let last = turn
+            .message_ids
+            .last()
+            .and_then(|id| self.message_indexes.get(id))
+            .map(|index| &self.messages[*index]);
+        match last {
+            Some(message) if message.role == AgentMessageRole::Assistant => message.id.clone(),
+            Some(message) if !turn.assistant_message_ids.is_empty() => {
+                format!("assistant:{}:{}", turn.id, message.id)
+            }
+            _ => format!("assistant:{}", turn.id),
+        }
     }
 
     fn put_assistant_part(
@@ -686,14 +823,34 @@ impl CodexRolloutReducer {
         part: AgentTranscriptPart,
         created_at: Option<u64>,
         completed_at: Option<u64>,
-    ) {
+    ) -> usize {
         let turn_index = self.ensure_turn(turn_id);
-        let message_id = format!("assistant:{turn_id}");
+        // Completions still update their original tool/message even when a
+        // follow-up prompt has started a new assistant segment in this turn.
+        let message_id = self
+            .assistant_part_message_index(turn_id, part_id(&part))
+            .map(|index| self.messages[index].id.clone())
+            .unwrap_or_else(|| self.current_assistant_message_id(turn_index));
         if !self.message_indexes.contains_key(&message_id) {
-            let parent_id = self.turns[turn_index].user_message_id.clone();
+            let parent_id = self.turns[turn_index]
+                .message_ids
+                .iter()
+                .rev()
+                .filter_map(|id| {
+                    self.message_indexes
+                        .get(id)
+                        .map(|index| &self.messages[*index])
+                })
+                .find(|message| message.role == AgentMessageRole::User)
+                .map(|message| message.id.clone());
             self.put_message(
                 turn_id,
                 AgentTranscriptMessage {
+                    details: Some(AgentTranscriptDetails {
+                        model: self.model.clone(),
+                        provider: self.provider.clone(),
+                        ..Default::default()
+                    }),
                     id: message_id.clone(),
                     role: AgentMessageRole::Assistant,
                     parent_id,
@@ -723,21 +880,24 @@ impl CodexRolloutReducer {
             message.parts.push(part);
         }
         self.dirty_messages.push(index);
+        index
     }
 
-    fn merge_turn_diffs(&mut self, turn_id: &str, files: &[AgentFileDiff]) {
+    fn merge_turn_diffs(&mut self, turn_id: &str, message_index: usize, files: &[AgentFileDiff]) {
         let turn_index = self.ensure_turn(turn_id);
         merge_diffs(&mut self.turns[turn_index].diffs, files);
-        let message_id = format!("assistant:{turn_id}");
-        if let Some(index) = self.message_indexes.get(&message_id).copied() {
-            merge_diffs(&mut self.messages[index].diffs, files);
-            self.dirty_messages.push(index);
-        }
+        merge_diffs(&mut self.messages[message_index].diffs, files);
+        self.dirty_messages.push(message_index);
     }
 
     fn set_turn_error(&mut self, turn_id: &str, error: String) {
-        let message_id = format!("assistant:{turn_id}");
-        if let Some(index) = self.message_indexes.get(&message_id).copied() {
+        if let Some(index) = self
+            .turn_indexes
+            .get(turn_id)
+            .and_then(|index| self.turns[*index].assistant_message_ids.last())
+            .and_then(|id| self.message_indexes.get(id))
+            .copied()
+        {
             self.messages[index].error = Some(error);
             self.dirty_messages.push(index);
         }
@@ -826,17 +986,10 @@ fn value_fields(value: &Value) -> Vec<AgentField> {
         .iter()
         .filter_map(|(key, value)| {
             let value = match value {
-                Value::String(value) => AgentScalarValue::String {
-                    value: value.clone(),
-                },
-                Value::Number(value) => AgentScalarValue::Number {
-                    value: value.as_f64()?,
-                },
-                Value::Bool(value) => AgentScalarValue::Boolean { value: *value },
-                Value::Null => return None,
-                value => AgentScalarValue::String {
+                Value::Array(_) | Value::Object(_) => AgentScalarValue::String {
                     value: serde_json::to_string(value).ok()?,
                 },
+                _ => AgentScalarValue::from_json_primitive(value)?,
             };
             Some(AgentField {
                 key: key.clone(),
@@ -894,6 +1047,7 @@ fn tool_status(value: &str) -> AgentToolStatus {
 fn part_id(part: &AgentTranscriptPart) -> &str {
     match part {
         AgentTranscriptPart::Text { id, .. }
+        | AgentTranscriptPart::Image { id, .. }
         | AgentTranscriptPart::Reasoning { id, .. }
         | AgentTranscriptPart::Tool { id, .. }
         | AgentTranscriptPart::Plan { id, .. }
@@ -926,4 +1080,81 @@ fn supported_tool_start(item: &TurnItem) -> bool {
         _ => return false,
     };
     !id.trim().is_empty()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn value_fields_convert_primitives_and_serialize_nested_json() {
+        let input = serde_json::json!({
+            "text": "hello",
+            "empty": "",
+            "integer": -42,
+            "fraction": 1.5,
+            "enabled": true,
+            "disabled": false,
+            "array": [1, "two"],
+            "object": {"nested": true},
+            "null": null,
+        });
+        let fields = value_fields(&input);
+        let expected = [
+            (
+                "text",
+                AgentScalarValue::String {
+                    value: "hello".to_owned(),
+                },
+            ),
+            (
+                "empty",
+                AgentScalarValue::String {
+                    value: String::new(),
+                },
+            ),
+            ("integer", AgentScalarValue::Number { value: -42.0 }),
+            ("fraction", AgentScalarValue::Number { value: 1.5 }),
+            ("enabled", AgentScalarValue::Boolean { value: true }),
+            ("disabled", AgentScalarValue::Boolean { value: false }),
+            (
+                "array",
+                AgentScalarValue::String {
+                    value: r#"[1,"two"]"#.to_owned(),
+                },
+            ),
+            (
+                "object",
+                AgentScalarValue::String {
+                    value: r#"{"nested":true}"#.to_owned(),
+                },
+            ),
+        ];
+        assert_eq!(fields.len(), expected.len());
+        for (key, value) in expected {
+            assert!(fields.contains(&AgentField {
+                key: key.to_owned(),
+                value
+            }));
+        }
+    }
+
+    #[test]
+    fn value_fields_keep_non_object_payloads_as_text() {
+        for (input, expected) in [
+            (serde_json::json!("hello"), "hello"),
+            (serde_json::json!(""), ""),
+            (serde_json::json!(42), "42"),
+            (serde_json::json!(1.5), "1.5"),
+            (serde_json::json!(true), "true"),
+            (serde_json::json!(false), "false"),
+            (serde_json::json!([1, "two"]), r#"[1,"two"]"#),
+        ] {
+            assert_eq!(
+                value_fields(&input),
+                vec![string_field("value", expected.to_owned())]
+            );
+        }
+        assert!(value_fields(&Value::Null).is_empty());
+    }
 }

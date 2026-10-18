@@ -11,9 +11,46 @@ export interface NativeAgentChatCheckpoint {
   blob: ArrayBuffer;
 }
 
+export interface SavedAgentChat {
+  key: string;
+  namespace: string;
+  agent: 'claude' | 'codex' | 'opencode';
+  sessionId: string;
+  updatedAt: number;
+  cacheBytes: number;
+}
+
+interface SavedAgentChatRow {
+  cache_key: string;
+  namespace: string;
+  updated_at: number;
+  cache_bytes: number;
+}
+
+function savedChatFromRow(row: SavedAgentChatRow): SavedAgentChat | null {
+  const prefix = `${row.namespace}\n`;
+  if (!row.cache_key.startsWith(prefix)) return null;
+  const identity = row.cache_key.slice(prefix.length);
+  const separator = identity.indexOf('\n');
+  if (separator < 0) return null;
+  const agent = identity.slice(0, separator);
+  const sessionId = identity.slice(separator + 1);
+  if ((agent !== 'claude' && agent !== 'codex' && agent !== 'opencode') || !sessionId || sessionId.includes('\n')) return null;
+  return {
+    key: row.cache_key,
+    namespace: row.namespace,
+    agent,
+    sessionId,
+    updatedAt: row.updated_at,
+    cacheBytes: row.cache_bytes,
+  };
+}
+
 export interface AgentChatCache {
+  listNative(): Promise<SavedAgentChat[]>;
   loadNative(key: string): Promise<ArrayBuffer | null>;
-  saveNative(checkpoint: NativeAgentChatCheckpoint): Promise<void>;
+  /** False means a newer checkpoint replaced this write before it reached storage. */
+  saveNative(checkpoint: NativeAgentChatCheckpoint): Promise<boolean>;
   retainNative(namespace: string, retainedKeys: readonly string[]): Promise<void>;
   deleteHost(namespace: string): Promise<void>;
 }
@@ -43,16 +80,49 @@ class NativeCacheWriteQueue {
   private writes: Promise<void> = Promise.resolve();
   private readonly retained = new Map<string, ReadonlySet<string>>();
   private readonly reconciliations = new Map<string, Promise<void>>();
+  private readonly pendingSaves = new Map<string, {
+    namespace: string;
+    key: string;
+    write: () => void | Promise<void>;
+    resolve: (saved: boolean) => void;
+    reject: (error: unknown) => void;
+  }>();
 
   read<T>(read: () => Promise<T>): Promise<T> {
     // A fast tab switch must restore the final checkpoint admitted by detach.
-    return this.writes.then(read);
+    return settledPromise(this.writes).then(read);
   }
 
-  save(namespace: string, key: string, write: () => void | Promise<void>): Promise<void> {
+  save(namespace: string, key: string, write: () => void | Promise<void>): Promise<boolean> {
     const retained = this.retained.get(namespace);
-    if (retained && !retained.has(key)) return Promise.resolve();
-    return this.enqueue(write);
+    if (retained && !retained.has(key)) return Promise.resolve(false);
+    const pendingKey = `${namespace.length}:${namespace}${key}`;
+    const previous = this.pendingSaves.get(pendingKey);
+    if (previous) previous.resolve(false);
+    const result = new Promise<boolean>((resolve, reject) => {
+      const pending = { namespace, key, write, resolve, reject };
+      this.pendingSaves.set(pendingKey, pending);
+      if (previous) return;
+      // Keep one queued write per key. Each newer full transcript replaces the
+      // previous pending blob instead of retaining every historical snapshot.
+      void this.enqueue(async () => {
+        const latest = this.pendingSaves.get(pendingKey);
+        this.pendingSaves.delete(pendingKey);
+        if (!latest) return;
+        const allowed = this.retained.get(latest.namespace);
+        if (allowed && !allowed.has(latest.key)) {
+          latest.resolve(false);
+          return;
+        }
+        try {
+          await latest.write();
+          latest.resolve(true);
+        } catch (error) {
+          latest.reject(error);
+        }
+      });
+    });
+    return result;
   }
 
   retain(namespace: string, keys: readonly string[], prune: () => void | Promise<void>): Promise<void> {
@@ -133,6 +203,21 @@ export class SQLiteAgentChatCache implements AgentChatCache {
     return this.database;
   }
 
+  async listNative(): Promise<SavedAgentChat[]> {
+    return this.writes.read(async () => {
+      const db = await this.db();
+      const rows = await db.getAllAsync<SavedAgentChatRow>(`
+        SELECT cache_key, namespace, updated_at, length(cache_blob) AS cache_bytes
+        FROM native_agent_transcript_cache
+        ORDER BY updated_at DESC
+      `);
+      return rows.flatMap(row => {
+        const saved = savedChatFromRow(row);
+        return saved ? [saved] : [];
+      });
+    });
+  }
+
   async loadNative(key: string): Promise<ArrayBuffer | null> {
     return this.writes.read(() => trace('Whip chat cache load', async () => {
       const db = await this.db();
@@ -140,14 +225,15 @@ export class SQLiteAgentChatCache implements AgentChatCache {
         SELECT cache_blob FROM native_agent_transcript_cache WHERE cache_key = ?
       `, [key]);
       if (!row) return null;
-      const bytes = row.cache_blob instanceof ArrayBuffer
-        ? new Uint8Array(row.cache_blob)
-        : new Uint8Array(row.cache_blob.buffer, row.cache_blob.byteOffset, row.cache_blob.byteLength);
+      if (row.cache_blob instanceof ArrayBuffer) return row.cache_blob;
+      const bytes = row.cache_blob;
+      if (bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength
+        && bytes.buffer instanceof ArrayBuffer) return bytes.buffer;
       return bytes.slice().buffer;
     }));
   }
 
-  saveNative(checkpoint: NativeAgentChatCheckpoint): Promise<void> {
+  saveNative(checkpoint: NativeAgentChatCheckpoint): Promise<boolean> {
     return this.writes.save(checkpoint.namespace, checkpoint.key, () => trace(
       'Whip chat cache persist',
       async () => {
@@ -189,6 +275,7 @@ export class SQLiteAgentChatCache implements AgentChatCache {
 interface MemoryCheckpoint {
   namespace: string;
   blob: ArrayBuffer;
+  updatedAt: number;
 }
 
 /** Deterministic opaque persistence adapter used by transcript service tests. */
@@ -196,15 +283,28 @@ export class MemoryAgentChatCache implements AgentChatCache {
   private readonly entries = new Map<string, MemoryCheckpoint>();
   private readonly writes = new NativeCacheWriteQueue();
 
+  listNative(): Promise<SavedAgentChat[]> {
+    return this.writes.read(() => Promise.resolve([...this.entries].flatMap(([key, value]) => {
+      const saved = savedChatFromRow({
+        cache_key: key,
+        namespace: value.namespace,
+        updated_at: value.updatedAt,
+        cache_bytes: value.blob.byteLength,
+      });
+      return saved ? [saved] : [];
+    }).sort((first, second) => second.updatedAt - first.updatedAt)));
+  }
+
   loadNative(key: string): Promise<ArrayBuffer | null> {
     return this.writes.read(() => Promise.resolve(this.entries.get(key)?.blob.slice(0) || null));
   }
 
-  saveNative(checkpoint: NativeAgentChatCheckpoint): Promise<void> {
+  saveNative(checkpoint: NativeAgentChatCheckpoint): Promise<boolean> {
     return this.writes.save(checkpoint.namespace, checkpoint.key, () => {
       this.entries.set(checkpoint.key, {
         namespace: checkpoint.namespace,
         blob: checkpoint.blob.slice(0),
+        updatedAt: Date.now(),
       });
     });
   }

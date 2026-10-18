@@ -1,8 +1,9 @@
 import type { NativeAgentTranscriptState } from 'react-native-whip-ssh';
 
 import { agentChatStateFromNative, applyNativeAgentTranscriptUpdate } from '../src/lib/nativeAgentTranscript';
+import { transcriptBlocks } from '../src/lib/agentChatBlocks';
 
-test('keeps normalized native tool fields typed through the presentation boundary', () => {
+test.each(['claude', 'codex', 'opencode'] as const)('keeps %s normalized tool fields typed through the presentation boundary', agent => {
   const tool = {
     type: 'tool' as const,
     id: 'tool:1',
@@ -26,11 +27,15 @@ test('keeps normalized native tool fields typed through the presentation boundar
       }],
       loaded: ['AGENTS.md'],
       exitCode: 0,
+      inputJson: '{"path":"src/main.rs","options":{"recursive":true}}',
+      durationMs: 2500,
+      startedAt: 1000,
+      completedAt: 3500,
     },
   };
   const native: NativeAgentTranscriptState = {
     sessionId: 'session-1',
-    agent: 'opencode',
+    agent,
     revision: 1,
     status: 'live',
     messages: [{
@@ -38,12 +43,14 @@ test('keeps normalized native tool fields typed through the presentation boundar
       role: 'assistant',
       parts: [tool],
       diffs: tool.state.files,
+      details: { model: 'model', provider: 'provider', usage: { input: 10, output: 5, total: 15 } },
     }],
     turns: [{
       id: 'turn:1',
       assistantMessageIds: ['assistant:1'],
       status: 'idle',
       diffs: tool.state.files,
+      details: { model: 'model', provider: 'provider', usage: { input: 10, output: 5, total: 15 }, outcome: 'completed' },
     }],
   };
 
@@ -59,9 +66,12 @@ test('keeps normalized native tool fields typed through the presentation boundar
       diagnostics: [{ file: 'src/main.rs', line: 5, column: 9 }],
       loaded: ['AGENTS.md'],
       exitCode: 0,
+      inputJson: '{"path":"src/main.rs","options":{"recursive":true}}',
+      durationMs: 2500,
     },
   });
   expect(state.transcript.turns[0].assistants[0]).toBe(native.messages[0]);
+  expect(state.transcript.turns[0].details).toEqual(native.turns[0].details);
 });
 
 test('preserves a closed native transcript as a recoverable terminal state', () => {
@@ -150,4 +160,68 @@ test('native tool lifecycle updates replace the assistant in its canonical turn'
     expect(state.transcript.turns[0].assistants[0].parts[1]).toMatchObject({ state: { status } });
     expect(state.transcript.turns[0].status).toBe('working');
   }
+});
+
+test('queued Codex prompts appear between assistant responses during updates and reopening', () => {
+  const prompt = (id: string) => ({
+    id, role: 'user' as const, diffs: [],
+    parts: [{ id: `${id}:text`, type: 'text' as const, text: 'Also cover errors' }],
+  });
+  const initial = prompt('initial');
+  const assistant = {
+    id: 'assistant:turn', role: 'assistant' as const, diffs: [],
+    parts: [{ id: 'before', type: 'text' as const, text: 'I am working on it.' }],
+  };
+  const native: NativeAgentTranscriptState = {
+    sessionId: 'thread', agent: 'codex', revision: 1, status: 'live',
+    messages: [initial, assistant],
+    turns: [{
+      id: 'turn', userMessageId: initial.id, assistantMessageIds: [assistant.id],
+      messageIds: [initial.id, assistant.id], status: 'working', diffs: [],
+    }],
+  };
+  let state = agentChatStateFromNative(native);
+  const originalRows = transcriptBlocks(state.transcript.turns, true, new Set());
+  for (const id of ['queued-1', 'queued-2']) {
+    const message = prompt(id);
+    native.messages = [...native.messages, message];
+    native.turns[0] = { ...native.turns[0], messageIds: [...native.turns[0].messageIds!, id] };
+    native.revision += 1;
+    const next = applyNativeAgentTranscriptUpdate(state, {
+      key: 'host\ncodex\nthread', runtimeIncarnation: 1, revision: native.revision,
+      deltas: [
+        { type: 'message-upserted', index: native.messages.length - 1, message },
+        { type: 'turn-upserted', index: 0, turn: native.turns[0] },
+      ],
+    });
+    expect(next).not.toBeNull();
+    state = next!;
+    const rows = transcriptBlocks(state.transcript.turns, true, new Set());
+    expect(rows.filter(row => row.type === 'user').map(row => row.message.id))
+      .toEqual(native.messages.filter(current => current.role === 'user').map(current => current.id));
+    expect(rows.slice(0, 2).map(row => row.id)).toEqual(originalRows.slice(0, 2).map(row => row.id));
+    expect(rows.some(row => row.type === 'thinking')).toBe(true);
+  }
+  const response = { ...assistant, id: 'assistant:queued-2', parts: [{
+    id: 'after', type: 'text' as const, text: 'I covered errors too.',
+  }] };
+  native.messages = [...native.messages, response];
+  native.turns[0] = {
+    ...native.turns[0], status: 'idle',
+    assistantMessageIds: [...native.turns[0].assistantMessageIds, response.id],
+    messageIds: [...native.turns[0].messageIds!, response.id],
+  };
+  native.revision += 1;
+  state = applyNativeAgentTranscriptUpdate(state, {
+    key: 'host\ncodex\nthread', runtimeIncarnation: 1, revision: native.revision,
+    deltas: [
+      { type: 'message-upserted', index: 4, message: response },
+      { type: 'turn-upserted', index: 0, turn: native.turns[0] },
+    ],
+  })!;
+  const rows = transcriptBlocks(state.transcript.turns, false, new Set());
+  expect(rows.map(row => row.type === 'user' ? row.message.id : row.type === 'part' ? row.part.id : row.type))
+    .toEqual(['initial', 'before', 'queued-1', 'queued-2', 'after', 'meta']);
+  const reopened = agentChatStateFromNative(native);
+  expect(transcriptBlocks(reopened.transcript.turns, false, new Set())).toEqual(rows);
 });

@@ -1,6 +1,7 @@
 //! Remote path resolution, preview ownership, transfer progress, and Git execution.
 
 use super::*;
+use std::future::Future;
 use std::time::Duration;
 
 use crate::remote_ops::{
@@ -11,13 +12,53 @@ use crate::remote_ops::{
     parse_git_diff, parse_git_repository, parse_git_status, remote_filename,
 };
 
+fn remote_file_entry(
+    name: String,
+    path: String,
+    metadata: crate::ssh::SftpMetadata,
+) -> RemoteFileEntry {
+    let kind = if metadata.is_directory {
+        RemoteFileKind::Directory
+    } else if metadata.is_regular {
+        RemoteFileKind::File
+    } else if metadata.is_symlink {
+        RemoteFileKind::Symlink
+    } else {
+        RemoteFileKind::Other
+    };
+    RemoteFileEntry {
+        name,
+        path,
+        kind,
+        size: metadata.size,
+        modified_at: metadata.modified_at,
+        permissions: metadata.permissions,
+    }
+}
+
 pub(super) async fn resolved_remote_path(
     inner: &RuntimeInner,
     path: Option<&str>,
 ) -> Result<String, HostRuntimeError> {
     let generation = current_generation(inner)?;
-    let home = current_ssh(inner)?.remote_home().await?;
+    let ssh = current_ssh(inner)?;
+    let resolved = resolved_ssh_path(&ssh, path).await?;
     validate_generation(inner, generation)?;
+    Ok(resolved)
+}
+
+async fn resolved_ssh_path(
+    ssh: &SshSession,
+    path: Option<&str>,
+) -> Result<String, HostRuntimeError> {
+    if let Some(path) = path
+        .map(crate::remote_ops::remote_path_input)
+        .filter(|path| path.starts_with('/'))
+    {
+        return crate::remote_ops::normalize_absolute(path)
+            .map_err(HostRuntimeError::RemoteFileFailure);
+    }
+    let home = ssh.remote_home().await?;
     let home = crate::remote_ops::normalize_absolute(home.trim())
         .map_err(HostRuntimeError::RemoteFileFailure)?;
     normalize_remote_path(path, &home).map_err(HostRuntimeError::RemoteFileFailure)
@@ -101,6 +142,7 @@ pub(super) fn invalidate_remote_operations(
     generation: u64,
     reason: &str,
 ) {
+    inner.directory_cache.lock().clear();
     inner.operations.cancel_generation(generation, reason);
     let previews = inner.operations.disconnect_previews(generation);
     for (preview_id, _) in &previews {
@@ -191,7 +233,7 @@ pub(super) async fn transfer_setup_step<T, E, F>(
 ) -> Result<T, String>
 where
     E: std::fmt::Display,
-    F: std::future::Future<Output = Result<T, E>>,
+    F: Future<Output = Result<T, E>>,
 {
     if *cancel.borrow() {
         return Err("transfer cancelled".to_owned());
@@ -204,6 +246,129 @@ where
         }
         result = future => result.map_err(|error| error.to_string()),
     }
+}
+
+struct TransferPaths {
+    local_path: String,
+    remote_path: String,
+}
+
+// Invalidate on both sides of a mutation, including errors/cancellation that may
+// leave a partial upload or recursively-created directory on the server.
+struct DirectoryMutation {
+    inner: Arc<RuntimeInner>,
+    generation: u64,
+    paths: Vec<String>,
+    ancestors: bool,
+}
+
+impl DirectoryMutation {
+    fn new(inner: Arc<RuntimeInner>, generation: u64, paths: Vec<String>, ancestors: bool) -> Self {
+        inner
+            .directory_cache
+            .lock()
+            .invalidate(generation, &paths, ancestors);
+        Self {
+            inner,
+            generation,
+            paths,
+            ancestors,
+        }
+    }
+}
+
+impl Drop for DirectoryMutation {
+    fn drop(&mut self) {
+        self.inner
+            .directory_cache
+            .lock()
+            .invalidate(self.generation, &self.paths, self.ancestors);
+    }
+}
+
+#[cfg(test)]
+mod directory_mutation_tests {
+    use super::*;
+
+    #[test]
+    fn mutation_guard_invalidates_before_and_after_partial_work() {
+        let inner = super::super::tests::connected_runtime_inner("directory-mutation");
+        let now = std::time::Instant::now();
+        let listing = RemoteDirectoryListing {
+            path: "/home".into(),
+            entries: Vec::new(),
+        };
+        let request = inner.directory_cache.lock().begin(1, now);
+        inner
+            .directory_cache
+            .lock()
+            .insert(request, listing.clone(), now);
+        let mutation = DirectoryMutation::new(inner.clone(), 1, vec!["/home/file".into()], false);
+        assert!(
+            inner
+                .directory_cache
+                .lock()
+                .lookup(1, "/home", now)
+                .is_none()
+        );
+        let during = inner.directory_cache.lock().begin(1, now);
+        inner
+            .directory_cache
+            .lock()
+            .insert(during, listing.clone(), now);
+        let pending = inner.directory_cache.lock().begin(1, now);
+        drop(mutation);
+        inner.directory_cache.lock().insert(pending, listing, now);
+        assert!(
+            inner
+                .directory_cache
+                .lock()
+                .lookup(1, "/home", now)
+                .is_none()
+        );
+    }
+}
+
+fn start_transfer<F, Fut>(
+    inner: &Arc<RuntimeInner>,
+    operation: F,
+) -> Result<String, HostRuntimeError>
+where
+    F: FnOnce(
+            Arc<SshSession>,
+            watch::Receiver<bool>,
+            Arc<dyn Fn(u64, Option<u64>) + Send + Sync>,
+        ) -> Fut
+        + Send
+        + 'static,
+    Fut: Future<Output = Result<TransferPaths, String>> + Send + 'static,
+{
+    let generation = current_generation(inner)?;
+    let ssh = current_ssh(inner)?;
+    let (transfer_id, cancel, _) = inner
+        .operations
+        .begin_transfer(generation)
+        .map_err(HostRuntimeError::TransferFailure)?;
+    let id = transfer_id.clone();
+    let inner = inner.clone();
+    crate::runtime()
+        .map_err(HostRuntimeError::SshTransportFailure)?
+        .spawn(async move {
+            let progress_inner = inner.clone();
+            let progress_id = id.clone();
+            let progress = Arc::new(move |bytes, total| {
+                update_transfer_progress(&progress_inner, &progress_id, bytes, total);
+            });
+            let result = operation(ssh, cancel, progress)
+                .await
+                .map(|paths| TransferResult {
+                    transfer_id: id.clone(),
+                    local_path: Some(paths.local_path),
+                    remote_path: Some(paths.remote_path),
+                });
+            finish_transfer(&inner, &id, generation, result);
+        });
+    Ok(transfer_id)
 }
 
 pub(super) async fn execute_generation_checked(
@@ -239,6 +404,19 @@ pub(super) fn command_failure(kind: &str, output: &crate::ssh::CommandOutput) ->
 }
 #[uniffi::export]
 impl HostRuntime {
+    pub fn cached_directory(&self, path: String) -> Option<RemoteDirectoryListing> {
+        let generation = current_generation(&self.inner).ok()?;
+        // Navigation uses the canonical path returned by list_directory. Paths
+        // requiring home resolution fall through to a fresh asynchronous read.
+        let path =
+            crate::remote_ops::normalize_absolute(crate::remote_ops::remote_path_input(&path))
+                .ok()?;
+        self.inner
+            .directory_cache
+            .lock()
+            .lookup(generation, &path, std::time::Instant::now())
+    }
+
     pub async fn list_directory(
         &self,
         path: Option<String>,
@@ -249,9 +427,13 @@ impl HostRuntime {
             .spawn(async move {
                 let generation = current_generation(&inner)?;
                 let path = resolved_remote_path(&inner, path.as_deref()).await?;
+                let cache_request = inner
+                    .directory_cache
+                    .lock()
+                    .begin(generation, std::time::Instant::now());
                 let entries = current_ssh(&inner)?.sftp_list(&path).await?;
                 validate_generation(&inner, generation)?;
-                let mut entries = entries
+                let entries = entries
                     .into_iter()
                     .filter_map(|entry| {
                         let name = entry.filename.trim_end_matches('/').to_owned();
@@ -259,36 +441,22 @@ impl HostRuntime {
                             return None;
                         }
                         let entry_path = join_remote_path(&path, &name).ok()?;
-                        let kind = if entry.metadata.is_directory {
-                            RemoteFileKind::Directory
-                        } else if entry.metadata.is_regular {
-                            RemoteFileKind::File
-                        } else if entry.metadata.is_symlink {
-                            RemoteFileKind::Symlink
-                        } else {
-                            RemoteFileKind::Other
-                        };
-                        Some(RemoteFileEntry {
-                            name,
-                            path: entry_path,
-                            kind,
-                            size: entry.metadata.size,
-                            modified_at: entry.metadata.modified_at,
-                            permissions: entry.metadata.permissions,
-                        })
+                        Some(remote_file_entry(name, entry_path, entry.metadata))
                     })
                     .collect::<Vec<_>>();
-                entries.sort_by(|left, right| {
-                    let left_directory = left.kind == RemoteFileKind::Directory;
-                    let right_directory = right.kind == RemoteFileKind::Directory;
-                    right_directory.cmp(&left_directory).then_with(|| {
-                        left.name
-                            .to_lowercase()
-                            .cmp(&right.name.to_lowercase())
-                            .then(left.name.cmp(&right.name))
-                    })
-                });
-                Ok(RemoteDirectoryListing { path, entries })
+                inner.git_discovery.lock().observe(
+                    generation,
+                    &path,
+                    &entries,
+                    std::time::Instant::now(),
+                );
+                let listing = RemoteDirectoryListing { path, entries };
+                inner.directory_cache.lock().insert(
+                    cache_request,
+                    listing.clone(),
+                    std::time::Instant::now(),
+                );
+                Ok(listing)
             })
             .await
             .map_err(|error| {
@@ -298,6 +466,7 @@ impl HostRuntime {
             })?
     }
 
+    /// Resolve target metadata on demand while preserving the requested symlink path.
     pub async fn stat_remote_path(
         &self,
         path: String,
@@ -311,23 +480,7 @@ impl HostRuntime {
                 let metadata = current_ssh(&inner)?.sftp_stat(&path).await?;
                 validate_generation(&inner, generation)?;
                 let name = remote_filename(&path).unwrap_or_else(|_| "/".to_owned());
-                let kind = if metadata.is_directory {
-                    RemoteFileKind::Directory
-                } else if metadata.is_regular {
-                    RemoteFileKind::File
-                } else if metadata.is_symlink {
-                    RemoteFileKind::Symlink
-                } else {
-                    RemoteFileKind::Other
-                };
-                Ok(RemoteFileEntry {
-                    name,
-                    path,
-                    kind,
-                    size: metadata.size,
-                    modified_at: metadata.modified_at,
-                    permissions: metadata.permissions,
-                })
+                Ok(remote_file_entry(name, path, metadata))
             })
             .await
             .map_err(|error| {
@@ -370,6 +523,8 @@ impl HostRuntime {
             .spawn(async move {
                 let generation = current_generation(&inner)?;
                 let path = resolved_remote_path(&inner, Some(&path)).await?;
+                let _mutation =
+                    DirectoryMutation::new(inner.clone(), generation, vec![path.clone()], true);
                 current_ssh(&inner)?.sftp_create_dir_all(&path).await?;
                 validate_generation(&inner, generation)
             })
@@ -389,8 +544,23 @@ impl HostRuntime {
             .map_err(HostRuntimeError::SshTransportFailure)?
             .spawn(async move {
                 let generation = current_generation(&inner)?;
+                // Validate before normalization so a trailing slash or dot component
+                // cannot turn an invalid filename into a different mutation target.
+                crate::remote_ops::validate_remote_filename(
+                    to.rsplit('/').next().unwrap_or_default(),
+                )
+                .map_err(HostRuntimeError::RemoteFileFailure)?;
                 let from = resolved_remote_path(&inner, Some(&from)).await?;
                 let to = resolved_remote_path(&inner, Some(&to)).await?;
+                if from == to {
+                    return Ok(());
+                }
+                let _mutation = DirectoryMutation::new(
+                    inner.clone(),
+                    generation,
+                    vec![from.clone(), to.clone()],
+                    false,
+                );
                 current_ssh(&inner)?.sftp_rename(&from, &to).await?;
                 validate_generation(&inner, generation)
             })
@@ -411,6 +581,8 @@ impl HostRuntime {
             .spawn(async move {
                 let generation = current_generation(&inner)?;
                 let path = resolved_remote_path(&inner, Some(&path)).await?;
+                let _mutation =
+                    DirectoryMutation::new(inner.clone(), generation, vec![path.clone()], false);
                 current_ssh(&inner)?.sftp_remove(&path, directory).await?;
                 validate_generation(&inner, generation)
             })
@@ -425,88 +597,54 @@ impl HostRuntime {
         local_path: String,
         remote_directory: String,
     ) -> Result<String, HostRuntimeError> {
-        let generation = current_generation(&self.inner)?;
-        let ssh = current_ssh(&self.inner)?;
-        let (transfer_id, mut cancel, _) = self
-            .inner
-            .operations
-            .begin_transfer(generation)
-            .map_err(HostRuntimeError::TransferFailure)?;
-        let id = transfer_id.clone();
         let inner = self.inner.clone();
-        crate::runtime()
-            .map_err(HostRuntimeError::SshTransportFailure)?
-            .spawn(async move {
-                let result = async {
-                    let filename = std::path::Path::new(&local_path)
-                        .file_name()
-                        .and_then(|value| value.to_str())
-                        .ok_or_else(|| "local upload path has no UTF-8 filename".to_owned())?;
-                    let home = transfer_setup_step(&mut cancel, ssh.remote_home()).await?;
-                    let directory = normalize_remote_path(Some(&remote_directory), home.trim())?;
-                    let remote_path = join_remote_path(&directory, filename)?;
-                    let progress_inner = inner.clone();
-                    let progress_id = id.clone();
-                    let progress = Arc::new(move |bytes, total| {
-                        update_transfer_progress(&progress_inner, &progress_id, bytes, total);
-                    });
-                    ssh.transfer_upload(&local_path, &remote_path, cancel, progress)
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    Ok(TransferResult {
-                        transfer_id: id.clone(),
-                        local_path: Some(local_path),
-                        remote_path: Some(remote_path),
-                    })
-                }
-                .await;
-                finish_transfer(&inner, &id, generation, result);
-            });
-        Ok(transfer_id)
+        let generation = current_generation(&inner)?;
+        start_transfer(&self.inner, move |ssh, mut cancel, progress| async move {
+            let filename = std::path::Path::new(&local_path)
+                .file_name()
+                .and_then(|value| value.to_str())
+                .ok_or_else(|| "local upload path has no UTF-8 filename".to_owned())?;
+            let directory = transfer_setup_step(
+                &mut cancel,
+                resolved_ssh_path(&ssh, Some(&remote_directory)),
+            )
+            .await?;
+            let remote_path = join_remote_path(&directory, filename)?;
+            let _mutation =
+                DirectoryMutation::new(inner, generation, vec![remote_path.clone()], false);
+            ssh.transfer_upload(&local_path, &remote_path, cancel, progress)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(TransferPaths {
+                local_path,
+                remote_path,
+            })
+        })
     }
 
     pub fn start_attachment_upload(&self, local_path: String) -> Result<String, HostRuntimeError> {
-        let generation = current_generation(&self.inner)?;
-        let ssh = current_ssh(&self.inner)?;
-        let (transfer_id, mut cancel, _) = self
-            .inner
-            .operations
-            .begin_transfer(generation)
-            .map_err(HostRuntimeError::TransferFailure)?;
-        let id = transfer_id.clone();
         let inner = self.inner.clone();
-        crate::runtime()
-            .map_err(HostRuntimeError::SshTransportFailure)?
-            .spawn(async move {
-                let result = async {
-                    let home = crate::remote_ops::normalize_absolute(
-                        transfer_setup_step(&mut cancel, ssh.remote_home())
-                            .await?
-                            .trim(),
-                    )?;
-                    let upload_directory = join_remote_path(&home, ".whip/uploads")?;
-                    transfer_setup_step(&mut cancel, ssh.sftp_create_dir_all(&upload_directory))
-                        .await?;
-                    let filename = attachment_filename(&local_path)?;
-                    let remote_path = join_remote_path(&upload_directory, &filename)?;
-                    let progress_inner = inner.clone();
-                    let progress_id = id.clone();
-                    let progress = Arc::new(move |bytes, total| {
-                        update_transfer_progress(&progress_inner, &progress_id, bytes, total);
-                    });
-                    ssh.transfer_upload(&local_path, &remote_path, cancel, progress)
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    Ok(TransferResult {
-                        transfer_id: id.clone(),
-                        local_path: Some(local_path),
-                        remote_path: Some(remote_path),
-                    })
-                }
-                .await;
-                finish_transfer(&inner, &id, generation, result);
-            });
-        Ok(transfer_id)
+        let generation = current_generation(&inner)?;
+        start_transfer(&self.inner, move |ssh, mut cancel, progress| async move {
+            let home = crate::remote_ops::normalize_absolute(
+                transfer_setup_step(&mut cancel, ssh.remote_home())
+                    .await?
+                    .trim(),
+            )?;
+            let upload_directory = join_remote_path(&home, ".whip/uploads")?;
+            let _mutation =
+                DirectoryMutation::new(inner, generation, vec![upload_directory.clone()], true);
+            transfer_setup_step(&mut cancel, ssh.sftp_create_dir_all(&upload_directory)).await?;
+            let filename = attachment_filename(&local_path)?;
+            let remote_path = join_remote_path(&upload_directory, &filename)?;
+            ssh.transfer_upload(&local_path, &remote_path, cancel, progress)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(TransferPaths {
+                local_path,
+                remote_path,
+            })
+        })
     }
 
     pub fn start_download(
@@ -514,45 +652,24 @@ impl HostRuntime {
         remote_path: String,
         local_directory: String,
     ) -> Result<String, HostRuntimeError> {
-        let generation = current_generation(&self.inner)?;
-        let ssh = current_ssh(&self.inner)?;
-        let (transfer_id, mut cancel, _) = self
-            .inner
-            .operations
-            .begin_transfer(generation)
-            .map_err(HostRuntimeError::TransferFailure)?;
-        let id = transfer_id.clone();
-        let inner = self.inner.clone();
-        crate::runtime()
-            .map_err(HostRuntimeError::SshTransportFailure)?
-            .spawn(async move {
-                let result = async {
-                    let home = transfer_setup_step(&mut cancel, ssh.remote_home()).await?;
-                    let remote_path = normalize_remote_path(Some(&remote_path), home.trim())?;
-                    let filename = remote_filename(&remote_path)?;
-                    let local_path = std::path::Path::new(&local_directory)
-                        .join(filename)
-                        .to_str()
-                        .ok_or_else(|| "local download path is not UTF-8".to_owned())?
-                        .to_owned();
-                    let progress_inner = inner.clone();
-                    let progress_id = id.clone();
-                    let progress = Arc::new(move |bytes, total| {
-                        update_transfer_progress(&progress_inner, &progress_id, bytes, total);
-                    });
-                    ssh.transfer_download(&remote_path, &local_path, cancel, progress)
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    Ok(TransferResult {
-                        transfer_id: id.clone(),
-                        local_path: Some(local_path),
-                        remote_path: Some(remote_path),
-                    })
-                }
-                .await;
-                finish_transfer(&inner, &id, generation, result);
-            });
-        Ok(transfer_id)
+        start_transfer(&self.inner, move |ssh, mut cancel, progress| async move {
+            let remote_path =
+                transfer_setup_step(&mut cancel, resolved_ssh_path(&ssh, Some(&remote_path)))
+                    .await?;
+            let filename = remote_filename(&remote_path)?;
+            let local_path = std::path::Path::new(&local_directory)
+                .join(filename)
+                .to_str()
+                .ok_or_else(|| "local download path is not UTF-8".to_owned())?
+                .to_owned();
+            ssh.transfer_download(&remote_path, &local_path, cancel, progress)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(TransferPaths {
+                local_path,
+                remote_path,
+            })
+        })
     }
 
     pub fn transfer_progress(&self, transfer_id: String) -> Option<TransferProgress> {
@@ -624,18 +741,59 @@ impl HostRuntime {
         crate::runtime()
             .map_err(HostRuntimeError::SshTransportFailure)?
             .spawn(async move {
+                let generation = current_generation(&inner)?;
                 let path = resolved_remote_path(&inner, Some(&path)).await?;
+                validate_generation(&inner, generation)?;
+                if let Some(repository) =
+                    inner
+                        .git_discovery
+                        .lock()
+                        .lookup(generation, &path, std::time::Instant::now())
+                {
+                    return Ok(repository.into_repository());
+                }
+                // Serialize misses, then check again so simultaneous requests share
+                // one SSH command. Listings never wait on this operation lock.
+                let _operation = inner.git_discovery_operation.lock().await;
+                validate_generation(&inner, generation)?;
+                let revision = {
+                    let mut cache = inner.git_discovery.lock();
+                    if let Some(repository) =
+                        cache.lookup(generation, &path, std::time::Instant::now())
+                    {
+                        return Ok(repository.into_repository());
+                    }
+                    cache.revision()
+                };
                 let output =
                     execute_generation_checked(&inner, &git_repository_command(&path)).await?;
+                if output.exit_status != Some(0) {
+                    return Err(HostRuntimeError::GitFailure(command_failure(
+                        "Git discovery",
+                        &output,
+                    )));
+                }
                 if output.stdout_truncated {
                     return Err(HostRuntimeError::GitFailure(
                         "Git repository output exceeded the command limit".to_owned(),
                     ));
                 }
-                parse_git_repository(std::str::from_utf8(&output.stdout).map_err(|_| {
-                    HostRuntimeError::GitFailure("Git repository output was not UTF-8".to_owned())
-                })?)
-                .map_err(HostRuntimeError::GitFailure)
+                let repository =
+                    parse_git_repository(std::str::from_utf8(&output.stdout).map_err(|_| {
+                        HostRuntimeError::GitFailure(
+                            "Git repository output was not UTF-8".to_owned(),
+                        )
+                    })?)
+                    .map_err(HostRuntimeError::GitFailure)?;
+                validate_generation(&inner, generation)?;
+                inner.git_discovery.lock().insert(
+                    generation,
+                    revision,
+                    path,
+                    repository.clone(),
+                    std::time::Instant::now(),
+                );
+                Ok(repository)
             })
             .await
             .map_err(|error| {
@@ -673,13 +831,14 @@ impl HostRuntime {
         &self,
         repository: GitRepository,
         status: GitStatusEntry,
+        context: crate::remote_ops::GitDiffContext,
     ) -> Result<GitDiff, HostRuntimeError> {
         let inner = self.inner.clone();
         crate::runtime()
             .map_err(HostRuntimeError::SshTransportFailure)?
             .spawn(async move {
-                let command =
-                    git_diff_command(&repository, &status).map_err(HostRuntimeError::GitFailure)?;
+                let command = git_diff_command(&repository, &status, context)
+                    .map_err(HostRuntimeError::GitFailure)?;
                 let output = execute_generation_checked(&inner, &command).await?;
                 if output.exit_status.is_some_and(|status| status != 0) {
                     return Err(HostRuntimeError::GitFailure(command_failure(
@@ -692,6 +851,64 @@ impl HostRuntime {
             .map_err(|error| {
                 HostRuntimeError::GitFailure(format!("Git diff task failed: {error}"))
             })?
+    }
+
+    pub async fn git_diff_review(
+        &self,
+        repository: GitRepository,
+        status: GitStatusEntry,
+        context: crate::remote_ops::GitDiffContext,
+        expansions: Vec<crate::git_review::GitDiffExpansion>,
+    ) -> Result<crate::git_review::GitDiffReview, HostRuntimeError> {
+        let inner = self.inner.clone();
+        crate::runtime()
+            .map_err(HostRuntimeError::SshTransportFailure)?
+            .spawn(async move {
+                let generation = current_generation(&inner)?;
+                let lines = crate::git_review::fetch_context(context, &expansions)
+                    .map_err(HostRuntimeError::GitFailure)?;
+                let command = crate::remote_ops::git_diff_command_lines(&repository, &status, lines)
+                    .map_err(HostRuntimeError::GitFailure)?;
+                let output = execute_generation_checked(&inner, &command).await?;
+                if output.exit_status.is_some_and(|status| status != 0) {
+                    return Err(HostRuntimeError::GitFailure(command_failure("git diff", &output)));
+                }
+                let review = tokio::task::spawn_blocking(move || {
+                    let diff = parse_git_diff(&output.stdout)?;
+                    if diff.truncated && !expansions.is_empty() {
+                        return Err("Expanded context exceeds the preview limit; choose a context mode instead".to_owned());
+                    }
+                    Ok(crate::git_review::review(diff, context, &expansions))
+                }).await.map_err(|error| HostRuntimeError::GitFailure(error.to_string()))?
+                    .map_err(HostRuntimeError::GitFailure)?;
+                validate_generation(&inner, generation)?;
+                Ok(review)
+            })
+            .await
+            .map_err(|error| HostRuntimeError::GitFailure(format!("Git review task failed: {error}")))?
+    }
+
+    pub async fn start_browser_proxy(&self) -> Result<u16, HostRuntimeError> {
+        let inner = self.inner.clone();
+        crate::runtime()
+            .map_err(HostRuntimeError::SshTransportFailure)?
+            .spawn(async move {
+                let generation = current_generation(&inner)?;
+                let ssh = current_ssh(&inner)?;
+                let port = ssh.open_browser_proxy().await?;
+                if let Err(error) = validate_generation(&inner, generation) {
+                    ssh.close_local_forward(port);
+                    return Err(error);
+                }
+                Ok(port)
+            })
+            .await
+            .map_err(|error| HostRuntimeError::PreviewFailure(error.to_string()))?
+    }
+
+    pub fn stop_browser_proxy(&self, port: u16) -> Result<(), HostRuntimeError> {
+        current_ssh(&self.inner)?.close_local_forward(port);
+        Ok(())
     }
 
     pub async fn start_web_preview(

@@ -1,20 +1,19 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Keychain from 'react-native-keychain';
+import { NativeHostProfileStore } from 'react-native-whip-ssh';
 
 import {
   HOSTS_STORAGE_KEY,
+  DEFAULT_SSH_PORT,
+  DEFAULT_HERDR_COMMAND,
   LEGACY_CREDENTIAL_SERVICE,
   LEGACY_PROFILE_KEY,
   hostCredentialService,
-  hydrateHostProfiles,
   migrateLegacyProfile,
-  parseHosts,
-  prepareHostDisconnected,
-  prepareHostRemoval,
-  prepareHostUpsert,
   resolveJumpHostChain,
   toHostProfile,
 } from '../lib/hostProfiles';
+import { settledPromise } from '../lib/promises';
 import type { ConnectionProfile, HostProfile } from '../types';
 import { reportBackgroundFailure } from './backgroundOperations';
 import {
@@ -39,62 +38,226 @@ interface StoredCredential {
   passphrase?: string;
 }
 
+export type HostMetadataPatch = Partial<Omit<HostProfile, 'jumpHostId'>> & {
+  jumpHostId?: string | null;
+};
+
 export const CREDENTIAL_BACKUP_MIGRATION_KEY = 'herdr.credentials.backup-migration';
 export const CREDENTIAL_BACKUP_MIGRATION_VERSION = '1';
 let credentialBackupMigration: Promise<void> | null = null;
 
-export async function loadHostProfiles(): Promise<HostProfile[]> {
-  let entries: readonly [string, string | null][];
-  try {
-    entries = await AsyncStorage.multiGet([HOSTS_STORAGE_KEY, LEGACY_PROFILE_KEY]);
-  } catch (error) {
-    recordStorageDiagnostic('error', 'storage-read-failed', {
-      store: 'host-profiles',
-      phase: 'startup-fallback',
-      operation: 'multiGet',
-      fallbackUsed: 'empty-hosts',
-      ...storageErrorDetails(error),
-    });
-    throw error;
+export class HostProfilesUnavailableError extends Error {
+  constructor() {
+    super('Host profiles must be loaded successfully before they can be changed');
+    this.name = 'HostProfilesUnavailableError';
   }
-  const values = new Map(entries);
-  const hosts = await loadHostProfilesFromStorage(
-    values.get(HOSTS_STORAGE_KEY) ?? null,
-    values.get(LEGACY_PROFILE_KEY) ?? null,
-  );
-  scheduleCredentialBackupMigration(hosts);
-  return hosts;
 }
 
-/** Parses current host metadata without touching Keychain or credential backups. */
-export async function loadHostProfilesFromStorage(
-  stored: string | null,
-  legacyValue: string | null,
-): Promise<HostProfile[]> {
-  if (stored !== null) {
-    return parseHosts(stored, error => {
-      recordHostProfilesParseFailure(error, HOSTS_STORAGE_KEY, 'empty-hosts');
+/** Owns canonical Rust metadata and serializes storage and credential operations. */
+export class HostProfileRepository {
+  private store: NativeHostProfileStore | null = null;
+  private operations: Promise<void> = Promise.resolve();
+  private readonly listeners = new Set<(hosts: HostProfile[]) => void>();
+
+  subscribe(listener: (hosts: HostProfile[]) => void): () => void {
+    this.listeners.add(listener);
+    if (this.store) listener(this.store.view().hosts);
+    return () => { this.listeners.delete(listener); };
+  }
+
+  loadHostProfiles(): Promise<HostProfile[]> {
+    return this.enqueue(async () => {
+      if (this.store) return this.store.view().hosts;
+      let entries: readonly [string, string | null][];
+      try {
+        entries = await AsyncStorage.multiGet([HOSTS_STORAGE_KEY, LEGACY_PROFILE_KEY]);
+        const values = new Map(entries);
+        if (!values.has(HOSTS_STORAGE_KEY) || !values.has(LEGACY_PROFILE_KEY)) {
+          throw new Error('AsyncStorage omitted host profile storage keys');
+        }
+      } catch (error) {
+        recordStorageDiagnostic('error', 'storage-read-failed', {
+          store: 'host-profiles',
+          phase: 'startup-fallback',
+          operation: 'multiGet',
+          fallbackUsed: 'preserved-host-profiles',
+          ...storageErrorDetails(error),
+        });
+        throw error;
+      }
+      const values = new Map(entries);
+      const hosts = await this.hydrate(
+        values.get(HOSTS_STORAGE_KEY) ?? null,
+        values.get(LEGACY_PROFILE_KEY) ?? null,
+      );
+      scheduleCredentialBackupMigration(hosts);
+      return hosts;
     });
   }
 
-  const legacy = migrateLegacyProfile(legacyValue, error => {
-    recordHostProfilesParseFailure(error, LEGACY_PROFILE_KEY, 'empty-hosts');
-  });
-  if (!legacy) return parseHosts(null);
-
-  const credential = await Keychain.getGenericPassword({ service: LEGACY_CREDENTIAL_SERVICE });
-  const secrets = parseCredential(credential ? credential.password : null, legacy.id)
-    || { secret: '', passphrase: '' };
-  const migrated = { ...legacy, ...secrets };
-  const host = toHostProfile(migrated);
-
-  await writeHostProfiles(JSON.stringify([host]), 'startup-migration');
-  hydrateHostProfiles([host]);
-  if (migrated.secret) {
-    await writeCredential(migrated);
+  loadHostProfilesFromStorage(stored: string | null, legacyValue: string | null): Promise<HostProfile[]> {
+    return this.enqueue(() => this.hydrate(stored, legacyValue));
   }
-  return [host];
+
+  saveConnectionProfile(profile: ConnectionProfile): Promise<{ hosts: HostProfile[]; host: HostProfile }> {
+    return this.enqueue(async () => {
+      const next = this.draft();
+      const previous = next.view().hosts.find(host => host.id === profile.id);
+      const host = toHostProfile(profile, previous);
+      next.upsert(host, host.updatedAt);
+      const hosts = await this.persist(next, 'profile-save', async () => {
+        if (profile.secret) {
+          await writeCredential(profile);
+        } else {
+          await Keychain.resetGenericPassword({ service: hostCredentialService(profile.id) });
+          await removeCredentialBackup(profile.id);
+        }
+      });
+      return { hosts, host };
+    });
+  }
+
+  /** Metadata edits must not clear a saved credential or the user's AGENTS.md. */
+  saveHostMetadata(
+    id: string,
+    patch: HostMetadataPatch,
+    credentialFromHostId?: string,
+    assertActive: () => void = () => undefined,
+  ): Promise<{ host: HostProfile }> {
+    return this.enqueue(async () => {
+      assertActive();
+      const next = this.draft();
+      const hosts = next.view().hosts;
+      const previous = hosts.find(host => host.id === id);
+      const source = credentialFromHostId
+        ? hosts.find(host => host.id === credentialFromHostId)
+        : undefined;
+      if (credentialFromHostId && !source) throw new Error('Credential source host does not exist');
+      const now = new Date().toISOString();
+      const base: HostProfile = previous || {
+        id, name: '', host: '', port: DEFAULT_SSH_PORT, username: '', authMode: 'password',
+        herdrCommand: DEFAULT_HERDR_COMMAND, herdrSocketPath: '', sessionName: '',
+        createdAt: now, updatedAt: now,
+      };
+      const host = next.normalizeProfile({
+        ...base, ...patch, id,
+        agentInstructions: previous?.agentInstructions ?? '',
+        createdAt: base.createdAt, updatedAt: now,
+        forwardAgent: Boolean(patch.forwardAgent ?? base.forwardAgent),
+        jumpHostId: patch.jumpHostId === null ? undefined : patch.jumpHostId ?? base.jumpHostId,
+        herdrSocketPath: patch.herdrSocketPath ?? base.herdrSocketPath ?? '',
+      }, previous?.createdAt, now);
+      if (source && source.authMode !== host.authMode) throw new Error('Credential source must use the same authentication mode');
+      if (previous && previous.authMode !== host.authMode && !source) {
+        throw new Error('Changing authentication mode requires a credential source or editing the host locally');
+      }
+      const credential = source ? await loadConnectionProfile(source) : undefined;
+      if (credential && !credential.secret) throw new Error('Credential source has no saved credential');
+      assertActive();
+      next.upsert(host, now);
+      await this.persist(next, 'reverse-control-profile-save', credential
+        ? () => writeCredential({ ...host, secret: credential.secret, passphrase: credential.passphrase })
+        : undefined);
+      return { host };
+    });
+  }
+
+  /** The Hosts screen presents the connection end time as last connected. */
+  markHostDisconnected(id: string): Promise<HostProfile[]> {
+    return this.enqueue(async () => {
+      const next = this.draft();
+      next.markDisconnected(id, new Date().toISOString());
+      return this.persist(next, 'disconnect-persistence');
+    });
+  }
+
+  deleteHostProfile(id: string): Promise<HostProfile[]> {
+    return this.enqueue(async () => {
+      const next = this.draft();
+      next.remove(id, new Date().toISOString());
+      return this.persist(next, 'profile-delete', async () => {
+        await Keychain.resetGenericPassword({ service: hostCredentialService(id) });
+        await removeCredentialBackup(id);
+      });
+    });
+  }
+
+  private enqueue<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.operations.then(operation);
+    this.operations = settledPromise(result);
+    return result;
+  }
+
+  private async hydrate(stored: string | null, legacyValue: string | null): Promise<HostProfile[]> {
+    // Startup snapshots may arrive again after edits; only initialize once.
+    if (this.store) return this.store.view().hosts;
+    const next = new NativeHostProfileStore();
+    if (stored !== null) {
+      try {
+        next.hydrate(stored);
+      } catch (error) {
+        recordHostProfilesParseFailure(error, HOSTS_STORAGE_KEY);
+        throw error;
+      }
+    } else {
+      const legacy = migrateLegacyProfile(legacyValue, error => {
+        recordHostProfilesParseFailure(error, LEGACY_PROFILE_KEY);
+      });
+      if (legacy) {
+        const credential = await Keychain.getGenericPassword({ service: LEGACY_CREDENTIAL_SERVICE });
+        const secrets = parseCredential(credential ? credential.password : null, legacy.id)
+          || { secret: '', passphrase: '' };
+        const migrated = { ...legacy, ...secrets };
+        const host = toHostProfile(migrated);
+        next.upsert(host, host.updatedAt);
+        if (migrated.secret) await writeCredential(migrated);
+        return this.persist(next, 'startup-migration');
+      }
+    }
+    return this.publish(next);
+  }
+
+  private draft(): NativeHostProfileStore {
+    if (!this.store) throw new HostProfilesUnavailableError();
+    // Stage changes in Rust without exposing them before persistence succeeds.
+    const next = new NativeHostProfileStore();
+    next.hydrate(this.store.view().persistedValue);
+    return next;
+  }
+
+  private async persist(
+    next: NativeHostProfileStore,
+    phase: string,
+    persistCredential?: () => Promise<void>,
+  ): Promise<HostProfile[]> {
+    await writeHostProfiles(next.view().persistedValue, phase);
+    this.store = next;
+    try {
+      await persistCredential?.();
+    } finally {
+      // Keychain cannot roll back a committed metadata write. Reflect disk even
+      // when credential work fails, while retaining that failure for the caller.
+      this.publish(next);
+    }
+    return next.view().hosts;
+  }
+
+  private publish(store: NativeHostProfileStore): HostProfile[] {
+    this.store = store;
+    const hosts = store.view().hosts;
+    for (const listener of this.listeners) listener(hosts);
+    return hosts;
+  }
 }
+
+const hostProfiles = new HostProfileRepository();
+export const loadHostProfiles = hostProfiles.loadHostProfiles.bind(hostProfiles);
+export const loadHostProfilesFromStorage = hostProfiles.loadHostProfilesFromStorage.bind(hostProfiles);
+export const saveConnectionProfile = hostProfiles.saveConnectionProfile.bind(hostProfiles);
+export const saveHostMetadata = hostProfiles.saveHostMetadata.bind(hostProfiles);
+export const markHostDisconnected = hostProfiles.markHostDisconnected.bind(hostProfiles);
+export const deleteHostProfile = hostProfiles.deleteHostProfile.bind(hostProfiles);
+export const subscribeToHostProfiles = hostProfiles.subscribe.bind(hostProfiles);
 
 /** Runs the one-time backup migration without delaying host metadata rendering. */
 export function scheduleCredentialBackupMigration(hosts: readonly HostProfile[]): void {
@@ -192,56 +355,6 @@ export async function loadJumpHostConnectionProfiles(
   return Promise.all(jumpHosts.map(loadConnectionProfile));
 }
 
-export async function saveConnectionProfile(
-  hosts: HostProfile[],
-  profile: ConnectionProfile,
-): Promise<{ hosts: HostProfile[]; host: HostProfile }> {
-  const previous = hosts.find(host => host.id === profile.id);
-  const host = toHostProfile(profile, previous);
-  const next = prepareHostUpsert(hosts, host);
-  try {
-    await writeHostProfiles(next.persistedValue, 'profile-save');
-  } catch (error) {
-    hydrateHostProfiles(hosts);
-    throw error;
-  }
-
-  if (profile.secret) {
-    await writeCredential(profile);
-  } else {
-    await Keychain.resetGenericPassword({ service: hostCredentialService(profile.id) });
-    await removeCredentialBackup(profile.id);
-  }
-  return { hosts: next.hosts, host };
-}
-
-/** Records when the host connection ended; the Hosts screen presents this as last connected. */
-export async function markHostDisconnected(hosts: HostProfile[], id: string): Promise<HostProfile[]> {
-  const now = new Date().toISOString();
-  const next = prepareHostDisconnected(hosts, id, now);
-  try {
-    await writeHostProfiles(next.persistedValue, 'disconnect-persistence');
-  } catch (error) {
-    hydrateHostProfiles(hosts);
-    throw error;
-  }
-  return next.hosts;
-}
-
-export async function deleteHostProfile(hosts: HostProfile[], id: string): Promise<HostProfile[]> {
-  const now = new Date().toISOString();
-  const next = prepareHostRemoval(hosts, id, now);
-  try {
-    await writeHostProfiles(next.persistedValue, 'profile-delete');
-  } catch (error) {
-    hydrateHostProfiles(hosts);
-    throw error;
-  }
-  await Keychain.resetGenericPassword({ service: hostCredentialService(id) });
-  await removeCredentialBackup(id);
-  return next.hosts;
-}
-
 async function writeCredential(profile: ConnectionProfile): Promise<void> {
   try {
     const result = await Keychain.setGenericPassword(profile.username, JSON.stringify({
@@ -283,14 +396,13 @@ async function writeHostProfiles(value: string, phase: string): Promise<void> {
 function recordHostProfilesParseFailure(
   error: unknown,
   storageKey: string,
-  fallbackUsed: string,
 ): void {
   recordStorageDiagnostic('error', 'storage-parse-failed', {
     store: 'host-profiles',
     storageKey,
     phase: 'startup',
     operation: 'parse',
-    fallbackUsed,
+    fallbackUsed: 'preserved-host-profiles',
     ...storageParseErrorDetails(error),
   });
 }

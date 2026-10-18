@@ -40,6 +40,37 @@ pub(super) fn current_ssh(inner: &RuntimeInner) -> Result<Arc<SshSession>, HostR
     })
 }
 
+pub(super) async fn resume_reverse_control(inner: &Arc<RuntimeInner>) {
+    if !inner.reverse_control.needs_resume() {
+        return;
+    }
+    let authorized = {
+        let state = inner.state.lock();
+        let host = state.host_state.projection();
+        state.connection == HostConnectionState::Connected
+            && host.freshness == HostFreshness::Fresh
+            && host.sync_status == HostSyncStatus::Synced
+            && host.snapshot.is_some()
+    };
+    if !authorized {
+        return;
+    }
+    let Ok(ssh) = current_ssh(inner) else { return };
+    match inner.reverse_control.resume(ssh).await {
+        Ok(()) => {
+            log_lifecycle(format_args!(
+                "MCP forwarding restored: runtime={}",
+                inner.id
+            ));
+            emit_host_state(inner);
+        }
+        Err(error) => log_lifecycle(format_args!(
+            "MCP forwarding restore failed: runtime={} reason={error}",
+            inner.id
+        )),
+    }
+}
+
 pub(super) fn current_generation(inner: &RuntimeInner) -> Result<u64, HostRuntimeError> {
     let state = inner.state.lock();
     if state.connection != HostConnectionState::Connected {
@@ -252,7 +283,7 @@ pub(super) async fn initial_connect(inner: Arc<RuntimeInner>) -> Result<(), Host
     if let Some(status) = existing {
         return wait_for_reconnect(status).await;
     }
-    let _ = inner.cancellation.send(epoch);
+    inner.cancellation.send_replace(epoch);
     publish_lifecycle_status(&inner);
     let started_at = Instant::now();
     match connect_chain(&inner).await {
@@ -415,10 +446,16 @@ pub(super) fn begin_reconnect_for_generation(
     }) else {
         return false;
     };
+    log_lifecycle(format_args!(
+        "SSH reconnect: runtime={} incarnation={} generation={} reason={}",
+        inner.id, inner.incarnation, generation, reason
+    ));
+    agent_view::stop(&inner);
     let ssh = inner.herdr.clear(generation);
     let jumps = std::mem::take(&mut *inner.jump_sessions.lock());
     invalidate_remote_operations(&inner, generation, &reason);
-    let _ = inner.cancellation.send(epoch);
+    inner.cancellation.send_replace(epoch);
+    inner.reverse_control.suspend();
     inner.agents.disconnected(false, &reason);
     publish_lifecycle_status(&inner);
     emit_host_state(&inner);
@@ -430,6 +467,7 @@ pub(super) fn begin_reconnect_for_generation(
                     ssh.disconnect().await;
                 }
                 disconnect_sessions(jumps).await;
+                clear_latency_transport(&inner).await;
                 reconnect_loop(inner, epoch, reason, immediate).await;
             });
         })
@@ -612,21 +650,10 @@ pub(super) async fn confirm_ssh_health(
     inner: &Arc<RuntimeInner>,
     generation: u64,
 ) -> Result<(), HostRuntimeError> {
-    let started_at = Instant::now();
-    let result = match current_ssh(inner) {
-        Ok(ssh) => ssh.latency_ms().await.map(|_| ()).map_err(Into::into),
-        Err(error) => Err(error),
-    }
-    .and_then(|()| validate_generation(inner, generation));
-    emit_diagnostic(
-        inner,
-        RuntimeDiagnosticOperation::HostLatencyProbe,
-        started_at,
-        None,
-        None,
-        result.as_ref().err().map(ToString::to_string),
-    );
-    result
+    measure_host_latency_inner(inner.clone())
+        .await
+        .map(|_| ())
+        .and_then(|()| validate_generation(inner, generation))
 }
 
 pub(super) async fn recover_herdr_only(
@@ -676,7 +703,9 @@ async fn recover_control_failure(
     let ssh_alive = current_ssh(&inner).is_ok_and(|ssh| ssh.is_alive());
     let mut scope = recovery_scope_for_transport_state(error, ssh_alive);
     if matches!(error, HerdrControlError::RequestTimeout(_)) && scope == RecoveryScope::Herdr {
-        scope = if confirm_ssh_health(&inner, generation).await.is_ok() {
+        scope = if confirm_ssh_health(&inner, generation).await.is_ok()
+            || current_ssh(&inner).is_ok_and(|ssh| ssh.is_alive())
+        {
             RecoveryScope::Herdr
         } else {
             RecoveryScope::Ssh
@@ -701,7 +730,10 @@ pub(super) fn safe_control_replay(request: &HerdrControlRequest) -> bool {
             request,
             HerdrControlRequest::Ping
                 | HerdrControlRequest::SessionSnapshot
+                | HerdrControlRequest::IntegrationList
                 | HerdrControlRequest::PaneRead { .. }
+                | HerdrControlRequest::PaneReadVisible { .. }
+                | HerdrControlRequest::PaneGet { .. }
         )
 }
 
@@ -766,12 +798,25 @@ pub(super) async fn control_request_inner(
         state.generation
     };
     let started_at = Instant::now();
-    let result = request_on_runtime(
-        inner.herdr.clone(),
-        request.clone(),
-        request_replay(&request),
-    )
-    .await;
+    match &request {
+        HerdrControlRequest::PaneSendInput { pane_id, .. }
+        | HerdrControlRequest::PaneSendKeys { pane_id, .. } => inner.agents.wake_pane(pane_id),
+        _ => {}
+    }
+    let result = if let HerdrControlRequest::PaneGet { pane_id } = &request {
+        chat_identity::read_pane_identity_using(inner.clone(), pane_id, |request| {
+            let replay = request_replay(&request);
+            request_on_runtime(inner.herdr.clone(), request, replay)
+        })
+        .await
+    } else {
+        request_on_runtime(
+            inner.herdr.clone(),
+            request.clone(),
+            request_replay(&request),
+        )
+        .await
+    };
     emit_slow_or_failed_diagnostic(
         &inner,
         RuntimeDiagnosticOperation::HerdrRequest,
@@ -790,11 +835,14 @@ pub(super) async fn control_request_inner(
             Ok(result)
         }
         Err(error) if is_transport_control_error(&error) => {
-            // Snapshot reads are authoritative but side-effect free. Preserve
+            // Snapshot and pane metadata reads are side-effect free. Preserve
             // the last known host state and let the caller's existing resync
             // policy decide when to retry; in particular, do not recursively
             // enter Herdr recovery while recovery itself reconciles events.
-            if matches!(request_for_state, HerdrControlRequest::SessionSnapshot) {
+            if matches!(
+                request_for_state,
+                HerdrControlRequest::SessionSnapshot | HerdrControlRequest::PaneGet { .. }
+            ) {
                 return Err(error);
             }
             let reason = error.to_string();
@@ -906,7 +954,8 @@ pub(super) enum HerdrReadinessPollError {
     Permanent(HostRuntimeError),
 }
 
-pub(super) fn herdr_protocol_label() -> String {
+#[uniffi::export]
+pub fn herdr_protocol_label() -> String {
     format!("{MIN_PROTOCOL}\u{2013}{MAX_PROTOCOL}")
 }
 
@@ -1202,7 +1251,7 @@ impl HostRuntime {
                         return Ok(());
                     }
                     let epoch = state.disconnect();
-                    let _ = inner.cancellation.send(epoch);
+                    inner.cancellation.send_replace(epoch);
                     state.generation
                 };
                 log_lifecycle(format_args!(
@@ -1215,8 +1264,11 @@ impl HostRuntime {
                 publish_lifecycle_status(&inner);
                 emit_host_state(&inner);
                 inner.terminal_settled.notify_waiters();
+                inner.reverse_control.shutdown();
                 inner.agents.disconnected(true, "Host runtime disconnected");
                 close_herdr_event_subscription(inner.id.clone());
+                agent_view::stop(&inner);
+                clear_latency_transport(&inner).await;
                 close_all_herdr_terminal_bridges(inner.id.clone());
                 let ssh = inner.herdr.clear(generation);
                 let jumps = std::mem::take(&mut *inner.jump_sessions.lock());
@@ -1253,7 +1305,8 @@ impl HostRuntime {
                         .then_some((state.generation, state.herdr_recovery_revision))
                 };
                 if let Some((generation, recovery_revision)) = connected
-                    && confirm_ssh_health(&inner, generation).await.is_ok()
+                    && (confirm_ssh_health(&inner, generation).await.is_ok()
+                        || current_ssh(&inner).is_ok_and(|ssh| ssh.is_alive()))
                 {
                     return recover_herdr_only(inner, generation, recovery_revision).await;
                 }

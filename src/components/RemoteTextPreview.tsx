@@ -1,8 +1,15 @@
-import { ScrollView } from 'react-native';
+import { useMemo } from 'react';
+import { ScrollView, StyleSheet, View } from 'react-native';
 
 import { useRemoteScrollProgress } from '@/src/hooks/useRemoteScrollProgress';
+import { terminalFontFamily } from '@/src/lib/terminalFonts';
 import type { RemoteContentIdentity } from '@/src/services/remoteContentProgress';
+import { renderCjkText } from './CjkText';
+import { LineNumberGutter } from './LineNumberGutter';
 import { Text } from './ui/text';
+
+const TEXT_LINE_HEIGHT = 17;
+const TEXT_PADDING = 16;
 
 interface Props {
   content: string;
@@ -11,21 +18,45 @@ interface Props {
 }
 
 export function RemoteTextPreview({ content, initialLine, progressIdentity }: Props) {
+  const text = useMemo(() => renderCjkText(content || ' '), [content]);
   const scrollProgress = useRemoteScrollProgress(
     progressIdentity,
-    initialLine ? { y: 16 + Math.max(0, initialLine - 1) * 17 } : undefined,
+    initialLine ? { y: TEXT_PADDING + Math.max(0, initialLine - 1) * TEXT_LINE_HEIGHT } : undefined,
   );
   return (
     <ScrollView
       {...scrollProgress}
       className="flex-1 bg-terminal-canvas"
-      contentContainerClassName="p-4"
+      contentContainerStyle={styles.content}
     >
-      <ScrollView horizontal>
-        <Text selectable className="font-mono text-[11px] leading-[17px] text-terminal-text">
-          {content || ' '}
-        </Text>
-      </ScrollView>
+      <View style={styles.row}>
+        <LineNumberGutter content={content} style={styles.text} />
+        <ScrollView horizontal style={styles.textScroller}>
+          <Text selectable className="text-terminal-text" style={styles.text}>
+            {text}
+          </Text>
+        </ScrollView>
+      </View>
     </ScrollView>
   );
 }
+
+const styles = StyleSheet.create({
+  content: {
+    padding: TEXT_PADDING,
+  },
+  row: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+  },
+  textScroller: {
+    flex: 1,
+    marginLeft: 12,
+  },
+  text: {
+    fontFamily: terminalFontFamily,
+    fontSize: 11,
+    includeFontPadding: false,
+    lineHeight: TEXT_LINE_HEIGHT,
+  },
+});

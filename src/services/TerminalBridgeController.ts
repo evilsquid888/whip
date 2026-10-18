@@ -24,11 +24,6 @@ import {
   type TerminalInputTrace,
   type TerminalResizeTrace,
 } from './performanceTrace';
-import {
-  networkErrorKind,
-  networkErrorMessage,
-  recordNetworkDiagnostic,
-} from './networkDiagnostics';
 
 type TerminalFrameHandler = (frame: TerminalFrame) => void;
 type TerminalClosedHandler = (reason?: string) => void;
@@ -56,14 +51,12 @@ const DEFAULT_TERMINAL_SIZE: RuntimeTerminalGeometry = {
   cellHeightPx: 0,
 };
 
-const TERMINAL_STATE_REFRESH_DEBOUNCE_MS = 120;
-
 /** Owns the JavaScript attachment, tracing, and lifecycle state around native terminals. */
 export class TerminalBridgeController {
   private readonly attachments = new Map<string, TerminalAttachment>();
+  private readonly applicationMouseCapture = new Map<string, boolean>();
   private readonly inputTraces = new Map<string, TerminalInputTrace[]>();
   private readonly pendingResizeTraces = new Map<string, TerminalResizeTrace>();
-  private stateRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(private readonly currentRuntime: () => HostRuntimeConnection | null) {}
 
@@ -96,11 +89,16 @@ export class TerminalBridgeController {
     }
 
     const coldAttach = !this.requireRuntime().hasHerdrBridge(terminalId);
+    if (coldAttach) this.applicationMouseCapture.delete(terminalId);
     const bridgeAttachTrace = coldAttach
       ? beginAppPerformanceTrace('Whip terminal bridge attach')
       : null;
     try {
       await this.attachTerminal(terminalId, coldAttach, initialGeometry);
+      this.attachments.get(terminalId)?.onControl?.({
+        type: 'mouse-capture',
+        enabled: this.applicationMouseCapture.get(terminalId) === true,
+      });
       this.attachments.get(terminalId)?.onControl?.({
         type: 'protocol-state',
         state: this.requireRuntime().herdrBridgeProtocolState(terminalId),
@@ -242,7 +240,6 @@ export class TerminalBridgeController {
       column,
       row,
     );
-    this.scheduleStateRefresh();
     return '';
   }
 
@@ -304,22 +301,19 @@ export class TerminalBridgeController {
       }
       runtime.closeAllHerdrBridges();
     }
-    this.cancelStateRefresh();
     this.clearAllState();
   }
 
   /** Clears JS-owned state before its native runtime is disconnected. */
   reset(runtime: HostRuntimeConnection): void {
-    this.cancelStateRefresh();
     for (const terminalId of this.attachments.keys()) {
       if (isSshShellTerminalId(terminalId)) runtime.closeSshShell(terminalId);
     }
     this.clearAllState();
   }
 
-  /** A disappearing UI releases callbacks and timers, not native terminals. */
+  /** A disappearing UI releases callbacks, not native terminals. */
   detach(): void {
-    this.cancelStateRefresh();
     this.clearAllState();
   }
 
@@ -389,7 +383,6 @@ export class TerminalBridgeController {
     try {
       await this.ensureTerminalBridge(terminalId, initialGeometry);
       this.pendingResizeTraces.delete(terminalId);
-      this.scheduleStateRefresh();
       terminalResizeNativeDispatchEnded(resizeTrace, true);
     } catch (error) {
       this.pendingResizeTraces.delete(terminalId);
@@ -418,22 +411,6 @@ export class TerminalBridgeController {
       size.cellHeightPx,
       event => this.handleHerdrBridgeEvent(terminalId, event),
     );
-  }
-
-  private scheduleStateRefresh(): void {
-    if (this.stateRefreshTimer !== null) clearTimeout(this.stateRefreshTimer);
-    this.stateRefreshTimer = setTimeout(() => {
-      this.stateRefreshTimer = null;
-      this.currentRuntime()?.refreshState().catch(error => {
-        recordRuntimeCleanupFailure('terminal-state-refresh-failed', error);
-      });
-    }, TERMINAL_STATE_REFRESH_DEBOUNCE_MS);
-  }
-
-  private cancelStateRefresh(): void {
-    if (this.stateRefreshTimer === null) return;
-    clearTimeout(this.stateRefreshTimer);
-    this.stateRefreshTimer = null;
   }
 
   private handleHerdrBridgeEvent(terminalId: string, event: HerdrBridgeEvent): void {
@@ -480,8 +457,11 @@ export class TerminalBridgeController {
       return;
     }
     if (event.type === 'mouse_capture') {
-      // Direct attachments do not render the Herdr TUI, whose mouse setting
-      // must not control Whip's terminal surface.
+      // For direct attachments Herdr reports the child application's request,
+      // separately from the cell repaint, which does not preserve terminal modes.
+      const enabled = event.flag === true;
+      this.applicationMouseCapture.set(terminalId, enabled);
+      this.attachments.get(terminalId)?.onControl?.({ type: 'mouse-capture', enabled });
       return;
     }
     if (event.type === 'kitty_keyboard_report_all') {
@@ -514,12 +494,14 @@ export class TerminalBridgeController {
   }
 
   private clearBridgeState(terminalId: string): void {
+    this.applicationMouseCapture.delete(terminalId);
     abandonTerminalResizeTrace(this.pendingResizeTraces.get(terminalId) || null);
     this.pendingResizeTraces.delete(terminalId);
     this.inputTraces.delete(terminalId);
   }
 
   private clearAllState(): void {
+    this.applicationMouseCapture.clear();
     for (const trace of this.pendingResizeTraces.values()) {
       abandonTerminalResizeTrace(trace);
     }
@@ -566,11 +548,4 @@ export class TerminalBridgeController {
       terminalNativeResponseDelivered(trace);
     }
   }
-}
-
-function recordRuntimeCleanupFailure(event: string, error: unknown): void {
-  recordNetworkDiagnostic('warn', event, {
-    error: networkErrorMessage(error),
-    errorKind: networkErrorKind(error),
-  });
 }

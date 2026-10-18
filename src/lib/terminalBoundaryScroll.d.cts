@@ -1,5 +1,8 @@
 export type TerminalBoundary = 'top' | 'bottom' | null;
 
+export function terminalBoundaryFiniteNumber(value: unknown, fallback?: number): number;
+export function terminalBoundaryClamp(value: number, minimum: number, maximum: number): number;
+
 export interface TerminalBoundaryScrollState {
   offsetFromBottom: number;
   maxOffsetFromBottom: number;
@@ -51,3 +54,9 @@ export function terminalBoundaryScroll(input: {
   gestureDeltaPx: number;
   cellHeightPx: number;
 } & TerminalBoundaryAllowances): TerminalBoundaryScrollResult;
+
+export function terminalUnconsumedScrollRows(input: {
+  unconsumedGesturePx: number;
+  remainderPx?: number;
+  cellHeightPx: number;
+}): { rows: number; remainderPx: number };

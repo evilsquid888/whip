@@ -21,10 +21,15 @@ function turn(value: NativeAgentTranscriptTurn, byId: ReadonlyMap<string, Transc
       const current = byId.get(id);
       return current ? [current] : [];
     }),
+    messages: value.messageIds?.length ? value.messageIds.flatMap(id => {
+      const current = byId.get(id);
+      return current ? [current] : [];
+    }) : undefined,
     status: value.status,
     startedAt: value.startedAt,
     completedAt: value.completedAt,
     diffs: value.diffs,
+    details: value.details,
   };
 }
 

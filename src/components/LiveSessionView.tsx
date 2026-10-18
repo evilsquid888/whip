@@ -1,4 +1,6 @@
 import { useCallback } from 'react';
+import type { ComposerDraftRequest } from '../lib/composerDraftRequest';
+import type { TerminalComposerStore } from '../lib/terminalComposerStore';
 
 import type {
   TerminalControlId,
@@ -6,7 +8,7 @@ import type {
 } from '../lib/terminalControls';
 import type { TerminalRenderTarget } from '../lib/terminalRenderer';
 import type { TranscriptFileLinkTarget } from '../lib/transcriptLinks';
-import type { LiveHostSession } from '../liveHostSessions';
+import type { SessionPresentation } from '../liveHostSessions';
 import type { TerminalPreferences } from '../services/devicePreferences';
 import type { HerdrClient } from '../services/HerdrClient';
 import type {
@@ -17,8 +19,10 @@ import type { PaneInfo } from '../types';
 import { SessionScreen } from './SessionScreen';
 
 interface Props {
-  session: LiveHostSession;
-  client: HerdrClient;
+  composerDraftRequest?: ComposerDraftRequest;
+  onComposerDraftConsumed?: (id: number) => void;
+  session: SessionPresentation;
+  client: HerdrClient | null;
   visible: boolean;
   ttsEnabled: boolean;
   latencyMs: number | null;
@@ -35,20 +39,17 @@ interface Props {
     terminalId: string,
     target?: TranscriptFileLinkTarget,
   ) => void;
-  getTerminalComposerDraft: (sessionId: string, terminalId: string) => string;
-  onTerminalComposerDraftChange: (
-    sessionId: string,
-    terminalId: string,
-    value: string,
-  ) => void;
+  composerStore: TerminalComposerStore;
   onTerminalControlUse: (control: TerminalControlId) => void;
   onTerminalHistoryEntry: (entry: string) => void;
-  onTerminalOpenLinksInAppChange: (value: boolean) => void;
   onInteraction: (sessionId: string, tabId: string) => void;
   onExit: () => void;
   onRefresh: (sessionId: string) => Promise<void>;
   onOpenPane: (sessionId: string, pane: PaneInfo) => void;
   onActivateTerminal: (sessionId: string, pane: PaneInfo) => void;
+  onOpenSshShell: (sessionId: string, title?: string) => void;
+  onSelectSshShell: (sessionId: string, terminalId: string) => void;
+  onRenameSshShell: (sessionId: string, terminalId: string, title: string) => void;
   onCloseTerminal: (sessionId: string, terminalId: string) => void;
   onTerminalStatus: (
     sessionId: string,
@@ -66,6 +67,8 @@ interface Props {
 
 /** Adapts one application-level live host into SessionScreen's local contract. */
 export function LiveSessionView({
+  composerDraftRequest,
+  onComposerDraftConsumed,
   session,
   client,
   visible,
@@ -80,16 +83,17 @@ export function LiveSessionView({
   terminalControlUsage,
   terminalHistory,
   onOpenFiles,
-  getTerminalComposerDraft,
-  onTerminalComposerDraftChange,
+  composerStore,
   onTerminalControlUse,
   onTerminalHistoryEntry,
-  onTerminalOpenLinksInAppChange,
   onInteraction,
   onExit,
   onRefresh,
   onOpenPane,
   onActivateTerminal,
+  onOpenSshShell,
+  onSelectSshShell,
+  onRenameSshShell,
   onCloseTerminal,
   onTerminalStatus,
   onTerminalFontSizeChange,
@@ -111,23 +115,28 @@ export function LiveSessionView({
     (terminalId: string) => onCloseTerminal(sessionId, terminalId),
     [onCloseTerminal, sessionId],
   );
+  const openSshShell = useCallback(
+    (title?: string) => onOpenSshShell(sessionId, title),
+    [onOpenSshShell, sessionId],
+  );
+  const selectSshShell = useCallback(
+    (terminalId: string) => onSelectSshShell(sessionId, terminalId),
+    [onSelectSshShell, sessionId],
+  );
+  const renameSshShell = useCallback(
+    (terminalId: string, title: string) => onRenameSshShell(sessionId, terminalId, title),
+    [onRenameSshShell, sessionId],
+  );
   const openFiles = useCallback(
     (terminalId: string, target?: TranscriptFileLinkTarget) =>
       onOpenFiles(sessionId, terminalId, target),
     [onOpenFiles, sessionId],
   );
-  const getComposerDraft = useCallback(
-    (terminalId: string) => getTerminalComposerDraft(sessionId, terminalId),
-    [getTerminalComposerDraft, sessionId],
-  );
-  const updateComposerDraft = useCallback(
-    (terminalId: string, value: string) =>
-      onTerminalComposerDraftChange(sessionId, terminalId, value),
-    [onTerminalComposerDraftChange, sessionId],
-  );
-
   return (
     <SessionScreen
+      composerDraftRequest={composerDraftRequest}
+      onComposerDraftConsumed={onComposerDraftConsumed}
+      hostId={session.hostId}
       hostSessionId={sessionId}
       visible={visible}
       ttsEnabled={ttsEnabled}
@@ -142,6 +151,9 @@ export function LiveSessionView({
       onRefresh={refresh}
       onOpenPane={openPane}
       onActivateTerminal={activateTerminal}
+      onOpenSshShell={openSshShell}
+      onSelectSshShell={selectSshShell}
+      onRenameSshShell={renameSshShell}
       onCloseTerminal={closeTerminal}
       onTerminalStatus={onTerminalStatus}
       onTerminalFontSizeChange={onTerminalFontSizeChange}
@@ -149,11 +161,9 @@ export function LiveSessionView({
       terminalControlUsage={terminalControlUsage}
       terminalHistory={terminalHistory}
       onOpenFiles={openFiles}
-      getComposerDraft={getComposerDraft}
-      onComposerDraftChange={updateComposerDraft}
+      composerStore={composerStore}
       onTerminalControlUse={onTerminalControlUse}
       onTerminalHistoryEntry={onTerminalHistoryEntry}
-      onTerminalOpenLinksInAppChange={onTerminalOpenLinksInAppChange}
       onInteraction={tabId => onInteraction(sessionId, tabId)}
       onExit={onExit}
     />

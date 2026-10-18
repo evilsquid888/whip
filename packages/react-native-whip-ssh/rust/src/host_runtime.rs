@@ -1,11 +1,26 @@
 //! Rust-owned lifecycle for one connected Whip/Herdr host.
 
+mod actions;
+mod agent_controls;
+pub use agent_controls::AgentControlView;
+mod agent_view;
 mod agents;
+mod chat_identity;
 mod connection;
+pub use connection::herdr_protocol_label;
 mod diagnostics;
+mod directory_cache;
 mod events;
+mod git_discovery;
+mod host_latency;
+mod interaction;
+pub use interaction::{AgentInteractionChoice, AgentInteractionKind, AgentInteractionPrompt};
 mod monitoring;
 mod remote_files;
+mod remote_text;
+pub use remote_text::{RemoteTextAnchor, RemoteTextPage, RemoteTextReader, RemoteTextRow};
+mod selection;
+pub use selection::TerminalSelectionSnapshot;
 mod terminal;
 
 use std::collections::HashMap;
@@ -39,6 +54,7 @@ pub(crate) use events::{
     deliver_herdr_events, event_subscription_closed, terminal_bridge_closed,
     terminal_kitty_keyboard_report_all_changed,
 };
+use host_latency::*;
 use monitoring::*;
 use remote_files::*;
 use terminal::*;
@@ -182,6 +198,7 @@ pub enum RuntimeDiagnosticOperation {
     SshReconnectFast,
     SshReconnectPersistent,
     HostLatencyProbe,
+    ApplicationLatencyProbe,
     HerdrRequest,
     HerdrRecovery,
     TerminalAttach,
@@ -409,6 +426,7 @@ struct RuntimeState {
     terminal_kitty_keyboard_report_all: HashMap<String, bool>,
     ssh_shells: HashMap<String, SshShellRuntime>,
     host_state: HostState,
+    agent_order: Option<Vec<String>>,
 }
 
 impl RuntimeState {
@@ -430,6 +448,7 @@ impl RuntimeState {
             terminal_kitty_keyboard_report_all: HashMap::new(),
             ssh_shells: HashMap::new(),
             host_state: HostState::default(),
+            agent_order: None,
         }
     }
 
@@ -468,6 +487,7 @@ impl RuntimeState {
         if self.epoch != epoch || self.explicit_disconnect {
             return false;
         }
+        self.agent_order = None;
         self.generation = self.generation.wrapping_add(1);
         self.connection = HostConnectionState::Connected;
         self.reconnect_attempt = 0;
@@ -490,6 +510,7 @@ impl RuntimeState {
         }) {
             return None;
         }
+        self.agent_order = None;
         self.epoch = self.epoch.wrapping_add(1);
         self.connection = HostConnectionState::Reconnecting;
         self.reconnect_running = true;
@@ -520,6 +541,7 @@ impl RuntimeState {
         self.reconnect_running = false;
         self.reconnect_attempt = 0;
         self.event = None;
+        self.agent_order = None;
         for terminal in self.terminals.values_mut() {
             terminal.operation_epoch = terminal.operation_epoch.wrapping_add(1);
             terminal.state = HostTerminalState::Closed;
@@ -543,6 +565,7 @@ impl RuntimeState {
 }
 
 struct RuntimeInner {
+    interaction_response: AsyncMutex<HashMap<String, String>>,
     id: String,
     incarnation: u64,
     config: HostRuntimeConfig,
@@ -551,6 +574,17 @@ struct RuntimeInner {
     jump_sessions: Mutex<Vec<Arc<SshSession>>>,
     agents: AgentSessionManager,
     operations: RemoteOperationManager,
+    git_discovery: Mutex<git_discovery::GitDiscoveryCache>,
+    git_discovery_operation: AsyncMutex<()>,
+    directory_cache: Mutex<directory_cache::DirectoryCache>,
+    reverse_control: Arc<crate::reverse_control::ReverseControl>,
+    agent_preferences: Mutex<agent_controls::AgentPreferences>,
+    agent_control_operation: AsyncMutex<()>,
+    agent_view: Mutex<Option<Arc<agent_view::Follower>>>,
+    agent_view_start: AsyncMutex<()>,
+    agent_view_task: Mutex<Option<tokio::task::AbortHandle>>,
+    agent_view_refresh: Arc<Notify>,
+    latency_transport: AsyncMutex<Option<host_latency::LatencyTransport>>,
     herdr_startup: AsyncMutex<()>,
     herdr_recovery: AsyncMutex<()>,
     shutdown: AsyncMutex<()>,
@@ -568,6 +602,7 @@ impl Drop for RuntimeInner {
             "runtime destroyed: {} incarnation={}",
             self.id, self.incarnation
         ));
+        agent_view::stop(self);
         self.monitoring_changed.notify_one();
         self.reconnect_wakeup.notify_one();
     }
@@ -606,7 +641,9 @@ fn authoritative_agent_chat_identity(
     if session.kind != HerdrAgentSessionKind::Id {
         return None;
     }
-    let agent = if session.agent.eq_ignore_ascii_case("codex") {
+    let agent = if session.agent.eq_ignore_ascii_case("claude") {
+        AgentTranscriptKind::Claude
+    } else if session.agent.eq_ignore_ascii_case("codex") {
         AgentTranscriptKind::Codex
     } else if session.agent.eq_ignore_ascii_case("opencode") {
         AgentTranscriptKind::OpenCode
@@ -629,6 +666,12 @@ fn emit_host_state(inner: &RuntimeInner) {
         drop(runtime);
         (state, transitions)
     };
+    if state.sync_status == HostSyncStatus::Synced
+        && state.freshness == HostFreshness::Fresh
+        && let Some(snapshot) = state.snapshot.as_ref()
+    {
+        inner.reverse_control.reconcile(&snapshot.panes);
+    }
     let transcript_retention = if state.sync_status == HostSyncStatus::Synced
         && state.freshness == HostFreshness::Fresh
         && let Some(snapshot) = state.snapshot.as_ref()
@@ -647,6 +690,28 @@ fn emit_host_state(inner: &RuntimeInner) {
     } else {
         None
     };
+    let statuses = if state.sync_status == HostSyncStatus::Synced
+        && state.freshness == HostFreshness::Fresh
+        && let Some(snapshot) = state.snapshot.as_ref()
+    {
+        let mut by_pane = snapshot
+            .panes
+            .iter()
+            .map(|pane| (pane.pane_id.as_str(), pane.agent_status))
+            .collect::<HashMap<_, _>>();
+        for agent in &snapshot.agents {
+            by_pane.insert(&agent.pane_id, agent.agent_status);
+        }
+        snapshot
+            .panes
+            .iter()
+            .map(|pane| (pane.terminal_id.clone(), by_pane[pane.pane_id.as_str()]))
+            .collect()
+    } else {
+        // An interrupted event subscription cannot reliably wake idle agents.
+        HashMap::new()
+    };
+    inner.agents.update_agent_statuses(statuses, state.revision);
     emit(HostRuntimeEvent::HostStateChanged {
         runtime_id: inner.id.clone(),
         state,
@@ -674,6 +739,7 @@ pub fn clear_host_runtime_event_sink() {
 // React bridge invalidation detaches foreign callbacks, never SSH transports.
 #[unsafe(no_mangle)]
 pub extern "C" fn whip_detach_runtime_ui() {
+    crate::reverse_control::detach_ui();
     crate::set_usage_foreground(false);
     clear_host_runtime_event_sink();
     crate::clear_herdr_terminal_event_sink();
@@ -700,6 +766,80 @@ pub fn get_host_runtime(runtime_id: String) -> Option<Arc<HostRuntime>> {
         inner.id, inner.incarnation
     ));
     Some(Arc::new(HostRuntime { inner }))
+}
+
+impl HostRuntime {
+    pub(crate) async fn request_from_reverse_agent(
+        &self,
+        request: crate::reverse_control::herdr::Request,
+    ) -> Result<serde_json::Value, crate::herdr_api::HerdrControlError> {
+        use crate::herdr_api::{HerdrControlError, HerdrControlRequest};
+        let (generation, protocol, closing_terminal) = {
+            let state = self.inner.state.lock();
+            if state.connection != HostConnectionState::Connected {
+                return Err(HerdrControlError::TransportDisconnected(
+                    "Host is disconnected".into(),
+                ));
+            }
+            let closing = match &request.base {
+                Some(HerdrControlRequest::PaneClose { pane_id }) => {
+                    state.host_state.terminal_id_for_pane(pane_id)
+                }
+                _ => None,
+            };
+            (state.generation, state.protocol, closing)
+        };
+        let protocol = protocol.ok_or_else(|| {
+            HerdrControlError::TransportDisconnected(
+                "Herdr protocol has not been negotiated".into(),
+            )
+        })?;
+        let result = request.run(protocol, |call| {
+            let inner = self.inner.clone();
+            async move {
+                let check_generation = || {
+                    let state = inner.state.lock();
+                    if state.generation != generation || state.connection != HostConnectionState::Connected {
+                        Err(HerdrControlError::TransportDisconnected("Host connection changed during the request; inspect state before retrying".into()))
+                    } else { Ok(()) }
+                };
+                check_generation()?;
+                let result = crate::herdr_api::request_json_on_runtime(inner.herdr.clone(), &call.method, call.params, call.timeout_ms).await?;
+                check_generation()?;
+                Ok(result)
+            }
+        }).await;
+        // The native UI model assumes focused creation. Reconcile the actual
+        // snapshot instead so a background creation never synthesizes focus.
+        if let Ok(value) = &result
+            && let Some(base @ HerdrControlRequest::PaneClose { .. }) = &request.base
+        {
+            let response = serde_json::to_vec(&serde_json::json!({"result":value}))
+                .map_err(|error| HerdrControlError::MalformedResponse(error.to_string()))?;
+            let typed = crate::herdr_api::parse_response(base, &response)?;
+            reconcile_control_result(&self.inner, base, &typed, closing_terminal.as_deref());
+        }
+        if request.changes_state() {
+            schedule_state_resync(
+                self.inner.clone(),
+                "reverse-control request completed".into(),
+            );
+        }
+        result
+    }
+
+    /// Keep MCP cancellation attached to the control future instead of detaching
+    /// a spawned task when the agent session closes.
+    pub(crate) async fn control_from_reverse_agent(
+        &self,
+        request: crate::herdr_api::HerdrControlRequest,
+    ) -> Result<crate::herdr_api::HerdrControlResult, crate::herdr_api::HerdrControlError> {
+        control_request_inner(self.inner.clone(), request).await
+    }
+
+    pub(crate) async fn start_herdr_from_reverse_agent(&self) -> Result<(), HostRuntimeError> {
+        start_herdr_server_inner(self.inner.clone()).await
+    }
 }
 
 #[uniffi::export]
@@ -742,11 +882,23 @@ pub fn create_host_runtime(
         config.cached_socket_path.clone(),
     );
     let inner = Arc::new(RuntimeInner {
+        interaction_response: AsyncMutex::new(HashMap::new()),
         id: id.clone(),
         incarnation,
         state: Mutex::new(state),
         agents: AgentSessionManager::new(id.clone(), incarnation, herdr.clone()),
         operations: RemoteOperationManager::default(),
+        git_discovery: Mutex::new(git_discovery::GitDiscoveryCache::default()),
+        git_discovery_operation: AsyncMutex::new(()),
+        directory_cache: Mutex::new(directory_cache::DirectoryCache::default()),
+        reverse_control: Arc::new(crate::reverse_control::ReverseControl::for_host(&config)),
+        agent_preferences: Mutex::new(agent_controls::AgentPreferences::default()),
+        agent_control_operation: AsyncMutex::new(()),
+        agent_view: Mutex::new(None),
+        agent_view_start: AsyncMutex::new(()),
+        agent_view_task: Mutex::new(None),
+        agent_view_refresh: Arc::new(Notify::new()),
+        latency_transport: AsyncMutex::new(None),
         herdr,
         jump_sessions: Mutex::new(Vec::new()),
         herdr_startup: AsyncMutex::new(()),
@@ -771,6 +923,25 @@ pub fn create_host_runtime(
 
 #[uniffi::export]
 impl HostRuntime {
+    pub fn reverse_control_sessions(&self) -> Vec<crate::reverse_control::ReverseControlSession> {
+        self.inner.reverse_control.list()
+    }
+
+    pub fn reverse_control_reply(
+        &self,
+        session_id: String,
+        request_id: String,
+        result_json: String,
+    ) {
+        self.inner
+            .reverse_control
+            .reply(&session_id, &request_id, &result_json);
+    }
+
+    pub fn close_reverse_control_session(&self, session_id: String) {
+        self.inner.reverse_control.close_session(&session_id);
+    }
+
     pub fn runtime_id(&self) -> String {
         self.inner.id.clone()
     }
@@ -789,6 +960,21 @@ impl HostRuntime {
 
     pub fn set_monitoring_state(&self, app_active: bool, hosts_visible: bool, access_locked: bool) {
         monitoring::set_monitoring_state(&self.inner, app_active, hosts_visible, access_locked);
+    }
+}
+
+impl HostRuntime {
+    pub(crate) fn app_session_state(&self) -> (HostRuntimeStatus, HostStateSnapshot, bool) {
+        let state = self.inner.state.lock();
+        (
+            state.status(),
+            state.host_state.projection(),
+            state.host_state.is_connection_ready(),
+        )
+    }
+
+    pub(crate) fn herd_agent_order(&self) -> Option<Vec<String>> {
+        self.inner.state.lock().agent_order.clone()
     }
 }
 

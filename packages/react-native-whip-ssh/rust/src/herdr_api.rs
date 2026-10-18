@@ -21,6 +21,19 @@ pub enum HerdrAgentStatus {
     Unknown,
 }
 
+impl HerdrAgentStatus {
+    /// Lower values come first in both sorting and aggregation.
+    pub(crate) fn priority(self) -> u8 {
+        match self {
+            Self::Blocked => 0,
+            Self::Done => 1,
+            Self::Working => 2,
+            Self::Idle => 3,
+            Self::Unknown => 4,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Enum)]
 #[serde(rename_all = "snake_case")]
 pub enum HerdrAgentKind {
@@ -66,10 +79,27 @@ pub enum HerdrTabLaunchResult {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, uniffi::Record)]
 pub struct HerdrIntegrationInstallResult {
     pub kind: HerdrAgentKind,
     pub messages: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Enum)]
+#[serde(rename_all = "snake_case")]
+pub enum HerdrIntegrationState {
+    NotInstalled,
+    Current,
+    Outdated,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, uniffi::Record)]
+pub struct HerdrIntegrationInfo {
+    pub target: String,
+    pub label: String,
+    pub command: String,
+    pub available: bool,
+    pub state: HerdrIntegrationState,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
@@ -134,7 +164,7 @@ pub enum HerdrPaneZoomReason {
     AlreadyUnzoomed,
 }
 
-#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+#[derive(Clone, Debug, PartialEq, Serialize, uniffi::Record)]
 pub struct HerdrAgentSessionInfo {
     pub source: String,
     pub agent: String,
@@ -142,14 +172,14 @@ pub struct HerdrAgentSessionInfo {
     pub value: String,
 }
 
-#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+#[derive(Clone, Debug, PartialEq, Serialize, uniffi::Record)]
 pub struct HerdrPaneScrollInfo {
     pub offset_from_bottom: f64,
     pub max_offset_from_bottom: f64,
     pub viewport_rows: f64,
 }
 
-#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+#[derive(Clone, Debug, PartialEq, Serialize, uniffi::Record)]
 pub struct HerdrWorkspaceWorktreeInfo {
     pub repo_key: String,
     pub repo_name: String,
@@ -158,7 +188,7 @@ pub struct HerdrWorkspaceWorktreeInfo {
     pub is_linked_worktree: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+#[derive(Clone, Debug, PartialEq, Serialize, uniffi::Record)]
 pub struct HerdrWorkspaceInfo {
     pub workspace_id: String,
     pub number: f64,
@@ -168,7 +198,9 @@ pub struct HerdrWorkspaceInfo {
     pub tab_count: f64,
     pub active_tab_id: String,
     pub agent_status: HerdrAgentStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tokens: Option<HashMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub worktree: Option<HerdrWorkspaceWorktreeInfo>,
 }
 
@@ -184,7 +216,7 @@ pub struct HerdrWorktreeInfo {
     pub path: String,
 }
 
-#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+#[derive(Clone, Debug, PartialEq, Serialize, uniffi::Record)]
 pub struct HerdrTabInfo {
     pub tab_id: String,
     pub workspace_id: String,
@@ -195,30 +227,42 @@ pub struct HerdrTabInfo {
     pub agent_status: HerdrAgentStatus,
 }
 
-#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+#[derive(Clone, Debug, PartialEq, Serialize, uniffi::Record)]
 pub struct HerdrPaneInfo {
     pub pane_id: String,
     pub terminal_id: String,
     pub workspace_id: String,
     pub tab_id: String,
     pub focused: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub foreground_cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_title_stripped: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub display_agent: Option<String>,
     pub agent_status: HerdrAgentStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub state_labels: Option<HashMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tokens: Option<HashMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_session: Option<HerdrAgentSessionInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub scroll: Option<HerdrPaneScrollInfo>,
     pub revision: f64,
 }
 
-#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+#[derive(Clone, Debug, PartialEq, Serialize, uniffi::Record)]
 pub struct HerdrAgentInfo {
     pub pane_id: String,
     pub terminal_id: String,
@@ -227,24 +271,39 @@ pub struct HerdrAgentInfo {
     pub focused: bool,
     pub agent_status: HerdrAgentStatus,
     pub revision: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub foreground_cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_title_stripped: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub display_agent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub interactive_ready: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub launch_pending: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub screen_detection_skipped: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub state_change_seq: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub state_labels: Option<HashMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tokens: Option<HashMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_session: Option<HerdrAgentSessionInfo>,
 }
 
-#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+#[derive(Clone, Debug, PartialEq, Serialize, uniffi::Record)]
 pub struct HerdrPaneLayoutRect {
     pub x: f64,
     pub y: f64,
@@ -252,14 +311,14 @@ pub struct HerdrPaneLayoutRect {
     pub height: f64,
 }
 
-#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+#[derive(Clone, Debug, PartialEq, Serialize, uniffi::Record)]
 pub struct HerdrPaneLayoutPane {
     pub pane_id: String,
     pub focused: bool,
     pub rect: HerdrPaneLayoutRect,
 }
 
-#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+#[derive(Clone, Debug, PartialEq, Serialize, uniffi::Record)]
 pub struct HerdrPaneLayoutSplit {
     pub id: String,
     pub direction: HerdrSplitDirection,
@@ -267,7 +326,7 @@ pub struct HerdrPaneLayoutSplit {
     pub rect: HerdrPaneLayoutRect,
 }
 
-#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+#[derive(Clone, Debug, PartialEq, Serialize, uniffi::Record)]
 pub struct HerdrPaneLayoutSnapshot {
     pub workspace_id: String,
     pub tab_id: String,
@@ -278,12 +337,15 @@ pub struct HerdrPaneLayoutSnapshot {
     pub splits: Vec<HerdrPaneLayoutSplit>,
 }
 
-#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+#[derive(Clone, Debug, PartialEq, Serialize, uniffi::Record)]
 pub struct HerdrSessionSnapshot {
     pub version: String,
     pub protocol: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub focused_workspace_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub focused_tab_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub focused_pane_id: Option<String>,
     pub agents: Vec<HerdrAgentInfo>,
     pub workspaces: Vec<HerdrWorkspaceInfo>,
@@ -292,7 +354,7 @@ pub struct HerdrSessionSnapshot {
     pub layouts: Vec<HerdrPaneLayoutSnapshot>,
 }
 
-#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+#[derive(Clone, Debug, PartialEq, Serialize, uniffi::Record)]
 pub struct HerdrPaneReadResult {
     pub pane_id: String,
     pub workspace_id: String,
@@ -304,7 +366,7 @@ pub struct HerdrPaneReadResult {
     pub truncated: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+#[derive(Clone, Debug, PartialEq, Serialize, uniffi::Record)]
 pub struct HerdrPaneZoomResult {
     pub changed: bool,
     pub zoom_changed: bool,
@@ -316,7 +378,8 @@ pub struct HerdrPaneZoomResult {
     pub layout: HerdrPaneLayoutSnapshot,
 }
 
-#[derive(Clone, Debug, PartialEq, uniffi::Enum)]
+#[derive(Clone, Debug, PartialEq, Serialize, uniffi::Enum)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 // UniFFI data enums cannot box associated records. Keeping the result typed is
 // preferable to recreating the former string discriminator plus option bag.
 #[allow(
@@ -365,13 +428,17 @@ pub enum HerdrControlResult {
     IntegrationInstalled {
         install: HerdrIntegrationInstallResult,
     },
+    IntegrationList {
+        integrations: Vec<HerdrIntegrationInfo>,
+    },
     PaneZoom {
         zoom: HerdrPaneZoomResult,
     },
     Ok,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, uniffi::Enum)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Enum)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HerdrControlRequest {
     Ping,
     SessionSnapshot,
@@ -406,6 +473,12 @@ pub enum HerdrControlRequest {
     PaneRead {
         pane_id: String,
         lines: u32,
+    },
+    PaneReadVisible {
+        pane_id: String,
+    },
+    PaneGet {
+        pane_id: String,
     },
     PaneFocus {
         pane_id: String,
@@ -453,6 +526,7 @@ pub enum HerdrControlRequest {
     IntegrationInstall {
         kind: HerdrAgentKind,
     },
+    IntegrationList,
 }
 
 #[derive(Clone, Debug, thiserror::Error, uniffi::Error, PartialEq, Eq)]
@@ -567,7 +641,8 @@ struct PaneZoomParams<'a> {
 struct PaneReadParams<'a> {
     pane_id: &'a str,
     source: HerdrPaneReadSource,
-    lines: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lines: Option<u32>,
     format: HerdrPaneReadFormat,
     strip_ansi: bool,
 }
@@ -616,6 +691,9 @@ struct IntegrationInstallParams {
 }
 
 impl HerdrControlRequest {
+    pub(crate) fn result_type(&self) -> &'static str {
+        self.expected_result().wire_name()
+    }
     fn method(&self) -> &'static str {
         match self {
             Self::Ping => "ping",
@@ -628,7 +706,8 @@ impl HerdrControlRequest {
             Self::TabFocus { .. } => "tab.focus",
             Self::TabRename { .. } => "tab.rename",
             Self::TabClose { .. } => "tab.close",
-            Self::PaneRead { .. } => "pane.read",
+            Self::PaneRead { .. } | Self::PaneReadVisible { .. } => "pane.read",
+            Self::PaneGet { .. } => "pane.get",
             Self::PaneFocus { .. } => "pane.focus",
             Self::PaneRename { .. } => "pane.rename",
             Self::PaneSplit { .. } => "pane.split",
@@ -641,10 +720,11 @@ impl HerdrControlRequest {
             Self::AgentFocus { .. } => "agent.focus",
             Self::AgentPrompt { .. } => "agent.prompt",
             Self::IntegrationInstall { .. } => "integration.install",
+            Self::IntegrationList => "integration.list",
         }
     }
 
-    fn encode(&self, id: &str) -> Result<Vec<u8>, HerdrControlError> {
+    pub(crate) fn encode(&self, id: &str) -> Result<Vec<u8>, HerdrControlError> {
         fn line<P: Serialize>(request: WireRequest<'_, P>) -> Result<Vec<u8>, HerdrControlError> {
             let mut bytes = serde_json::to_vec(&request).map_err(|error| {
                 HerdrControlError::InvalidField(format!(
@@ -656,7 +736,7 @@ impl HerdrControlRequest {
         }
         let method = self.method();
         match self {
-            Self::Ping | Self::SessionSnapshot => line(WireRequest {
+            Self::Ping | Self::SessionSnapshot | Self::IntegrationList => line(WireRequest {
                 id,
                 method,
                 params: EmptyParams {},
@@ -716,12 +796,26 @@ impl HerdrControlRequest {
                 params: PaneReadParams {
                     pane_id,
                     source: HerdrPaneReadSource::Recent,
-                    lines: *lines,
+                    lines: Some(*lines),
                     format: HerdrPaneReadFormat::Ansi,
                     strip_ansi: false,
                 },
             }),
-            Self::PaneFocus { pane_id } | Self::PaneClose { pane_id } => line(WireRequest {
+            Self::PaneReadVisible { pane_id } => line(WireRequest {
+                id,
+                method,
+                params: PaneReadParams {
+                    pane_id,
+                    source: HerdrPaneReadSource::Visible,
+                    // An omitted limit reads the full viewport; zero reads no rows.
+                    lines: None,
+                    format: HerdrPaneReadFormat::Text,
+                    strip_ansi: true,
+                },
+            }),
+            Self::PaneGet { pane_id }
+            | Self::PaneFocus { pane_id }
+            | Self::PaneClose { pane_id } => line(WireRequest {
                 id,
                 method,
                 params: PaneTarget { pane_id },
@@ -823,15 +917,19 @@ impl HerdrControlRequest {
             | Self::PaneSendKeys { .. } => HerdrControlResultKind::Ok,
             Self::TabCreate { .. } => HerdrControlResultKind::TabCreated,
             Self::TabFocus { .. } | Self::TabRename { .. } => HerdrControlResultKind::TabInfo,
-            Self::PaneRead { .. } => HerdrControlResultKind::PaneRead,
-            Self::PaneFocus { .. } | Self::PaneRename { .. } | Self::PaneSplit { .. } => {
-                HerdrControlResultKind::PaneInfo
+            Self::PaneRead { .. } | Self::PaneReadVisible { .. } => {
+                HerdrControlResultKind::PaneRead
             }
+            Self::PaneGet { .. }
+            | Self::PaneFocus { .. }
+            | Self::PaneRename { .. }
+            | Self::PaneSplit { .. } => HerdrControlResultKind::PaneInfo,
             Self::PaneZoom { .. } => HerdrControlResultKind::PaneZoom,
             Self::AgentStart { .. } => HerdrControlResultKind::AgentStarted,
             Self::AgentFocus { .. } => HerdrControlResultKind::AgentInfo,
             Self::AgentPrompt { .. } => HerdrControlResultKind::AgentPrompted,
             Self::IntegrationInstall { .. } => HerdrControlResultKind::IntegrationInstall,
+            Self::IntegrationList => HerdrControlResultKind::IntegrationList,
         }
     }
 }
@@ -851,6 +949,7 @@ enum HerdrControlResultKind {
     AgentInfo,
     AgentPrompted,
     IntegrationInstall,
+    IntegrationList,
     PaneZoom,
     Ok,
 }
@@ -870,6 +969,7 @@ impl HerdrControlResultKind {
             Self::AgentInfo => "agent_info",
             Self::AgentPrompted => "agent_prompted",
             Self::IntegrationInstall => "integration_install",
+            Self::IntegrationList => "integration_list",
             Self::PaneZoom => "pane_zoom",
             Self::Ok => "ok",
         }
@@ -947,10 +1047,57 @@ pub async fn herdr_control_request(
         })?
 }
 
-fn parse_response(
+pub(crate) fn parse_response(
     request: &HerdrControlRequest,
     bytes: &[u8],
 ) -> Result<HerdrControlResult, HerdrControlError> {
+    let result = parse_json_response(bytes)?;
+    let result = object(&result, "result").map_err(HerdrControlError::InvalidField)?;
+    let raw_kind =
+        required_string(result, "type", "result.type").map_err(HerdrControlError::InvalidField)?;
+    let kind =
+        parse_wire_str::<HerdrControlResultKind>(&raw_kind, "result.type").map_err(|_| {
+            HerdrControlError::UnsupportedResponse(format!(
+                "Herdr API returned unsupported response type {raw_kind}"
+            ))
+        })?;
+    let expected = request.expected_result();
+    if kind != expected {
+        return Err(HerdrControlError::UnsupportedResponse(format!(
+            "Herdr API returned {raw_kind} for {}, expected {}",
+            request.method(),
+            expected.wire_name(),
+        )));
+    }
+    decode_result(kind, result).map_err(HerdrControlError::InvalidField)
+}
+
+/// The reverse-control surface preserves fields newer than the native UI model.
+pub(crate) async fn request_json_on_runtime(
+    connection: Arc<HerdrConnection>,
+    method: &str,
+    params: Value,
+    timeout_ms: u64,
+) -> Result<Value, HerdrControlError> {
+    let mut bytes = serde_json::to_vec(&serde_json::json!({
+        "id": next_request_id(connection.client_key()), "method":method, "params":params
+    }))
+    .map_err(|error| HerdrControlError::InvalidField(error.to_string()))?;
+    bytes.push(b'\n');
+    let response = connection
+        .request(
+            &bytes,
+            b'\n',
+            timeout_ms,
+            MAX_CONTROL_RESPONSE_BYTES,
+            HerdrRequestReplay::Never,
+        )
+        .await
+        .map_err(transport_error)?;
+    parse_json_response(&response)
+}
+
+pub(crate) fn parse_json_response(bytes: &[u8]) -> Result<Value, HerdrControlError> {
     let value: Value = serde_json::from_slice(bytes).map_err(|_| {
         HerdrControlError::MalformedResponse("Herdr API returned invalid JSON".to_owned())
     })?;
@@ -970,24 +1117,8 @@ fn parse_response(
             "Herdr API response did not include a result".to_owned(),
         )
     })?;
-    let result = object(result, "result").map_err(HerdrControlError::InvalidField)?;
-    let raw_kind =
-        required_string(result, "type", "result.type").map_err(HerdrControlError::InvalidField)?;
-    let kind =
-        parse_wire_str::<HerdrControlResultKind>(&raw_kind, "result.type").map_err(|_| {
-            HerdrControlError::UnsupportedResponse(format!(
-                "Herdr API returned unsupported response type {raw_kind}"
-            ))
-        })?;
-    let expected = request.expected_result();
-    if kind != expected {
-        return Err(HerdrControlError::UnsupportedResponse(format!(
-            "Herdr API returned {raw_kind} for {}, expected {}",
-            request.method(),
-            expected.wire_name(),
-        )));
-    }
-    decode_result(kind, result).map_err(HerdrControlError::InvalidField)
+    object(result, "result").map_err(HerdrControlError::InvalidField)?;
+    Ok(result.clone())
 }
 
 fn decode_result(
@@ -1089,6 +1220,32 @@ fn decode_result(
                     )?,
                 },
             })
+        }
+        HerdrControlResultKind::IntegrationList => {
+            let integrations = required(result, "integrations", "result.integrations")?
+                .as_array()
+                .ok_or_else(|| "result.integrations must be an array".to_owned())?
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    let path = format!("result.integrations[{index}]");
+                    let entry = object(value, &path)?;
+                    Ok(HerdrIntegrationInfo {
+                        target: required_string(entry, "target", &format!("{path}.target"))?,
+                        label: required_string(entry, "label", &format!("{path}.label"))?,
+                        command: required_string(entry, "command", &format!("{path}.command"))?,
+                        available: bool_value(
+                            required(entry, "available", &format!("{path}.available"))?,
+                            &format!("{path}.available"),
+                        )?,
+                        state: enum_value(
+                            required(entry, "state", &format!("{path}.state"))?,
+                            &format!("{path}.state"),
+                        )?,
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            Ok(HerdrControlResult::IntegrationList { integrations })
         }
         HerdrControlResultKind::PaneZoom => Ok(HerdrControlResult::PaneZoom {
             zoom: pane_zoom(required(result, "zoom", "result.zoom")?)?,
@@ -1295,7 +1452,7 @@ fn agent_session(value: &Value, label: &str) -> Result<HerdrAgentSessionInfo, St
     })
 }
 
-fn pane_scroll(value: &Value, label: &str) -> Result<HerdrPaneScrollInfo, String> {
+pub(crate) fn pane_scroll(value: &Value, label: &str) -> Result<HerdrPaneScrollInfo, String> {
     let item = object(value, label)?;
     Ok(HerdrPaneScrollInfo {
         offset_from_bottom: non_negative_number(
@@ -1726,7 +1883,7 @@ fn decoded_array<T>(
         .collect()
 }
 
-fn session_snapshot(value: &Value) -> Result<HerdrSessionSnapshot, String> {
+pub(crate) fn session_snapshot(value: &Value) -> Result<HerdrSessionSnapshot, String> {
     let item = object(value, "snapshot")?;
     Ok(HerdrSessionSnapshot {
         version: required_string(item, "version", "snapshot.version")?,
@@ -1898,7 +2055,58 @@ mod tests {
     }
 
     #[test]
+    fn live_prompt_read_omits_line_limit_and_recent_reads_preserve_it() {
+        // Herdr interprets a supplied zero as an empty, truncated read. Only
+        // omitting the limit requests every row of the live question dialog.
+        let visible = HerdrControlRequest::PaneReadVisible {
+            pane_id: "pane-1".into(),
+        };
+        let wire: Value = serde_json::from_slice(&visible.encode("inline-read").unwrap()).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "id": "inline-read", "method": "pane.read",
+                "params": { "pane_id": "pane-1", "source": "visible", "format": "text", "strip_ansi": true }
+            })
+        );
+        for lines in [0, 80] {
+            let recent = HerdrControlRequest::PaneRead {
+                pane_id: "pane-1".into(),
+                lines,
+            };
+            let wire: Value =
+                serde_json::from_slice(&recent.encode("recent-read").unwrap()).unwrap();
+            assert_eq!(
+                wire["params"],
+                serde_json::json!({
+                    "pane_id": "pane-1", "source": "recent", "lines": lines,
+                    "format": "ansi", "strip_ansi": false
+                })
+            );
+        }
+    }
+
+    #[test]
     fn representative_requests_match_typescript_fixtures() {
+        let get = HerdrControlRequest::PaneGet {
+            pane_id: "p1".to_owned(),
+        };
+        assert_eq!(
+            serde_json::from_slice::<Value>(&get.encode("scroll").unwrap()).unwrap(),
+            serde_json::json!({
+                "id": "scroll", "method": "pane.get", "params": {"pane_id": "p1"}
+            })
+        );
+        let mut value = pane_value();
+        value["scroll"] = serde_json::json!({"offset_from_bottom": 3, "max_offset_from_bottom": 100, "viewport_rows": 30});
+        let response = serde_json::to_vec(
+            &serde_json::json!({"id": "scroll", "result": {"type": "pane_info", "pane": value}}),
+        )
+        .unwrap();
+        let HerdrControlResult::PaneInfo { pane } = parse_response(&get, &response).unwrap() else {
+            panic!("expected pane_info")
+        };
+        assert!((pane.scroll.unwrap().offset_from_bottom - 3.0).abs() < f64::EPSILON);
         assert_eq!(
             String::from_utf8(HerdrControlRequest::Ping.encode("android_1").unwrap()).unwrap(),
             "{\"id\":\"android_1\",\"method\":\"ping\",\"params\":{}}\n"
@@ -1993,6 +2201,45 @@ mod tests {
             HerdrAgentKind::OpenCode
         );
         assert!(serde_json::from_str::<HerdrAgentKind>("\"open_code\"").is_err());
+    }
+
+    #[test]
+    fn integration_list_uses_the_socket_schema_and_rejects_wrong_result_types() {
+        let request = HerdrControlRequest::IntegrationList;
+        assert_eq!(
+            String::from_utf8(request.encode("android_8").unwrap()).unwrap(),
+            "{\"id\":\"android_8\",\"method\":\"integration.list\",\"params\":{}}\n"
+        );
+        let response = parse_response(
+            &request,
+            br#"{"id":"android_8","result":{"type":"integration_list","integrations":[{"target":"codex","label":"Codex","command":"codex","available":true,"state":"current"},{"target":"opencode","label":"OpenCode","command":"opencode","available":true,"state":"outdated"}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            response,
+            HerdrControlResult::IntegrationList {
+                integrations: vec![
+                    HerdrIntegrationInfo {
+                        target: "codex".to_owned(),
+                        label: "Codex".to_owned(),
+                        command: "codex".to_owned(),
+                        available: true,
+                        state: HerdrIntegrationState::Current,
+                    },
+                    HerdrIntegrationInfo {
+                        target: "opencode".to_owned(),
+                        label: "OpenCode".to_owned(),
+                        command: "opencode".to_owned(),
+                        available: true,
+                        state: HerdrIntegrationState::Outdated,
+                    },
+                ],
+            }
+        );
+        assert!(matches!(
+            parse_response(&request, br#"{"id":"android_8","result":{"type":"ok"}}"#,),
+            Err(HerdrControlError::UnsupportedResponse(_))
+        ));
     }
 
     #[test]
@@ -2114,6 +2361,13 @@ mod tests {
                     "details":{"messages":["installed"]}
                 }),
             ),
+            (
+                HerdrControlResultKind::IntegrationList,
+                serde_json::json!({"integrations":[{
+                    "target":"codex","label":"Codex","command":"codex",
+                    "available":true,"state":"not_installed"
+                }]}),
+            ),
             (HerdrControlResultKind::Ok, serde_json::json!({})),
         ];
         for (kind, value) in cases {
@@ -2136,6 +2390,9 @@ mod tests {
                 HerdrControlResult::AgentPrompted { .. } => HerdrControlResultKind::AgentPrompted,
                 HerdrControlResult::IntegrationInstalled { .. } => {
                     HerdrControlResultKind::IntegrationInstall
+                }
+                HerdrControlResult::IntegrationList { .. } => {
+                    HerdrControlResultKind::IntegrationList
                 }
                 HerdrControlResult::PaneZoom { .. } => HerdrControlResultKind::PaneZoom,
                 HerdrControlResult::Ok => HerdrControlResultKind::Ok,

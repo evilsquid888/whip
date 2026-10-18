@@ -1,0 +1,667 @@
+import {
+  bestEffortCleanup,
+  reportBackgroundFailure,
+} from '../services/backgroundOperations';
+import { isLiveHostSshConnected } from '../lib/liveHostLatency';
+import { closeDeviceSession, deviceAction } from './device';
+import type { SessionPresentation } from '../liveHostSessions';
+import {
+  BrowserRouting,
+  LOCAL_BROWSER_RUNTIME_ID,
+  type BrowserHost,
+} from './routing';
+import { browserAddress } from './address';
+import {
+  BROWSER_ACTION_TIMEOUT_MS,
+  BROWSER_DOWNLOAD_TIMEOUT_MS,
+  BrowserController,
+  BROWSER_LIVE_VIEW_BUDGET,
+  type BrowserTab,
+  type BrowserAction,
+  type PreviewTransport,
+} from './controller';
+import {
+  browserArchive,
+  type BrowserArchive,
+  type SavedBrowserSession,
+} from './archive';
+
+const localBrowserTransport: PreviewTransport = {
+  startWebPreview: () =>
+    Promise.reject(
+      new Error('Connect to an SSH host to preview remote pages.'),
+    ),
+  stopPreview: () => Promise.resolve(),
+};
+const runtimeConnectivity = new WeakMap<BrowserRuntime, boolean>();
+
+export interface BrowserSessionIdentity {
+  runtimeId: string;
+  sessionId: string;
+  paneId: string;
+  terminalId: string;
+}
+export interface BrowserBridgeEvent {
+  session: BrowserSessionIdentity;
+  kind: string;
+  requestId: string;
+  action: string;
+  argumentsJson: string;
+}
+export interface BrowserRuntime extends PreviewTransport {
+  readonly runtimeId: string;
+  startBrowserProxy?(): Promise<number>;
+  stopBrowserProxy?(port: number): Promise<void>;
+  reverseControlSessions(): BrowserSessionIdentity[];
+  hostState?(): {
+    freshness: string;
+    syncStatus: string;
+    snapshot?: { panes: { pane_id: string; terminal_id: string }[] };
+  };
+  reverseControlReply(
+    sessionId: string,
+    requestId: string,
+    resultJson: string,
+  ): void;
+}
+
+/** Keep launch-owned browser state while its SSH transport is being restored. */
+export function connectedBrowserRuntimes(
+  sessions: readonly (Pick<SessionPresentation, 'id' | 'connectionStatus'> &
+    Partial<Pick<SessionPresentation, 'hostId' | 'host'>>)[],
+  getRuntime: (id: string) => BrowserRuntime | undefined,
+): BrowserRuntime[] {
+  return sessions.flatMap(session => {
+    if (
+      !isLiveHostSshConnected(session.connectionStatus) &&
+      session.connectionStatus !== 'reconnecting'
+    )
+      return [];
+    const runtime = getRuntime(session.id);
+    if (runtime)
+      runtimeConnectivity.set(
+        runtime,
+        isLiveHostSshConnected(session.connectionStatus),
+      );
+    if (runtime && session.hostId)
+      runtimeHosts.set(runtime, {
+        id: session.hostId,
+        label: session.host?.name || session.host?.host || 'SSH host',
+      });
+    return runtime ? [runtime] : [];
+  });
+}
+const runtimeHosts = new WeakMap<BrowserRuntime, BrowserHost>();
+export interface BrowserEntry {
+  identity: BrowserSessionIdentity;
+  controller: BrowserController;
+  reverseControl: boolean;
+  /** Restored user tabs remain reachable from their pane without granting MCP access. */
+  restored: boolean;
+  unsubscribe: () => void;
+}
+
+export class BrowserRegistry {
+  readonly entries = new Map<string, BrowserEntry>();
+  visibleId: string | null = null;
+  private revision = 0;
+  private readonly listeners = new Set<() => void>();
+  private readonly calls = new Map<string, AbortController>();
+  private readonly runtimes = new Map<string, BrowserRuntime>();
+  private readonly reconnectingRoutes = new Set<string>();
+  private viewQueue: Promise<void> = Promise.resolve();
+  private linkQueue: Promise<unknown> = Promise.resolve();
+  private archiveLoading: Promise<void> | null = null;
+  readonly routing?: BrowserRouting;
+  constructor(
+    private readonly archive?: BrowserArchive,
+    routeNetworks = false,
+  ) {
+    if (routeNetworks)
+      this.routing = new BrowserRouting(
+        id => {
+          const runtime = this.runtimes.get(id);
+          return runtime
+            ? { runtime, host: runtimeHosts.get(runtime) || { id, label: id } }
+            : undefined;
+        },
+        () => {
+          for (const entry of this.entries.values())
+            entry.controller.resetRoute();
+          this.changed();
+        },
+        id => {
+          const runtime = this.runtimes.get(id);
+          return !!runtime && runtimeConnectivity.get(runtime) !== false;
+        },
+      );
+  }
+  host(runtimeId: string): BrowserHost | undefined {
+    const runtime = this.runtimes.get(runtimeId);
+    return runtime
+      ? runtimeHosts.get(runtime) || { id: runtimeId, label: runtimeId }
+      : undefined;
+  }
+  loadArchive = (): Promise<void> => {
+    if (!this.archiveLoading)
+      this.archiveLoading = (async () => {
+        const loading = this.archive?.load() || Promise.resolve();
+        reportBackgroundFailure(loading, 'browser-archive-load');
+        await Promise.allSettled([loading]);
+        this.restoreAvailableSessions();
+      })();
+    return this.archiveLoading;
+  };
+  private restoreAvailableSessions() {
+    for (const record of this.archive?.list() || []) {
+      if (this.entries.has(record.id) || !this.canRestore(record)) continue;
+      const runtime =
+        record.runtimeId === LOCAL_BROWSER_RUNTIME_ID
+          ? localBrowserTransport
+          : this.runtimes.get(record.runtimeId)!;
+      // Page locations grant no agent access. Reconciliation separately validates
+      // recovered native launches before enabling reverse control.
+      this.ensure(
+        {
+          runtimeId: record.runtimeId,
+          sessionId: record.id,
+          paneId: record.paneId,
+          terminalId: record.terminalId,
+        },
+        runtime,
+        false,
+      );
+    }
+  }
+  registerRuntimes(runtimes: readonly BrowserRuntime[]) {
+    const changed =
+      runtimes.length !== this.runtimes.size ||
+      runtimes.some(
+        runtime => this.runtimes.get(runtime.runtimeId) !== runtime,
+      );
+    this.runtimes.clear();
+    for (const runtime of runtimes)
+      this.runtimes.set(runtime.runtimeId, runtime);
+    this.restoreAvailableSessions();
+    for (const runtime of runtimes) {
+      const id = runtime.runtimeId;
+      if (runtimeConnectivity.get(runtime) === false) {
+        if (
+          this.routing?.runtimeId === id &&
+          !this.reconnectingRoutes.has(id)
+        ) {
+          this.reconnectingRoutes.add(id);
+          bestEffortCleanup(
+            this.routing.disconnect(id),
+            'browser-route-suspend',
+          );
+        }
+      } else if (this.reconnectingRoutes.delete(id)) {
+        const visible = this.visibleId
+          ? this.entries.get(this.visibleId)
+          : undefined;
+        if (visible?.identity.runtimeId === id && this.routing)
+          bestEffortCleanup(this.routing.activate(id), 'browser-route-restore');
+      }
+    }
+    if (changed) this.changed();
+  }
+  canRestore = (record: SavedBrowserSession) =>
+    record.runtimeId === LOCAL_BROWSER_RUNTIME_ID ||
+    this.runtimes.has(record.runtimeId);
+  async restore(record: SavedBrowserSession) {
+    if (this.entries.has(record.id)) {
+      this.open(record.id);
+      return;
+    }
+    const runtime =
+      record.runtimeId === LOCAL_BROWSER_RUNTIME_ID
+        ? localBrowserTransport
+        : this.runtimes.get(record.runtimeId);
+    if (!runtime)
+      throw new Error('Connect to this host to restore its browser tabs.');
+    // Restore for the user. A saved location never grants an old agent MCP access.
+    const entry = this.ensure(
+      {
+        runtimeId: record.runtimeId,
+        sessionId: 'restored-' + record.id,
+        paneId: '',
+        terminalId: '',
+      },
+      runtime,
+      false,
+    );
+    try {
+      entry.controller.restoreTabs(record.tabs, record.selected);
+      this.open(entry.identity.sessionId);
+      this.archive?.remove(record.id);
+    } catch (error) {
+      await this.close(entry.identity.sessionId);
+      throw error;
+    }
+  }
+  private save(entry: BrowserEntry) {
+    this.archive?.save({
+      id: entry.identity.sessionId,
+      runtimeId: entry.identity.runtimeId,
+      paneId: entry.identity.paneId,
+      terminalId: entry.identity.terminalId,
+      selected: entry.controller.tabs.findIndex(
+        tab => tab.id === entry.controller.selectedTabId,
+      ),
+      tabs: entry.controller.tabs.map(tab => ({
+        url: tab.url,
+        title: tab.title,
+      })),
+    });
+  }
+  subscribe = (listener: () => void) => {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  };
+  getSnapshot = () => this.revision;
+  changed = () => {
+    this.revision++;
+    for (const listener of this.listeners) listener();
+  };
+  totalTabs = () =>
+    [...this.entries.values()].reduce(
+      (total, entry) => total + entry.controller.tabs.length,
+      0,
+    );
+  activeViews = () =>
+    [...this.entries.values()].reduce(
+      (total, entry) =>
+        total +
+        entry.controller.tabs.filter(tab => tab.lifecycle === 'active').length,
+      0,
+    );
+  private enqueueView(operation: () => Promise<void>) {
+    const pending = this.viewQueue.then(operation);
+    this.viewQueue = pending.then(
+      () => undefined,
+      () => undefined,
+    );
+    return pending;
+  }
+  private async reclaimViews(budget: number, activating?: BrowserTab) {
+    if (this.activeViews() <= budget) return;
+    const visible = () =>
+      this.visibleId
+        ? this.entries.get(this.visibleId)?.controller.selectedTabId
+        : undefined;
+    const candidates = [...this.entries.values()]
+      .flatMap(entry =>
+        entry.controller.tabs.map(tab => ({
+          controller: entry.controller,
+          tab,
+        })),
+      )
+      .sort((a, b) => a.tab.lastUsedAt - b.tab.lastUsedAt);
+    for (const { controller, tab } of candidates) {
+      if (this.activeViews() <= budget) break;
+      await controller.suspendTab(
+        tab,
+        () => tab !== activating && tab.id !== visible(),
+      );
+    }
+  }
+  trimViews = () =>
+    this.activeViews() <= BROWSER_LIVE_VIEW_BUDGET
+      ? Promise.resolve()
+      : this.enqueueView(() => this.reclaimViews(BROWSER_LIVE_VIEW_BUDGET));
+  private activateView(controller: BrowserController, tab: BrowserTab) {
+    return this.enqueueView(async () => {
+      await this.reclaimViews(BROWSER_LIVE_VIEW_BUDGET - 1, tab);
+      controller.tab(tab.id);
+      // Visible tabs and in-flight agent leases take priority over the soft budget.
+      tab.lifecycle = 'active';
+    });
+  }
+  ensure(
+    identity: BrowserSessionIdentity,
+    runtime: PreviewTransport,
+    reverseControl = true,
+  ): BrowserEntry {
+    const existing = this.entries.get(identity.sessionId);
+    if (existing) {
+      if (
+        existing.identity.runtimeId !== identity.runtimeId ||
+        existing.identity.paneId !== identity.paneId ||
+        existing.identity.terminalId !== identity.terminalId
+      )
+        throw new Error('Browser identity mismatch');
+      if (reverseControl && !existing.reverseControl) {
+        existing.reverseControl = true;
+        this.changed();
+      }
+      return existing;
+    }
+    const controller: BrowserController = new BrowserController(
+      identity.sessionId,
+      runtime,
+      () => this.activeViews() < BROWSER_LIVE_VIEW_BUDGET,
+      this.routing
+        ? { activate: () => this.routing!.activate(identity.runtimeId) }
+        : undefined,
+      tab => this.activateView(controller, tab),
+    );
+    const saved = this.archive
+      ?.list()
+      .find(
+        record =>
+          record.id === identity.sessionId &&
+          record.runtimeId === identity.runtimeId &&
+          record.paneId === identity.paneId &&
+          record.terminalId === identity.terminalId,
+      );
+    // Hydrate before subscribing so blank placeholders cannot overwrite disk.
+    if (saved) controller.restoreTabs(saved.tabs, saved.selected);
+    const entry: BrowserEntry = {
+      identity,
+      controller,
+      reverseControl,
+      restored: !!saved,
+      unsubscribe: () => undefined,
+    };
+    entry.unsubscribe = controller.subscribe(() => {
+      this.save(entry);
+      this.changed();
+    });
+    this.entries.set(identity.sessionId, entry);
+    this.changed();
+    return entry;
+  }
+  async openLocal() {
+    await this.loadArchive();
+    const entry =
+      [...this.entries.values()].find(
+        candidate => candidate.identity.runtimeId === LOCAL_BROWSER_RUNTIME_ID,
+      ) ||
+      this.ensure(
+        {
+          runtimeId: LOCAL_BROWSER_RUNTIME_ID,
+          sessionId: LOCAL_BROWSER_RUNTIME_ID,
+          paneId: '',
+          terminalId: '',
+        },
+        localBrowserTransport,
+        false,
+      );
+    if (!entry.controller.tabs.length) entry.controller.newTab();
+    this.open(entry.identity.sessionId);
+    return entry;
+  }
+  forPane(runtimeId: string, paneId: string | undefined) {
+    const candidates = [...this.entries.values()].filter(
+      entry =>
+        entry.identity.runtimeId === runtimeId &&
+        entry.identity.paneId === paneId,
+    );
+    return (
+      candidates.find(entry => entry.reverseControl) ||
+      candidates.find(entry => entry.restored)
+    );
+  }
+  open(id: string) {
+    if (!this.entries.has(id)) {
+      throw new Error('Browser session closed');
+    }
+    this.visibleId = id;
+    const controller = this.entries.get(id)!.controller;
+    if (controller.selectedTabId) controller.touch(controller.selectedTabId);
+    this.changed();
+  }
+  /** User link opens reuse the host's tabs without navigating an existing page. */
+  openLink(id: string, value: string): Promise<unknown> {
+    const operation = this.linkQueue.then(async () => {
+      const entry = this.entries.get(id);
+      if (!entry) throw new Error('Browser session closed');
+      const url = browserAddress(value);
+      // Prefer this terminal's tabs; another SSH host may serve a different
+      // page at the same address, especially for localhost links.
+      const candidates = [
+        entry,
+        ...[...this.entries.values()].filter(candidate => candidate !== entry),
+      ];
+      for (const candidate of candidates) {
+        if (candidate.identity.runtimeId !== entry.identity.runtimeId) continue;
+        const tab = candidate.controller.tabs.find(item => item.url === url);
+        if (!tab) continue;
+        candidate.controller.select(tab.id);
+        this.open(candidate.identity.sessionId);
+        return { tab_id: tab.id, url };
+      }
+      this.open(id);
+      return entry.controller.action('new_tab', { url });
+    });
+    // Serialize the lookup with creation so repeated taps cannot create duplicates.
+    this.linkQueue = operation.then(
+      () => undefined,
+      () => undefined,
+    );
+    return operation;
+  }
+  hide() {
+    this.visibleId = null;
+    this.changed();
+  }
+  async close(id: string) {
+    closeDeviceSession(id);
+    for (const [key, call] of this.calls)
+      if (key.startsWith(id + ':')) {
+        call.abort();
+        this.calls.delete(key);
+      }
+    const entry = this.entries.get(id);
+    this.archive?.remove(id);
+    if (!entry) return;
+    this.entries.delete(id);
+    entry.unsubscribe();
+    if (this.visibleId === id) {
+      this.visibleId = null;
+    }
+    this.changed();
+    await entry.controller.dispose();
+  }
+  async closeTerminal(runtimeId: string, terminalId: string) {
+    await Promise.all(
+      [...this.entries.values()]
+        .filter(
+          entry =>
+            entry.identity.runtimeId === runtimeId &&
+            entry.identity.terminalId === terminalId,
+        )
+        .map(entry => this.close(entry.identity.sessionId)),
+    );
+  }
+  async closeHost(runtimeId: string) {
+    // Phone-network tabs survive cleanup of disconnected SSH runtimes.
+    if (runtimeId === LOCAL_BROWSER_RUNTIME_ID) return;
+    this.reconnectingRoutes.delete(runtimeId);
+    await this.routing?.disconnect(runtimeId);
+    await Promise.all(
+      [...this.entries.values()]
+        .filter(entry => entry.identity.runtimeId === runtimeId)
+        .map(entry => this.close(entry.identity.sessionId)),
+    );
+    const visible = this.visibleId
+      ? this.entries.get(this.visibleId)
+      : undefined;
+    if (
+      visible &&
+      visible.identity.runtimeId !== runtimeId &&
+      this.routing &&
+      !this.routing.ready
+    )
+      await this.routing.activate(visible.identity.runtimeId);
+  }
+  reconcile(runtime: BrowserRuntime) {
+    const sessions = runtime.reverseControlSessions();
+    const authorized = new Set(sessions.map(session => session.sessionId));
+    const host = runtime.hostState?.();
+    if (
+      host?.freshness === 'fresh' &&
+      host.syncStatus === 'synced' &&
+      host.snapshot
+    ) {
+      for (const entry of this.entries.values()) {
+        if (
+          !entry.reverseControl &&
+          entry.identity.runtimeId === runtime.runtimeId &&
+          entry.identity.paneId &&
+          !host.snapshot.panes.some(
+            pane =>
+              pane.pane_id === entry.identity.paneId &&
+              pane.terminal_id === entry.identity.terminalId,
+          )
+        ) {
+          bestEffortCleanup(
+            this.close(entry.identity.sessionId),
+            'browser-preview-pane-close',
+          );
+        }
+      }
+    }
+    for (const entry of this.entries.values())
+      if (
+        entry.reverseControl &&
+        entry.identity.runtimeId === runtime.runtimeId &&
+        !authorized.has(entry.identity.sessionId)
+      )
+        bestEffortCleanup(
+          this.close(entry.identity.sessionId),
+          'browser-reconcile-close',
+        );
+    for (const identity of sessions) this.ensure(identity, runtime);
+  }
+  async event(event: BrowserBridgeEvent, runtime: BrowserRuntime) {
+    if (event.kind === 'action' && event.action.startsWith('hosts.')) return;
+    const id = event.session.sessionId;
+    if (event.session.runtimeId !== runtime.runtimeId) return;
+    if (event.kind === 'closed') {
+      await this.close(id);
+      return;
+    }
+    if (event.kind === 'cancel') {
+      this.calls.get(id + ':' + event.requestId)?.abort();
+      return;
+    }
+    if (event.kind === 'release') {
+      this.entries.get(id)?.controller.releaseLease(event.requestId);
+      return;
+    }
+    if (event.kind === 'opened') {
+      await this.loadArchive();
+      if (
+        runtime
+          .reverseControlSessions()
+          .some(
+            session =>
+              session.sessionId === id &&
+              session.paneId === event.session.paneId,
+          )
+      )
+        this.ensure(event.session, runtime);
+      return;
+    }
+    if (event.kind !== 'action') return;
+    const deviceCall = event.action.startsWith('device.');
+    const key = id + ':' + event.requestId;
+    const abort = new AbortController();
+    this.calls.set(key, abort);
+    let timedOut = false;
+    const timer = setTimeout(
+      () => {
+        timedOut = true;
+        abort.abort();
+      },
+      event.action === 'download'
+        ? BROWSER_DOWNLOAD_TIMEOUT_MS
+        : BROWSER_ACTION_TIMEOUT_MS,
+    );
+    let response: unknown;
+    try {
+      if (!deviceCall) await this.loadArchive();
+      if (abort.signal.aborted) throw new Error('Browser action cancelled');
+      const authorized = runtime
+        .reverseControlSessions()
+        .some(
+          session =>
+            session.sessionId === id && session.paneId === event.session.paneId,
+        );
+      if (!authorized) throw new Error('Browser session is not authorized');
+      const args = JSON.parse(event.argumentsJson) as Record<string, unknown>;
+      const result = deviceCall
+        ? await deviceAction(
+            event.action,
+            args,
+            key,
+            abort.signal,
+            event.session,
+          )
+        : await this.ensure(event.session, runtime).controller.action(
+            event.action as BrowserAction,
+            {
+              ...args,
+              primitive: true,
+            },
+            abort.signal,
+          );
+      response = { ok: true, value: result };
+    } catch (error) {
+      const message = timedOut
+        ? 'Browser action timed out'
+        : error instanceof Error
+          ? error.message
+          : 'Browser action failed';
+      const deviceCode =
+        error && typeof error === 'object' && 'code' in error
+          ? error.code
+          : undefined;
+      const code =
+        deviceCall &&
+        typeof deviceCode === 'string' &&
+        [
+          'device_unavailable',
+          'permission_denied',
+          'unauthorized',
+          'location_unavailable',
+          'sensor_unavailable',
+          'timeout',
+          'cancelled',
+          'unknown_action',
+          'invalid_argument',
+        ].includes(deviceCode)
+          ? deviceCode
+          : error &&
+              typeof error === 'object' &&
+              'code' in error &&
+              error.code === 'stale_page'
+            ? 'stale_page'
+            : timedOut || message.includes('timed out')
+              ? 'timeout'
+              : message.includes('cancelled')
+                ? 'cancelled'
+                : message.includes('not authorized')
+                  ? 'unauthorized'
+                  : event.action === 'download'
+                    ? 'download_failed'
+                    : message.includes('tab closed')
+                      ? 'tab_closed'
+                      : message.includes('session closed')
+                        ? 'session_closed'
+                        : deviceCall
+                          ? 'device_unavailable'
+                          : 'browser_unavailable';
+      response = { ok: false, error: { code, message } };
+    } finally {
+      clearTimeout(timer);
+      this.calls.delete(key);
+    }
+    runtime.reverseControlReply(id, event.requestId, JSON.stringify(response));
+  }
+}
+export const browserRegistry = new BrowserRegistry(browserArchive, true);

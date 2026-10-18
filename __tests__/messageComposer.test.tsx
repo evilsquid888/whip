@@ -1,6 +1,14 @@
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
+import * as Haptics from 'expo-haptics';
 
-import { MessageComposer } from '../src/components/MessageComposer';
+import { ComposerInput, MessageComposer } from '../src/components/MessageComposer';
+import { watchComposerImagePaste } from '../src/services/composerImagePaste';
+import { discardClipboardAttachment } from '../src/services/attachmentPaste';
+import { watchComposerFont } from '../src/services/composerFont';
+
+jest.mock('../src/services/composerFont', () => ({ watchComposerFont: jest.fn(() => jest.fn()) }));
+jest.mock('../src/services/composerImagePaste', () => ({ watchComposerImagePaste: jest.fn() }));
+jest.mock('../src/services/attachmentPaste', () => ({ discardClipboardAttachment: jest.fn() }));
 
 jest.mock(
   'lucide-react-native',
@@ -11,6 +19,7 @@ jest.mock('react-native-css-interop/jsx-runtime', () =>
 );
 jest.mock('react-native', () => ({
   ActivityIndicator: 'ActivityIndicator',
+  findNodeHandle: () => 42,
   View: 'View',
 }));
 jest.mock('../src/components/GlassSurface', () => ({
@@ -32,12 +41,13 @@ const actions = {
   actionClassName: 'bg-terminal-surface',
   actionColor: '#aaaaaa',
   attachLabel: 'Attach',
-  closeLabel: 'Close',
+  voiceLabel: 'Voice input',
+  voicePhase: 'idle' as const,
   expandLabel: 'Expand',
   onAttach: jest.fn(),
-  onClose: jest.fn(),
+  onVoiceInput: jest.fn(),
   onExpand: jest.fn(),
-  onSend: jest.fn(),
+  onSend: jest.fn(() => true),
   sendClassName: 'bg-white',
   sendColor: '#111111',
   sendLabel: 'Send',
@@ -60,17 +70,33 @@ function renderComposer(glass: boolean): ReactTestRenderer {
 describe('MessageComposer glass controls', () => {
   let renderer: ReactTestRenderer;
 
+  beforeEach(() => jest.clearAllMocks());
   afterEach(() => act(() => renderer?.unmount()));
+
+  test.each([true, false])('only confirms an accepted send (accepted=%s)', accepted => {
+    actions.onSend.mockImplementationOnce(() => {
+      expect(Haptics.impactAsync).not.toHaveBeenCalled();
+      return accepted;
+    });
+    renderer = renderComposer(false);
+
+    act(() => { renderer.root.findByProps({ accessibilityLabel: 'Send' }).props.onPress(); });
+
+    expect(actions.onSend).toHaveBeenCalledTimes(1);
+    expect(Haptics.impactAsync).toHaveBeenCalledTimes(accepted ? 1 : 0);
+    if (accepted) expect(Haptics.impactAsync).toHaveBeenCalledWith(Haptics.ImpactFeedbackStyle.Light);
+    expect(Haptics.selectionAsync).not.toHaveBeenCalled();
+  });
 
   test('uses passive glass utility buttons and an active glass send button', () => {
     renderer = renderComposer(true);
 
     const attach = renderer.root.findByProps({ accessibilityLabel: 'Attach' });
     const expand = renderer.root.findByProps({ accessibilityLabel: 'Expand' });
-    const close = renderer.root.findByProps({ accessibilityLabel: 'Close' });
+    const voice = renderer.root.findAllByProps({ accessibilityLabel: 'Voice input' }).find(node => String(node.type) === 'Button')!;
     const send = renderer.root.findByProps({ accessibilityLabel: 'Send' });
 
-    for (const action of [attach, expand, close]) {
+    for (const action of [attach, expand, voice]) {
       expect(action.props.className.split(/\s+/)).toContain('border');
       expect(action.props.className.split(/\s+/)).toEqual(
         expect.arrayContaining(['bg-card/60', 'active:bg-card/70']),
@@ -106,5 +132,104 @@ describe('MessageComposer glass controls', () => {
     expect(
       renderer.root.find(node => String(node.type) === 'Send').props.color,
     ).toBe('#111111');
+  });
+
+  test.each(['idle', 'listening', 'preparing', 'finishing'] as const)('renders the %s voice action', phase => {
+    act(() => {
+      renderer = create(<MessageComposer initialValue="Keep this draft" actions={{
+        ...actions,
+        voicePhase: phase,
+        voiceDisabled: phase === 'preparing' || phase === 'finishing',
+      }} />);
+    });
+    const voice = renderer.root.findAllByProps({ accessibilityLabel: 'Voice input' })
+      .find(node => String(node.type) === 'Button')!;
+    expect(voice.props.accessibilityState.selected).toBe(phase === 'listening');
+    expect(voice.props.accessibilityState.busy).toBe(phase === 'preparing' || phase === 'finishing');
+    if (phase === 'idle' || phase === 'listening') {
+      act(() => { voice.props.onPress(); });
+      expect(actions.onVoiceInput).toHaveBeenCalledTimes(1);
+      expect(renderer.root.findAll(node => String(node.type) === (phase === 'idle' ? 'Mic' : 'Square'))).toHaveLength(1);
+    } else {
+      expect(voice.props.disabled).toBe(true);
+    }
+  });
+});
+
+describe('ComposerInput image paste binding', () => {
+  let renderer: ReactTestRenderer;
+  const stop = jest.fn();
+  const handle = { clear: jest.fn(), focus: jest.fn() };
+  const image = { uri: 'file:///clipboard/photo.png', mimeType: 'image/png' };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    jest.mocked(watchComposerImagePaste).mockReturnValue(stop);
+  });
+  afterEach(() => act(() => renderer?.unmount()));
+
+  test('binds the mounted native input, preserves its ref and leaves text uncontrolled', () => {
+    const ref = { current: null };
+    const onPaste = jest.fn();
+    const onText = jest.fn();
+    act(() => {
+      renderer = create(<ComposerInput ref={ref} initialValue="draft" pasteTargetKey="chat-1"
+        onImagePaste={onPaste} onChangeText={onText} />, { createNodeMock: () => handle });
+    });
+    const input = renderer.root.find(node => String(node.type) === 'Input');
+    expect(ref.current).toBe(handle);
+    expect(watchComposerFont).not.toHaveBeenCalled();
+    expect(watchComposerImagePaste).not.toHaveBeenCalled();
+    act(() => { input.props.onLayout({ nativeEvent: {} }); });
+    expect(watchComposerFont).toHaveBeenCalledWith(42);
+    expect(watchComposerImagePaste).toHaveBeenCalledWith(42, expect.any(Function), expect.any(Function));
+    const receive = jest.mocked(watchComposerImagePaste).mock.calls[0][1];
+    act(() => receive(image));
+    expect(onPaste).toHaveBeenCalledWith(image);
+    act(() => { input.props.onChangeText('typed text'); });
+    expect(onText).toHaveBeenCalledWith('typed text');
+    act(() => renderer.update(<ComposerInput ref={ref} initialValue="typed text" pasteTargetKey="chat-1"
+      onImagePaste={onPaste} onChangeText={onText} />));
+    expect(input.props.defaultValue).toBe('draft');
+    expect(input.props.value).toBeUndefined();
+  });
+
+  test('styles CJK without image paste enabled and detaches on unmount', () => {
+    const stopFont = jest.fn();
+    jest.mocked(watchComposerFont).mockReturnValueOnce(stopFont);
+    const onLayout = jest.fn();
+    act(() => {
+      renderer = create(<ComposerInput initialValue="中文 draft" onLayout={onLayout} />,
+        { createNodeMock: () => handle });
+    });
+    const input = renderer.root.find(node => String(node.type) === 'Input');
+    act(() => { input.props.onLayout({ nativeEvent: {} }); });
+    act(() => { input.props.onLayout({ nativeEvent: {} }); });
+    expect(watchComposerFont).toHaveBeenCalledTimes(1);
+    expect(watchComposerImagePaste).not.toHaveBeenCalled();
+    expect(onLayout).toHaveBeenCalledTimes(2);
+    expect(input.props.defaultValue).toBe('中文 draft');
+    expect(input.props.value).toBeUndefined();
+    expect(input.props.children).toBeUndefined();
+    act(() => renderer.unmount());
+    expect(stopFont).toHaveBeenCalledTimes(1);
+  });
+
+  test('rebinds after switching chats and drops callbacks from the previous binding', () => {
+    const onPaste = jest.fn();
+    act(() => {
+      renderer = create(<ComposerInput initialValue="" pasteTargetKey="chat-1" onImagePaste={onPaste} />,
+        { createNodeMock: () => handle });
+    });
+    act(() => { renderer.root.find(node => String(node.type) === 'Input').props.onLayout({ nativeEvent: {} }); });
+    const receiveOld = jest.mocked(watchComposerImagePaste).mock.calls[0][1];
+    act(() => renderer.update(<ComposerInput initialValue="" pasteTargetKey="chat-2" onImagePaste={onPaste} />));
+    expect(stop).toHaveBeenCalledTimes(1);
+    expect(watchComposerImagePaste).toHaveBeenCalledTimes(2);
+    act(() => receiveOld(image));
+    expect(onPaste).not.toHaveBeenCalled();
+    expect(discardClipboardAttachment).toHaveBeenCalledWith(image);
+    act(() => jest.mocked(watchComposerImagePaste).mock.calls[1][1](image));
+    expect(onPaste).toHaveBeenCalledWith(image);
   });
 });

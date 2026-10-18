@@ -4,7 +4,11 @@
     "appVersionSource": "local"
   },
   "build": {
+    "base": {
+      "node": "24.18.0"
+    },
     "development": {
+      "extends": "base",
       "developmentClient": true,
       "distribution": "internal"
     },
@@ -16,13 +20,22 @@
       }
     },
     "preview": {
+      "extends": "base",
       "distribution": "internal",
       "android": {
         "image": "sdk-57",
         "buildType": "apk"
       }
     },
-    "production": {}
+    "production": {
+      "extends": "base",
+      "environment": "production",
+      "ios": {
+        "env": {
+          "WHIP_DISTRIBUTION_CHANNEL": "app-store"
+        }
+      }
+    }
   },
   "submit": {
     "internal-draft": {
@@ -52,6 +65,16 @@
         "track": "production",
         "releaseStatus": "draft",
         "changesNotSentForReview": true
+      }
+    },
+    "production": {
+      "extends": "production-draft",
+      "android": {
+        "releaseStatus": "completed",
+        "changesNotSentForReview": false
+      },
+      "ios": {
+        "ascAppId": "6808226150"
       }
     }
   }

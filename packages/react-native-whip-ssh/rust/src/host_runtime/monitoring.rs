@@ -77,6 +77,7 @@ pub(super) fn set_monitoring_state(
     };
     inner.monitoring_changed.notify_one();
     if became_active {
+        agent_view::request_refresh(inner);
         inner.reconnect_wakeup.notify_one();
     }
     if !start_worker {
@@ -132,6 +133,7 @@ pub(super) fn set_monitoring_state(
                     }
                     if health_due {
                         last_health = Instant::now();
+                        tokio::spawn(measure_application_latency_inner(inner.clone()));
                     }
                     probe(inner.clone()).await;
                 }
@@ -140,6 +142,7 @@ pub(super) fn set_monitoring_state(
                     let state = inner.state.lock();
                     state.connection == HostConnectionState::Connected
                         && (reconcile_due
+                            || (health_due && inner.reverse_control.needs_resume())
                             || (health_due
                                 && (state.host_state.projection().needs_resync
                                     || state.host_state.projection().freshness
@@ -159,10 +162,21 @@ pub(super) fn set_monitoring_state(
 }
 
 async fn probe(inner: Arc<RuntimeInner>) {
-    if inner.state.lock().connection != HostConnectionState::Connected {
-        return;
+    let generation = {
+        let state = inner.state.lock();
+        if state.connection != HostConnectionState::Connected {
+            return;
+        }
+        state.generation
+    };
+    let result = measure_host_latency_inner(inner.clone()).await;
+    {
+        let state = inner.state.lock();
+        if state.generation != generation || state.connection != HostConnectionState::Connected {
+            return;
+        }
     }
-    match measure_host_latency_inner(inner.clone()).await {
+    match result {
         Ok(measurement) => {
             inner.monitoring.lock().latency_failures = 0;
             emit(HostRuntimeEvent::LatencyMeasured {

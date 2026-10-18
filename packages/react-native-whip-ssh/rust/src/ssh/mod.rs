@@ -5,8 +5,15 @@
 //! module through ordinary typed Rust handles; there is no native callback ABI
 //! between the SSH and Herdr implementations.
 
+mod browser_proxy;
 mod known_hosts;
+mod reverse_forward;
 mod session;
+
+pub(crate) use reverse_forward::RemoteForward;
+
+#[cfg(test)]
+pub(crate) use reverse_forward::tests::Fixture as ReverseForwardFixture;
 
 use std::collections::HashMap;
 use std::ffi::CStr;
@@ -25,6 +32,7 @@ use parking_lot::RwLock;
 use russh::client;
 use russh::keys::{PrivateKeyWithHashAlg, PublicKeyOrCertificate};
 use russh_sftp::client::SftpSession;
+mod directory_download;
 use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
@@ -37,7 +45,6 @@ pub use self::known_hosts::{HostKeyChallenge, KnownHostStoreError, TrustedHostKe
 use self::known_hosts::{HostKeyDecision, KnownHosts};
 
 type Sessions = RwLock<HashMap<String, Arc<Session>>>;
-type SftpSessions = RwLock<HashMap<String, Arc<SftpSession>>>;
 
 #[derive(Debug)]
 struct GroupedChannels<T>(HashMap<String, HashMap<String, T>>);
@@ -130,7 +137,7 @@ impl Drop for AndroidTraceSlice {
     }
 }
 
-fn trace_instant(name: &'static CStr) {
+pub(crate) fn trace_instant(name: &'static CStr) {
     let _trace = AndroidTraceSlice::begin(name);
 }
 
@@ -174,7 +181,6 @@ static UNIFFI_EVENT_SINK: OnceLock<RwLock<Option<Arc<dyn WhipSshEventSink>>>> = 
 // it, so bridge teardown can wait for them instead of racing them.
 static EVENT_SINK_INFLIGHT: AtomicU64 = AtomicU64::new(0);
 static SHELLS: OnceLock<Shells> = OnceLock::new();
-static SFTP_SESSIONS: OnceLock<SftpSessions> = OnceLock::new();
 static EXEC_CHANNELS: OnceLock<ExecChannels> = OnceLock::new();
 static UNIX_SOCKET_CHANNELS: OnceLock<UnixSocketChannels> = OnceLock::new();
 static FORWARDS: OnceLock<Forwards> = OnceLock::new();
@@ -420,6 +426,8 @@ struct Session {
     handle: client::Handle<RusshHandler>,
     agent: Arc<AgentState>,
     lifecycle: Arc<ConnectionLifecycle>,
+    reverse_forwards: Arc<reverse_forward::Routes>,
+    remote_home: tokio::sync::Mutex<Option<String>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -430,6 +438,8 @@ struct ConnectionDisconnect {
 struct ConnectionLifecycle {
     alive: AtomicBool,
     disconnected: watch::Sender<Option<Arc<ConnectionDisconnect>>>,
+    sftp_init: tokio::sync::Mutex<()>,
+    sftp: RwLock<Option<Arc<SftpSession>>>,
 }
 
 impl Default for ConnectionLifecycle {
@@ -438,6 +448,8 @@ impl Default for ConnectionLifecycle {
         Self {
             alive: AtomicBool::new(true),
             disconnected,
+            sftp_init: tokio::sync::Mutex::new(()),
+            sftp: RwLock::new(None),
         }
     }
 }
@@ -448,6 +460,8 @@ impl ConnectionLifecycle {
     }
 
     fn mark_disconnected(&self, reason: impl Into<String>) -> bool {
+        // Synchronize invalidation with publishing an initialized SFTP session.
+        let mut sftp = self.sftp.write();
         if self
             .alive
             .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
@@ -455,6 +469,8 @@ impl ConnectionLifecycle {
         {
             return false;
         }
+        sftp.take();
+        drop(sftp);
         self.disconnected
             .send_replace(Some(Arc::new(ConnectionDisconnect {
                 reason: reason.into(),
@@ -697,6 +713,9 @@ struct RusshHandler {
     port: u16,
     agent: Arc<AgentState>,
     lifecycle: Arc<ConnectionLifecycle>,
+    reverse_forwards: Arc<reverse_forward::Routes>,
+    #[cfg(test)]
+    fixture_key: Option<russh::keys::PublicKey>,
 }
 
 impl RusshHandler {
@@ -711,6 +730,12 @@ impl RusshHandler {
         else {
             return Err(TransportError::UnsupportedHostCertificate);
         };
+        // In-process SSH tests pin a fixture key without mutating the shared
+        // known-host store used concurrently by other domain tests.
+        #[cfg(test)]
+        if let Some(key) = &self.fixture_key {
+            return Ok(key == server_public_key);
+        }
         let decision = known_hosts()
             .read()
             .check(&self.host, self.port, server_public_key);
@@ -737,6 +762,7 @@ impl client::Handler for RusshHandler {
         reason: client::DisconnectReason<Self::Error>,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         let lifecycle = self.lifecycle.clone();
+        reverse_forward::close_routes(&self.reverse_forwards);
         async move {
             match reason {
                 client::DisconnectReason::ReceivedDisconnect(info) => {
@@ -778,6 +804,26 @@ impl client::Handler for RusshHandler {
             Ok(())
         }
     }
+
+    fn server_channel_open_forwarded_tcpip(
+        &mut self,
+        channel: russh::Channel<client::Msg>,
+        connected_address: &str,
+        connected_port: u32,
+        originator_address: &str,
+        _originator_port: u32,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        reverse_forward::accept_channel(
+            &self.reverse_forwards,
+            channel,
+            connected_address,
+            connected_port,
+            originator_address,
+            reply,
+        )
+    }
 }
 
 fn runtime() -> Result<&'static tokio::runtime::Runtime, String> {
@@ -805,9 +851,6 @@ fn shells() -> &'static Shells {
 
 fn uniffi_event_sink() -> &'static RwLock<Option<Arc<dyn WhipSshEventSink>>> {
     UNIFFI_EVENT_SINK.get_or_init(|| RwLock::new(None))
-}
-fn sftp_sessions() -> &'static SftpSessions {
-    SFTP_SESSIONS.get_or_init(|| RwLock::new(HashMap::new()))
 }
 fn exec_channels() -> &'static ExecChannels {
     EXEC_CHANNELS.get_or_init(|| RwLock::new(GroupedChannels::default()))
@@ -982,11 +1025,15 @@ async fn connect_inner(
     });
     let agent = Arc::new(AgentState::default());
     let lifecycle = Arc::new(ConnectionLifecycle::default());
+    let reverse_forwards = Arc::new(reverse_forward::Routes::default());
     let handler = RusshHandler {
         host: host.clone(),
         port,
         agent: agent.clone(),
         lifecycle: lifecycle.clone(),
+        reverse_forwards: reverse_forwards.clone(),
+        #[cfg(test)]
+        fixture_key: None,
     };
     let mut handle = if let Some(jump) = jump {
         let channel = jump
@@ -1035,6 +1082,8 @@ async fn connect_inner(
         handle,
         agent,
         lifecycle,
+        reverse_forwards,
+        remote_home: tokio::sync::Mutex::new(None),
     });
     if connection.forward_agent {
         session.agent.enabled.store(true, Ordering::Relaxed);
@@ -1391,27 +1440,50 @@ fn shell_command_for_id(
     Ok(())
 }
 
-async fn connect_sftp_on(key: &str, session: &Session) -> Result<(), TransportError> {
+async fn connect_sftp_on(session: &Session) -> Result<Arc<SftpSession>, TransportError> {
     session.ensure_alive()?;
-    if sftp_sessions().read().contains_key(key) {
-        return Ok(());
+    // Every wrapper of this connection shares the same initialization flight.
+    // Failed or cancelled attempts leave the cache empty so callers can retry.
+    let _initializing = session.lifecycle.sftp_init.lock().await;
+    session.ensure_alive()?;
+    if let Some(sftp) = session.lifecycle.sftp.read().clone() {
+        return Ok(sftp);
     }
-    let channel = session.handle.channel_open_session().await?;
-    channel.request_subsystem(true, "sftp").await?;
-    let sftp = SftpSession::new(channel.into_stream()).await?;
-    sftp_sessions()
-        .write()
-        .insert(key.to_owned(), Arc::new(sftp));
-    Ok(())
+    let sftp = tokio::select! {
+        biased;
+        disconnect = session.lifecycle.disconnected() => {
+            return Err(TransportError::SessionClosed(disconnect.reason.clone()));
+        }
+        result = async {
+            let channel = session.handle.channel_open_session().await?;
+            channel.request_subsystem(true, "sftp").await?;
+            SftpSession::new(channel.into_stream()).await.map_err(TransportError::from)
+        } => Arc::new(result?),
+    };
+    let mut cached = session.lifecycle.sftp.write();
+    session.ensure_alive()?;
+    *cached = Some(sftp.clone());
+    drop(cached);
+    Ok(sftp)
 }
 
 fn sftp_for_key(key: &str) -> Result<Arc<SftpSession>, TransportError> {
-    let sftp = sftp_sessions()
-        .read()
-        .get(key)
-        .cloned()
-        .ok_or_else(|| TransportError::InvalidRequest("SFTP is not connected".to_owned()))?;
-    Ok(sftp)
+    let session = session_for_key(key)?;
+    let cached = session.lifecycle.sftp.read();
+    session.ensure_alive()?;
+    cached
+        .clone()
+        .ok_or_else(|| TransportError::InvalidRequest("SFTP is not connected".to_owned()))
+}
+
+async fn disconnect_sftp_on(session: &Session) -> Result<(), TransportError> {
+    // Closure cannot race an initializer publishing its result.
+    let _initializing = session.lifecycle.sftp_init.lock().await;
+    let removed = session.lifecycle.sftp.write().take();
+    if let Some(sftp) = removed {
+        sftp.close().await?;
+    }
+    Ok(())
 }
 
 pub(crate) struct SftpEntry {
@@ -1435,10 +1507,13 @@ pub(crate) struct SftpMetadata {
 
 impl From<russh_sftp::protocol::FileAttributes> for SftpMetadata {
     fn from(metadata: russh_sftp::protocol::FileAttributes) -> Self {
+        // The library's is_regular/is_dir helpers test overlapping Unix mode
+        // bits (symlinks can appear regular). Use its exact FileType instead.
+        let kind = metadata.file_type();
         Self {
-            is_directory: metadata.is_dir(),
-            is_regular: metadata.is_regular(),
-            is_symlink: metadata.is_symlink(),
+            is_directory: kind.is_dir(),
+            is_regular: kind.is_file(),
+            is_symlink: kind.is_symlink(),
             size: metadata.size,
             modified_at: metadata.mtime.map(u64::from),
             accessed_at: metadata.atime.map(u64::from),
@@ -2857,6 +2932,12 @@ fn exec_channel_command_for_key(
 }
 
 async fn disconnect_key(key: String) {
+    let removed_session = { sessions().write().remove(&key) };
+    if let Some(session) = &removed_session {
+        session
+            .lifecycle
+            .mark_disconnected("SSH session closed by application");
+    }
     let unix_channels = unix_socket_channels().write().remove_owner(&key);
     for handle in unix_channels.into_iter().flat_map(HashMap::into_values) {
         let _ = handle.sender.try_send(StreamCommand::Close);
@@ -2885,10 +2966,6 @@ async fn disconnect_key(key: String) {
             let _ = cancel.send(true);
         }
     }
-    let removed_sftp = { sftp_sessions().write().remove(&key) };
-    if let Some(sftp) = removed_sftp {
-        let _ = sftp.close().await;
-    }
     let ports = forwards()
         .read()
         .keys()
@@ -2899,11 +2976,7 @@ async fn disconnect_key(key: String) {
             let _ = cancel.send(true);
         }
     }
-    let removed_session = { sessions().write().remove(&key) };
     if let Some(session) = removed_session {
-        session
-            .lifecycle
-            .mark_disconnected("SSH session closed by application");
         let _ = session
             .handle
             .disconnect(russh::Disconnect::ByApplication, "", "en")
@@ -3059,7 +3132,11 @@ pub async fn measure_ssh_host_latency(key: String) -> Result<f64, SshError> {
 
 #[uniffi::export]
 pub async fn get_ssh_remote_home(key: String) -> Result<String, SshError> {
-    execute_ssh_command(key, REMOTE_HOME_COMMAND.to_owned()).await
+    let task_key = key.clone();
+    run_ssh_task(Some(task_key), async move {
+        session_for_key(&key)?.remote_home().await
+    })
+    .await
 }
 
 #[uniffi::export]
@@ -3076,7 +3153,7 @@ pub async fn connect_ssh_sftp(key: String) -> Result<(), SshError> {
     let task_key = key.clone();
     run_ssh_task(Some(task_key), async move {
         let session = session_for_key(&key)?;
-        connect_sftp_on(&key, &session).await
+        connect_sftp_on(&session).await.map(|_| ())
     })
     .await
 }
@@ -3085,9 +3162,9 @@ pub async fn connect_ssh_sftp(key: String) -> Result<(), SshError> {
 pub async fn disconnect_ssh_sftp(key: String) -> Result<(), SshError> {
     let task_key = key.clone();
     run_ssh_task(Some(task_key), async move {
-        let removed = { sftp_sessions().write().remove(&key) };
-        if let Some(sftp) = removed {
-            sftp.close().await?;
+        let session = sessions().read().get(&key).cloned();
+        if let Some(session) = session {
+            disconnect_sftp_on(&session).await?;
         }
         Ok(())
     })

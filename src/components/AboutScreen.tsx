@@ -1,8 +1,8 @@
-import { ChevronRight, ExternalLink, Scale, Share2 } from 'lucide-react-native';
+import { ChevronRight, ExternalLink, Info, Scale, Share2 } from 'lucide-react-native';
 import * as Application from 'expo-application';
 import Constants from 'expo-constants';
 import { useEffect, useState } from 'react';
-import { Alert, Linking, Platform, Share, View } from 'react-native';
+import { Alert, Image, Linking, Platform, Share, View } from 'react-native';
 import Animated, {
   cancelAnimation,
   Easing,
@@ -12,30 +12,35 @@ import Animated, {
 } from 'react-native-reanimated';
 import { useTranslation } from 'react-i18next';
 import { LocalSvg } from 'react-native-svg/css';
+import { herdrProtocolLabel } from 'react-native-whip-ssh';
 
 import terminalFonts from '@/assets/terminal-fonts/manifest.json';
 import { bundledAsset } from '@/src/lib/bundledAsset';
 import { isUnknownRecord } from '@/src/lib/unknown';
-import { HERDR_PROTOCOL_VERSIONS_LABEL } from '@/src/lib/herdrProtocol';
+import { WHIP_REPOSITORY_URL } from '@/src/services/githubReleases';
+import { CheckForUpdates } from './CheckForUpdates';
 import { hapticPress, HerdrMark, WhipMark } from './app-ui';
 import { GlassBackdrop } from './GlassSurface';
+import { GlassIconBadge } from './GlassControls';
 import { SectionCard, SectionCardHeader } from './CollapsibleSectionCard';
 import { Button } from './ui/button';
 import { Icon } from './ui/icon';
 import { Text } from './ui/text';
 
-export const WHIP_RELEASES_URL = 'https://github.com/kosumic/whip';
-export const WHIP_REPOSITORY_URL = 'https://github.com/kosumic/whip';
+export { WHIP_REPOSITORY_URL } from '@/src/services/githubReleases';
 export const HERDR_WEBSITE_URL = 'https://herdr.dev/';
 export const X_PROFILE_URL = 'https://x.com/Kosumi1989';
+export const WHIP_INSTALL_URL = 'https://kosumic.github.io/whip/';
 const ABOUT_EXPAND_DURATION = 340;
 const ABOUT_COLLAPSE_DURATION = 260;
+const INSTALL_QR_SIZE = 240;
 
 export function AboutSection({ onOpenLicenses }: { onOpenLicenses: () => void }) {
   const [expanded, setExpanded] = useState(false);
   const [contentMounted, setContentMounted] = useState(false);
   const [contentMeasured, setContentMeasured] = useState(false);
   const { t } = useTranslation();
+  const supportedHerdrProtocols = herdrProtocolLabel();
   const fallbackFont = Platform.select({
     ios: terminalFonts.fallback.ios,
     default: terminalFonts.fallback.android,
@@ -76,15 +81,15 @@ export function AboutSection({ onOpenLicenses }: { onOpenLicenses: () => void })
       Alert.alert(t('about.commitError'), String(error));
     });
   };
-  const openReleases = () => {
-    Linking.openURL(WHIP_RELEASES_URL).catch(error => {
+  const openRepository = () => {
+    Linking.openURL(WHIP_REPOSITORY_URL).catch(error => {
       Alert.alert(t('about.githubError'), String(error));
     });
   };
-  const shareReleases = () => {
+  const shareRepository = () => {
     Share.share({
       title: t('about.shareTitle'),
-      message: t('about.shareMessage', { url: WHIP_RELEASES_URL }),
+      message: t('about.shareMessage', { url: WHIP_REPOSITORY_URL }),
     }).catch(error => {
       Alert.alert(t('about.shareError'), String(error));
     });
@@ -107,12 +112,26 @@ export function AboutSection({ onOpenLicenses }: { onOpenLicenses: () => void })
       Alert.alert(t('about.shareHerdrError'), String(error));
     });
   };
+  const openInstallLink = () => {
+    Linking.openURL(WHIP_INSTALL_URL).catch(error => {
+      Alert.alert(t('about.installLinkError'), String(error));
+    });
+  };
+  const shareInstallLink = () => {
+    Share.share({
+      title: t('about.shareApp'),
+      message: t('about.installShareMessage', { url: WHIP_INSTALL_URL }),
+    }).catch(error => {
+      Alert.alert(t('about.shareError'), String(error));
+    });
+  };
 
   return (
     <View className="px-4 py-2">
       <SectionCard>
       <SectionCardHeader
         title={t('about.title')}
+        icon={Info}
         description={t('about.copy')}
         accessibilityLabel={expanded ? t('about.collapse') : t('about.expand')}
         expanded={expanded}
@@ -141,23 +160,23 @@ export function AboutSection({ onOpenLicenses }: { onOpenLicenses: () => void })
               className="min-h-[76px] min-w-0 flex-1 justify-start overflow-hidden rounded-lg border border-white/30 bg-transparent px-4 py-4 dark:border-white/10"
               size="content"
               variant="outline"
-              onPress={hapticPress(openReleases)}>
+              onPress={hapticPress(openRepository)}>
               <GlassBackdrop shapeClassName="rounded-lg" />
               <View className="size-11 items-center justify-center rounded-full bg-black">
                 <GitHubMark size={22} />
               </View>
               <View className="min-w-0 flex-1">
                 <Text className="text-[15px] font-semibold leading-5">{t('about.githubRepository')}</Text>
-                <Text className="mt-0.5 text-xs leading-[17px] text-muted-foreground" numberOfLines={1}>kosumic/whip</Text>
+                <Text className="mt-0.5 text-xs leading-[17px] text-muted-foreground" numberOfLines={1}>{WHIP_REPOSITORY_URL.replace('https://github.com/', '')}</Text>
               </View>
               <Icon as={ExternalLink} className="text-muted-foreground" size={19} />
             </Button>
             <Button
-              accessibilityLabel={t('about.shareReleases')}
+              accessibilityLabel={t('about.shareRepository')}
               className="w-14 self-stretch overflow-hidden rounded-lg border border-white/30 bg-transparent px-0 dark:border-white/10"
               size="content"
               variant="outline"
-              onPress={hapticPress(shareReleases)}>
+              onPress={hapticPress(shareRepository)}>
               <GlassBackdrop shapeClassName="rounded-lg" />
               <Icon as={Share2} size={21} />
             </Button>
@@ -223,6 +242,35 @@ export function AboutSection({ onOpenLicenses }: { onOpenLicenses: () => void })
                 <Icon as={ExternalLink} size={12} />
               </Button>
             ) : null}
+            <CheckForUpdates installedVersion={whipVersion} />
+          </View>
+
+          <View className="mt-9 items-center">
+            <Text className="mb-3 text-sm font-semibold text-muted-foreground">{t('about.shareApp')}</Text>
+            <Image
+              accessibilityLabel={t('about.installQr')}
+              accessibilityRole="image"
+              source={bundledAsset(require('../../site/whip-install-qr.png'))}
+              resizeMode="contain"
+              style={{ width: INSTALL_QR_SIZE, height: INSTALL_QR_SIZE, maxWidth: '100%' }}
+            />
+            <Button
+              accessibilityLabel={t('about.openInstallLink')}
+              accessibilityRole="link"
+              className="mt-2 min-h-11 max-w-full gap-1 px-1"
+              size="content"
+              variant="link"
+              onPress={hapticPress(openInstallLink)}>
+              <Text className="shrink text-center text-sm underline">{WHIP_INSTALL_URL}</Text>
+              <Icon as={ExternalLink} size={15} />
+            </Button>
+            <Button
+              accessibilityLabel={t('about.shareApp')}
+              className="mt-2 w-full"
+              onPress={hapticPress(shareInstallLink)}>
+              <Icon as={Share2} size={18} />
+              <Text>{t('about.shareApp')}</Text>
+            </Button>
           </View>
 
           <Text className="mb-3 mt-9 px-1 text-sm font-semibold text-muted-foreground">{t('about.legal')}</Text>
@@ -233,9 +281,9 @@ export function AboutSection({ onOpenLicenses }: { onOpenLicenses: () => void })
             variant="ghost"
             onPress={hapticPress(onOpenLicenses)}>
             <GlassBackdrop shapeClassName="rounded-lg" />
-            <View className="size-10 items-center justify-center rounded-full bg-primary/10">
+            <GlassIconBadge className="bg-primary/10">
               <Icon as={Scale} className="text-primary" size={20} />
-            </View>
+            </GlassIconBadge>
             <View className="min-w-0 flex-1">
               <Text className="text-[15px] font-semibold leading-5">{t('licenses.title')}</Text>
               <Text className="mt-0.5 text-xs leading-[17px] text-muted-foreground">{t('about.licensesCopy')}</Text>
@@ -245,11 +293,8 @@ export function AboutSection({ onOpenLicenses }: { onOpenLicenses: () => void })
 
           <Text className="mb-3 mt-9 px-1 text-sm font-semibold text-muted-foreground">{t('about.compatibility')}</Text>
           <View className="border-t border-border">
-            <AboutRow label={t('about.supportedHerdr')} value={t('common.protocol', { version: HERDR_PROTOCOL_VERSIONS_LABEL })} />
+            <AboutRow label={t('about.supportedHerdr')} value={t('common.protocol', { version: supportedHerdrProtocols })} />
           </View>
-          <Text className="mt-3 px-1 text-xs leading-[18px] text-muted-foreground">
-            {t('about.compatibilityCopy', { versions: HERDR_PROTOCOL_VERSIONS_LABEL })}
-          </Text>
 
           <Text className="mb-3 mt-8 px-1 text-sm font-semibold text-muted-foreground">{t('about.terminalFonts')}</Text>
           <View className="border-t border-border">

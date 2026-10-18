@@ -23,6 +23,7 @@ class MockNativeHostProfileStore {
       forwardAgent: profile.authMode === 'key' && Boolean(profile.forwardAgent),
       herdrCommand: profile.herdrCommand.trim() || 'herdr',
       herdrSocketPath: profile.herdrSocketPath.trim(), sessionName: profile.sessionName.trim(),
+      agentInstructions: profile.agentInstructions || '',
       createdAt: previousCreatedAt || profile.createdAt || now, updatedAt: now,
     };
     if (!host.id || !host.host || !host.username) throw new Error('invalid host profile');
@@ -593,6 +594,10 @@ function createMockWhipSshModule() {
     createHostRuntime: api.createHostRuntime,
     getHostRuntime: api.getHostRuntime,
     disconnectHostRuntime: api.disconnectHostRuntime,
+    readCachedAgentTranscript: jest.fn(),
+    HerdrAgentKind: { Claude: 0, Codex: 1, OpenCode: 2 },
+    ReverseControlState: { Off: 0, RestartRequired: 1, Recovering: 2, Connected: 3 },
+    subscribeReverseControlEvents: jest.fn(() => () => {}),
     NativeHostProfileStore: MockNativeHostProfileStore,
     NativeKnownHostStore: MockNativeKnownHostStore,
   };

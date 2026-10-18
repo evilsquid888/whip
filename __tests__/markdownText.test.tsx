@@ -1,4 +1,10 @@
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
+import Clipboard from '@react-native-clipboard/clipboard';
+import * as Haptics from 'expo-haptics';
+import { ChatSearchQuery } from '../src/components/SearchText';
+import { NativeCodeBlock } from '../src/components/NativeCodeBlock';
+import { ChatComposerSelection } from '../src/components/ChatComposerSelection';
+import { SelectableChatText } from '../src/components/SelectableChatText';
 
 import {
   MarkdownText,
@@ -12,6 +18,10 @@ jest.mock('react-native-css-interop/jsx-runtime', () =>
 jest.mock('react-native-enriched-markdown', () => ({
   EnrichedMarkdownText: 'EnrichedMarkdownText',
 }));
+jest.mock('../src/components/MermaidPreview', () => ({ MermaidPreview: 'MermaidPreview' }));
+jest.mock('../src/components/SvgPreview', () => ({ SvgPreview: 'SvgPreview' }));
+jest.mock('@rn-primitives/portal', () => ({ Portal: 'Portal' }));
+jest.mock('react-native', () => ({ View: 'View', Text: 'Text' }));
 jest.mock('react-i18next', () => ({
   useTranslation: () => ({ t: (key: string) => `translated:${key}` }),
 }));
@@ -49,9 +59,158 @@ jest.mock('../src/theme', () => ({
 describe('MarkdownText', () => {
   let renderer: ReactTestRenderer;
 
+  beforeEach(() => {
+    jest.mocked(Clipboard.setString).mockClear();
+    jest.mocked(Haptics.notificationAsync).mockClear();
+  });
+
   afterEach(() => {
     act(() => renderer?.unmount());
+    jest.useRealTimers();
   });
+
+  test('renders chat diagrams between native Markdown and preserves source for failures', () => {
+    const source = '```mermaid\nflowchart LR\nA --> B\n```\n';
+    const onLinkPress = jest.fn();
+    act(() => {
+      renderer = create(<MarkdownText content={`Before\n\n${source}\n[After](https://example.com)`} variant="transcript" onLinkPress={onLinkPress} />);
+    });
+    const diagram = renderer.root.find(node => String(node.type) === 'MermaidPreview');
+    expect(diagram.props).toMatchObject({ content: 'flowchart LR\nA --> B', inline: true });
+    expect(diagram.props.fallback.props.markdown).toBe(source);
+    const text = renderer.root.findAll(node => String(node.type) === 'EnrichedMarkdownText');
+    expect(text.map(node => node.props.markdown)).toEqual(['Before\n\n', '\n[After](https://example.com)']);
+    expect(text[1].props.onLinkPress).toBe(onLinkPress);
+  });
+
+  test('waits for a closing fence while streaming, then renders the diagram', () => {
+    const content = '```mermaid\nflowchart LR\nA --> B\n';
+    act(() => { renderer = create(<MarkdownText content={content} streaming variant="transcript" />); });
+    expect(renderer.root.findAll(node => String(node.type) === 'MermaidPreview')).toHaveLength(0);
+    expect(renderer.root.find(node => String(node.type) === 'EnrichedMarkdownText').props.markdown).toBe(content);
+    act(() => { renderer.update(<MarkdownText content={`${content}\`\`\`\nMore`} streaming variant="transcript" />); });
+    expect(renderer.root.find(node => String(node.type) === 'MermaidPreview').props.content).toBe('flowchart LR\nA --> B');
+    expect(renderer.root.find(node => String(node.type) === 'EnrichedMarkdownText').props.streamingAnimation).toBe(true);
+  });
+
+  test('preserves Mermaid labels verbatim while normalizing surrounding rich text', () => {
+    const diagram = String.raw`flowchart LR
+A["<b>Start</b>"] --> B["\(value\)"]`;
+    act(() => {
+      renderer = create(<MarkdownText content={`<b>Before</b>\n\n~~~mermaid\n${diagram}\n~~~~`} variant="transcript" />);
+    });
+    expect(renderer.root.find(node => String(node.type) === 'MermaidPreview').props.content).toBe(diagram);
+    expect(renderer.root.find(node => String(node.type) === 'EnrichedMarkdownText').props.markdown).toContain('**Before**');
+  });
+
+  test('keeps Mermaid examples in tool output as selectable native code', () => {
+    const content = '```mermaid\nflowchart LR\nA --> B\n```';
+    act(() => { renderer = create(<MarkdownText content={content} variant="tool" />); });
+    expect(renderer.root.findAll(node => String(node.type) === 'MermaidPreview')).toHaveLength(0);
+    expect(renderer.root.find(node => String(node.type) === 'EnrichedMarkdownText').props.markdown).toBe(content);
+  });
+
+  test('renders SVG alongside Mermaid without normalizing XML and preserves fallback source', () => {
+    const svg = '<svg viewBox="0 0 100 50"><text>&lt;b&gt; \\(value\\)</text></svg>';
+    const source = `~~~svg\n${svg}\n~~~\n`;
+    act(() => {
+      renderer = create(<MarkdownText content={`<b>Before</b>\n\n${source}\n\`\`\`mermaid\nflowchart LR\nA --> B\n\`\`\``} variant="transcript" />);
+    });
+    const preview = renderer.root.find(node => String(node.type) === 'SvgPreview');
+    expect(preview.props).toMatchObject({ content: svg, inline: true });
+    expect(preview.props.fallback.props.markdown).toBe(source);
+    expect(renderer.root.find(node => String(node.type) === 'MermaidPreview').props.content).toBe('flowchart LR\nA --> B');
+    expect(renderer.root.findAll(node => String(node.type) === 'EnrichedMarkdownText')[0].props.markdown).toContain('**Before**');
+  });
+
+  test('waits for complete SVG fences while streaming and keeps tool examples as code', () => {
+    const content = '```svg\n<svg viewBox="0 0 10 10"><rect width="10" height="10" /></svg>\n';
+    act(() => { renderer = create(<MarkdownText content={content} streaming variant="transcript" />); });
+    expect(renderer.root.findAll(node => String(node.type) === 'SvgPreview')).toHaveLength(0);
+    expect(renderer.root.find(node => String(node.type) === 'EnrichedMarkdownText').props.markdown).toBe(content);
+    const complete = `${content}\`\`\``;
+    act(() => { renderer.update(<MarkdownText content={complete} streaming variant="transcript" />); });
+    expect(renderer.root.findAll(node => String(node.type) === 'SvgPreview')).toHaveLength(1);
+    act(() => { renderer.update(<MarkdownText content={complete} variant="tool" />); });
+    expect(renderer.root.findAll(node => String(node.type) === 'SvgPreview')).toHaveLength(0);
+    expect(renderer.root.find(node => String(node.type) === 'EnrichedMarkdownText').props.markdown).toBe(complete);
+  });
+
+  test('passes highlights separately from Markdown, preserving formatting and code content', () => {
+    const content = '**needle** and `needle`\n\n```ts\nconst needle = "needle";\n```';
+    act(() => { renderer = create(<ChatSearchQuery.Provider value="needle"><MarkdownText content={content} /></ChatSearchQuery.Provider>); });
+    const native = () => renderer.root.find(node => String(node.type) === 'EnrichedMarkdownText');
+    expect(native().props.searchQuery).toBe('needle');
+    expect(native().props.markdown).toBe(content);
+    act(() => { renderer.update(<MarkdownText content={content} />); });
+    expect(native().props.searchQuery).toBe('');
+    expect(native().props.markdown).toBe(content);
+  });
+
+  test('adds only the selected Markdown text to the composer without copying it', () => {
+    const addToComposer = jest.fn();
+    act(() => {
+      renderer = create(<ChatComposerSelection.Provider value={addToComposer}>
+        <MarkdownText content="Before **selected text** after" />
+        <NativeCodeBlock content="git status" language="bash" />
+      </ChatComposerSelection.Provider>);
+    });
+    const native = renderer.root.findAll(node => String(node.type) === 'EnrichedMarkdownText');
+    for (const text of native) {
+      const [action] = text.props.contextMenuItems;
+      expect(action.text).toBe('translated:terminal.addToChatComposer');
+      act(() => { action.onPress({ text: 'selected text', selection: { start: 7, end: 20 } }); });
+    }
+    expect(addToComposer.mock.calls).toEqual([['selected text'], ['selected text']]);
+    expect(Clipboard.setString).not.toHaveBeenCalled();
+    act(() => renderer.update(<MarkdownText content="Outside chat" />));
+    expect(renderer.root.find(node => String(node.type) === 'EnrichedMarkdownText').props.contextMenuItems).toBeUndefined();
+  });
+
+  test('plain chat text keeps literal Markdown, indentation, Unicode, and line breaks with selection actions', () => {
+    const text = '    **literal** <tag> &amp; $x$\n\n中文 😀';
+    const addToComposer = jest.fn();
+    act(() => {
+      renderer = create(<ChatComposerSelection.Provider value={addToComposer}>
+        <ChatSearchQuery.Provider value="literal">
+          <SelectableChatText text={text} color="#faf5ff" />
+        </ChatSearchQuery.Provider>
+      </ChatComposerSelection.Provider>);
+    });
+    const props = renderer.root.find(node => String(node.type) === 'EnrichedMarkdownText').props;
+    const decoded = props.markdown.replace(/&#(\d+);/g, (_match: string, code: string) => String.fromCodePoint(Number(code)));
+    expect(decoded).toBe(text);
+    expect(props.markdown).not.toContain('**');
+    expect(props).toMatchObject({
+      selectable: true, searchQuery: 'literal', flavor: 'commonmark',
+      md4cFlags: { latexMath: false, hardSoftBreaks: true, preserveBlankLines: true },
+      markdownStyle: { paragraph: { color: '#faf5ff', fontFamily: 'Regular', fontSize: 14, lineHeight: 20, marginBottom: 0 } },
+      selectionMenuConfig: { copyAsMarkdown: { enabled: false } },
+    });
+    act(() => { props.contextMenuItems[0].onPress({ text: '中文 😀', selection: { start: text.length - 5, end: text.length } }); });
+    expect(addToComposer).toHaveBeenCalledWith('中文 😀');
+    expect(Clipboard.setString).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    'git status',
+    'rg --files src',
+    'git status &&\n  printf "%s\\n" "$HOME"',
+    'cat <<\'EOF\'\n```bash\necho literal\n```\n<p>not markup</p>\n\\(not math\\)\nEOF',
+  ])('renders %s as a native Bash block with search and selection', content => {
+    act(() => {
+      renderer = create(<ChatSearchQuery.Provider value="git"><NativeCodeBlock content={content} language="bash" /></ChatSearchQuery.Provider>);
+    });
+    const props = renderer.root.find(node => String(node.type) === 'EnrichedMarkdownText').props;
+    const fence = content.includes('```') ? '````' : '```';
+    expect(props.markdown).toBe(`${fence}bash\n${content}\n${fence}`);
+    expect(props).toMatchObject({ flavor: 'github', searchQuery: 'git', selectable: true, allowTrailingMargin: false });
+    expect(props.markdownStyle.codeBlock).toMatchObject({
+      fontFamily: 'Mono', fontSize: 11, lineHeight: 17, marginTop: 0, marginBottom: 0,
+      syntaxColors: { function: '#0969da', constant: '#9a6700' },
+    });
+  });
+
 
   function markdownProps(streaming = false, content = String.raw`H~2~O x^2^ ==important== \(x\)`) {
     act(() => {
@@ -119,5 +278,23 @@ describe('MarkdownText', () => {
       codeBlockMode: 'progressive',
       tableMode: 'progressive',
     });
+  });
+
+  test('confirms native code copies with haptics without a toast or feedback timer', () => {
+    jest.useFakeTimers();
+    const props = markdownProps(false, '```sh\necho hello\n```');
+    const portals = () => renderer.root.findAll(node => String(node.type) === 'Portal');
+    expect(portals()).toHaveLength(0);
+    act(() => { props.onCopyPress({ code: 'echo hello', language: 'sh' }); });
+    expect(Haptics.notificationAsync).toHaveBeenCalledTimes(1);
+    expect(Haptics.notificationAsync).toHaveBeenCalledWith(Haptics.NotificationFeedbackType.Success);
+    expect(Clipboard.setString).not.toHaveBeenCalled();
+    expect(portals()).toHaveLength(0);
+    expect(jest.getTimerCount()).toBe(0);
+    act(() => { props.onCopyPress({ code: 'echo hello', language: 'sh' }); });
+    expect(Haptics.notificationAsync).toHaveBeenCalledTimes(2);
+    expect(portals()).toHaveLength(0);
+    expect(Clipboard.setString).not.toHaveBeenCalled();
+    expect(jest.getTimerCount()).toBe(0);
   });
 });

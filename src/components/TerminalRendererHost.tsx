@@ -1,3 +1,4 @@
+import { parseTerminalSearchResult, type TerminalSearchResult } from '../lib/terminalSearch';
 import {
   forwardRef,
   useCallback,
@@ -32,6 +33,7 @@ import {
   type TerminalVisualViewport,
 } from '../lib/terminalRenderer';
 import { prepareTerminalPaste } from '../lib/terminalPaste';
+import { parseTerminalSelection } from '../lib/terminalSelection';
 import {
   resumedTerminalScrollOffset,
   type TerminalResumeViewport,
@@ -88,6 +90,7 @@ import type { PaneScrollInfo } from '../types';
 
 const FRAME_CHUNK_SIZE = 16_384;
 const TRANSCRIPT_CHUNK_SIZE = 16_384;
+const DICTATION_CONTEXT_TIMEOUT_MS = 1_000;
 const WEBVIEW_CONTAINER_STYLE = { backgroundColor: 'transparent' } as const;
 const IOS_TERMINAL_ASSET_DIRECTORY = IOS_TERMINAL_ASSETS?.directoryURL || '';
 const runtimeProcess: unknown = process;
@@ -159,6 +162,7 @@ interface RendererEntry {
   fontPreference: number;
   fontSize: number;
   protocolState: TerminalProtocolState;
+  applicationMouseCapture: boolean;
   alternateScreen: boolean;
   arbitration: TerminalArbitration;
   writableWaiters: Array<{
@@ -184,11 +188,12 @@ export interface TerminalRendererHandle {
   focus: () => void;
   input: (data: string) => boolean;
   paste: (data: string) => void;
+  readContext: () => Promise<string>;
   retry: () => void;
   scanLinks: () => void;
   scroll: (direction: 'up' | 'down', lines: number) => void;
   scrollToVisualBottom: () => void;
-  search: (query: string, caseSensitive: boolean, regex: boolean, direction: number) => void;
+  search: (query: string, caseSensitive: boolean, regex: boolean, direction: number, selected?: number) => void;
   setForcedMouseInput: (enabled: boolean) => void;
   setKeyboardEnabled: (enabled: boolean) => void;
   submitPastes: (
@@ -213,16 +218,24 @@ interface Props {
   onReady?: () => void;
   onInput: (target: TerminalRenderTarget, data: string) => void | Promise<void>;
   onScroll: (target: TerminalRenderTarget, direction: 'up' | 'down', lines: number) => void;
+  onScrollActivity?: (target: TerminalRenderTarget, scrolling: boolean) => void;
   onOfflineScroll: (target: TerminalRenderTarget, scroll: PaneScrollInfo) => void;
   onOfflineSnapshot: (targetKey: string, transcript: string) => void;
-  onSearchResult: (count: number, index: number, invalid: boolean) => void;
+  onSearchResult: (result: TerminalSearchResult) => void;
   onLinksScanned: (links: string[]) => void;
   onOpenLink: (link: string) => void;
   onPaste: (target: TerminalRenderTarget, text: string) => void;
+  onAddToComposer?: (target: TerminalRenderTarget, text: string) => void;
+  addToComposerLabel?: string;
   onBufferModeChange: (target: TerminalRenderTarget, alternate: boolean) => void;
   onVisualScrollState: (
     target: TerminalRenderTarget,
     atVisualBottom: boolean,
+  ) => void;
+  onCursorGeometry?: (
+    target: TerminalRenderTarget,
+    bottom: number | null,
+    viewportHeight: number,
   ) => void;
   onProtocolStateChange: (target: TerminalRenderTarget, state: TerminalProtocolState) => void;
   onTitleChange: (target: TerminalRenderTarget, title: string) => void;
@@ -250,14 +263,18 @@ export const TerminalRendererHost = forwardRef<TerminalRendererHandle, Props>(fu
   onReady,
   onInput,
   onScroll,
+  onScrollActivity,
   onOfflineScroll,
   onOfflineSnapshot,
   onSearchResult,
   onLinksScanned,
   onOpenLink,
   onPaste,
+  onAddToComposer,
+  addToComposerLabel,
   onBufferModeChange,
   onVisualScrollState,
+  onCursorGeometry,
   onProtocolStateChange,
   onTitleChange,
   onFontSizeChange,
@@ -275,7 +292,10 @@ export const TerminalRendererHost = forwardRef<TerminalRendererHandle, Props>(fu
   const offlineTranscriptRef = useRef(offlineTranscript);
   const offlineScrollRef = useRef(offlineScroll);
   const visualViewportRef = useRef(visualViewport);
+  const previousFontPreference = useRef(preferences.fontSize);
   const serializationTraces = useRef(new Map<string, AppPerformanceTrace>());
+  const contextRequests = useRef(new Map<number, { key: string; complete: (text: string) => void }>());
+  const contextSequence = useRef(0);
   activeKey.current = activeTarget?.key || null;
   offlineTranscriptRef.current = offlineTranscript;
   offlineScrollRef.current = offlineScroll;
@@ -285,14 +305,20 @@ export const TerminalRendererHost = forwardRef<TerminalRendererHandle, Props>(fu
   const reportResidencyEnd = useEffectEvent((...args: Parameters<TerminalResidencyEnd>) => onResidencyEnd?.(...args));
   const reportInput = useEffectEvent(onInput);
   const reportScroll = useEffectEvent(onScroll);
+  const reportScrollActivity = useEffectEvent((...args: Parameters<NonNullable<Props['onScrollActivity']>>) =>
+    onScrollActivity?.(...args));
   const reportOfflineScroll = useEffectEvent(onOfflineScroll);
   const reportOfflineSnapshot = useEffectEvent(onOfflineSnapshot);
   const reportSearch = useEffectEvent(onSearchResult);
   const reportLinks = useEffectEvent(onLinksScanned);
   const reportOpenLink = useEffectEvent(onOpenLink);
   const reportPaste = useEffectEvent(onPaste);
+  const reportAddToComposer = useEffectEvent((target: TerminalRenderTarget, text: string) =>
+    onAddToComposer?.(target, text));
   const reportBufferMode = useEffectEvent(onBufferModeChange);
   const reportVisualScrollState = useEffectEvent(onVisualScrollState);
+  const reportCursorGeometry = useEffectEvent((...args: Parameters<NonNullable<Props['onCursorGeometry']>>) =>
+    onCursorGeometry?.(...args));
   const reportProtocolState = useEffectEvent(onProtocolStateChange);
   const reportTitle = useEffectEvent(onTitleChange);
   const reportFontSize = useEffectEvent(onFontSizeChange);
@@ -368,10 +394,16 @@ export const TerminalRendererHost = forwardRef<TerminalRendererHandle, Props>(fu
   }, [inject, relinquishController]);
 
   const pruneEntries = useCallback((protectedKeys: ReadonlySet<string>) => {
+    // SSH shells have no server-side terminal history to reattach to. Evicting
+    // their renderer closes the PTY, so retain it until its tab is closed.
+    const retainedKeys = new Set(protectedKeys);
+    for (const [key, entry] of entries.current) {
+      if (entry.target.session.kind === 'ssh') retainedKeys.add(key);
+    }
     const evictions = terminalRendererEvictionKeys(
       [...entries.current.keys()],
       preferences.xtermCacheCapacity,
-      protectedKeys,
+      retainedKeys,
     );
     for (const key of evictions) {
       const entry = entries.current.get(key);
@@ -387,6 +419,7 @@ export const TerminalRendererHost = forwardRef<TerminalRendererHandle, Props>(fu
       : entry.target.scroll;
     inject(`window.herdrConfigure(${JSON.stringify(entry.target.key)}, ${JSON.stringify({
       ...preferences,
+      selectionComposerLabel: addToComposerLabel,
       fontSize: entry.fontSize,
       backgroundImageUri: null,
       ...scrollbackMode,
@@ -401,8 +434,8 @@ export const TerminalRendererHost = forwardRef<TerminalRendererHandle, Props>(fu
         : undefined,
       scrollOffsetFromBottom: visualScroll?.offset_from_bottom,
       maxScrollOffsetFromBottom: visualScroll?.max_offset_from_bottom,
-    })}); window.herdrSetRenderDrop(${JSON.stringify(entry.target.key)}, ${TERMINAL_RENDER_DROP_ENABLED});`);
-  }, [inject, preferences]);
+    })}); window.herdrSetApplicationMouseCapture(${JSON.stringify(entry.target.key)}, ${entry.applicationMouseCapture}); window.herdrSetRenderDrop(${JSON.stringify(entry.target.key)}, ${TERMINAL_RENDER_DROP_ENABLED});`);
+  }, [addToComposerLabel, inject, preferences]);
 
   const syncOfflineTranscript = useCallback((
     entry: RendererEntry,
@@ -681,8 +714,15 @@ export const TerminalRendererHost = forwardRef<TerminalRendererHandle, Props>(fu
         if (event.type === 'protocol-state') {
           entry.protocolState = event.state;
           reportProtocolState(entry.target, event.state);
+        } else if (event.type === 'mouse-capture') {
+          entry.applicationMouseCapture = event.enabled;
+          inject(`window.herdrSetApplicationMouseCapture(${JSON.stringify(entry.target.key)}, ${event.enabled});`);
         } else if (event.type === 'clipboard-write') {
-          Clipboard.setString(event.text);
+          if (hostReady.current && entry.rendererReady && appState.current === 'active') {
+            inject(`window.herdrClipboardWrite(${JSON.stringify(entry.target.key)}, ${JSON.stringify(event.text)});`);
+          } else {
+            Clipboard.setString(event.text);
+          }
         } else if (event.type === 'title') {
           reportTitle(entry.target, event.title);
         }
@@ -717,6 +757,7 @@ export const TerminalRendererHost = forwardRef<TerminalRendererHandle, Props>(fu
       scheduleReconnect(message, false);
     });
   }, [
+    inject,
     injectFrame,
     relinquishController,
     requestFullFrame,
@@ -746,6 +787,7 @@ export const TerminalRendererHost = forwardRef<TerminalRendererHandle, Props>(fu
         protocolState: {
           kittyKeyboardReportAll: false,
         },
+        applicationMouseCapture: false,
         alternateScreen: false,
         arbitration: new TerminalArbitration(),
         writableWaiters: [],
@@ -843,6 +885,21 @@ export const TerminalRendererHost = forwardRef<TerminalRendererHandle, Props>(fu
     },
     changeFontSize: delta => activeCall('herdrChangeFontSize', [delta]),
     clearSearch: () => activeCall('herdrClearSearch'),
+    readContext: () => {
+      const key = activeKey.current;
+      if (!key || !hostReady.current) return Promise.resolve('');
+      const id = ++contextSequence.current;
+      return new Promise(resolve => {
+        const timeout = setTimeout(() => complete(''), DICTATION_CONTEXT_TIMEOUT_MS);
+        const complete = (text: string) => {
+          clearTimeout(timeout);
+          contextRequests.current.delete(id);
+          resolve(text);
+        };
+        contextRequests.current.set(id, { key, complete });
+        activeCall('herdrReadContext', [id]);
+      });
+    },
     fit: () => activeCall('herdrFit'),
     focus: () => {
       webView.current?.requestFocus();
@@ -935,9 +992,9 @@ export const TerminalRendererHost = forwardRef<TerminalRendererHandle, Props>(fu
       }
       activeCall('herdrScrollToVisualBottom');
     },
-    search: (query, caseSensitive, regex, direction) => activeCall(
+    search: (query, caseSensitive, regex, direction, selected) => activeCall(
       'herdrSearch',
-      [query, caseSensitive, regex, direction],
+      [query, caseSensitive, regex, direction, selected],
     ),
     setForcedMouseInput: enabled => activeCall(
       'herdrSetForcedMouseInput',
@@ -1037,13 +1094,34 @@ export const TerminalRendererHost = forwardRef<TerminalRendererHandle, Props>(fu
   ]);
 
   useEffect(() => {
-    for (const entry of entries.current.values()) {
-      if (entry.fontPreference !== preferences.fontSize) {
+    const fontPreferenceChanged = previousFontPreference.current !== preferences.fontSize;
+    previousFontPreference.current = preferences.fontSize;
+    const fontOverrideKeys = new Set<string>();
+    for (const [key, entry] of entries.current) {
+      if (
+        entry.target.session.fontSize !== undefined
+        || entry.fontSize !== entry.fontPreference
+      ) {
+        fontOverrideKeys.add(key);
+      }
+      if (
+        fontPreferenceChanged
+        || entry.fontPreference !== preferences.fontSize
+      ) {
         entry.fontPreference = preferences.fontSize;
         entry.fontSize = preferences.fontSize;
-        reportFontSize(entry.target, entry.fontSize);
       }
       if (hostReady.current) configureEntry(entry);
+    }
+    if (fontPreferenceChanged) {
+      for (const [key, target] of knownTargets.current) {
+        if (
+          target.session.fontSize !== undefined
+          || fontOverrideKeys.has(key)
+        ) {
+          reportFontSize(target, preferences.fontSize);
+        }
+      }
     }
   }, [configureEntry, preferences]);
 
@@ -1194,6 +1272,7 @@ export const TerminalRendererHost = forwardRef<TerminalRendererHandle, Props>(fu
 
   useEffect(() => () => {
     resumeScrolls.current.clear();
+    for (const request of contextRequests.current.values()) request.complete('');
     for (const entry of entries.current.values()) {
       reportResidencyEnd(entry.target, TerminalResidencyEndReason.Evicted);
       if (
@@ -1215,6 +1294,13 @@ export const TerminalRendererHost = forwardRef<TerminalRendererHandle, Props>(fu
   const handleMessage = async (event: WebViewMessageEvent) => {
     const message = parseTerminalWebMessage(event.nativeEvent.data);
     if (!message) return;
+    if (message.type === 'dictation-context' && typeof message.requestId === 'number') {
+      const request = contextRequests.current.get(message.requestId);
+      if (request && request.key === message.key) {
+        request.complete(request.key === activeKey.current && typeof message.text === 'string' ? message.text : '');
+      }
+      return;
+    }
     if (message.type === 'ready') {
       const reloaded = hostReady.current;
       hostReady.current = true;
@@ -1452,6 +1538,9 @@ export const TerminalRendererHost = forwardRef<TerminalRendererHandle, Props>(fu
       } catch (reason) {
         reportError(entry.target, String(reason));
       }
+    } else if (message.type === 'scroll-activity') {
+      if (typeof message.scrolling !== 'boolean') return;
+      reportScrollActivity(entry.target, message.scrolling);
     } else if (message.type === 'offline-scroll') {
       if (
         !isFiniteNumber(message.offsetFromBottom)
@@ -1480,6 +1569,12 @@ export const TerminalRendererHost = forwardRef<TerminalRendererHandle, Props>(fu
     } else if (message.type === 'visual-scroll-state') {
       if (typeof message.atVisualBottom !== 'boolean') return;
       reportVisualScrollState(entry.target, message.atVisualBottom);
+    } else if (message.type === 'cursor-geometry') {
+      if ((message.bottom !== null && !isFiniteNumber(message.bottom))
+        || !isFiniteNumber(message.viewportHeight)) return;
+      if (entry.target.key === activeKey.current) {
+        reportCursorGeometry(entry.target, message.bottom, message.viewportHeight);
+      }
     } else if (message.type === 'visual-insets-debug') {
       console.info('[WHIP_TERMINAL_VISUAL]', JSON.stringify({
         key: entry.target.key,
@@ -1496,6 +1591,41 @@ export const TerminalRendererHost = forwardRef<TerminalRendererHandle, Props>(fu
         inputOffset: message.inputOffset,
         pendingDelta: message.pendingDelta,
       }));
+    } else if (message.type === 'selection-copy') {
+      if (!isInteger(message.requestId)) return;
+      const target = entry.target;
+      const requestId = message.requestId;
+      const isCurrent = () => entries.current.get(target.key) === entry
+        && entry.target.client === target.client
+        && entry.target.session.paneId === target.session.paneId;
+      const complete = (text: string | null) => {
+        if (!isCurrent()) return;
+        inject(`window.herdrSelectionCopied(${JSON.stringify(target.key)}, ${requestId}, ${JSON.stringify(text)});`);
+      };
+      const selection = parseTerminalSelection(message.selection);
+      if (!selection) {
+        complete(null);
+        return;
+      }
+      if (target.session.kind !== 'herdr' || target.session.status !== 'connected') {
+        complete(null);
+        return;
+      }
+      try {
+        const text = await target.client.native.readTerminalSelection(
+          target.session.terminalId, target.session.paneId, selection,
+        );
+        if (entry.target.session.status !== 'connected') return;
+        complete(text);
+      } catch (reason) {
+        complete(null);
+        console.warn('[WhipTerminalCopy] Server selection unavailable:', String(reason));
+      }
+    } else if (message.type === 'composer-add') {
+      if (entry.target.key !== activeKey.current || !visible || !renderingEnabled) return;
+      if (typeof message.text === 'string' && message.text) {
+        reportAddToComposer(entry.target, message.text);
+      }
     } else if (message.type === 'clipboard-write') {
       Clipboard.setString(typeof message.text === 'string' ? message.text : '');
     } else if (message.type === 'clipboard-read') {
@@ -1522,8 +1652,8 @@ export const TerminalRendererHost = forwardRef<TerminalRendererHandle, Props>(fu
         reportPaste(entry.target, value);
       }
     } else if (entry.target.key === activeKey.current && message.type === 'search-result') {
-      if (!isFiniteNumber(message.count) || !isFiniteNumber(message.index)) return;
-      reportSearch(message.count, message.index, message.invalid === true);
+      const result = parseTerminalSearchResult(message);
+      if (result) reportSearch(result);
     } else if (entry.target.key === activeKey.current && message.type === 'link-scan-result') {
       reportLinks(stringArray(message.links));
     } else if (

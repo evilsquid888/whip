@@ -1,25 +1,33 @@
-import { memo, useCallback, useEffect, useEffectEvent, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { ChatSearchQuery, SearchText } from './SearchText';
+import { memo, useCallback, useContext, useEffect, useEffectEvent, useLayoutEffect, useMemo, useRef, useState, type RefObject } from 'react';
 import {
   FlashList,
   type FlashListRef,
   type ViewToken,
 } from '@shopify/flash-list';
-import CodeHighlighter from 'react-native-code-highlighter';
 import {
-  atomOneDarkReasonable,
-  atomOneLight,
-} from 'react-syntax-highlighter/dist/esm/styles/hljs';
-import {
+  ArrowDown,
   Check,
   ChevronDown,
   ChevronRight,
+  ChevronUp,
   CircleAlert,
+  CircleCheck,
+  CircleHelp,
+  CircleX,
   Copy,
   ExternalLink,
   File,
+  FileDiff,
+  FilePlus,
+  Link,
+  Search,
+  SquareTerminal,
+  type LucideIcon,
 } from 'lucide-react-native';
 import {
   ActivityIndicator,
+  Keyboard,
   Linking,
   Pressable,
   ScrollView,
@@ -28,42 +36,57 @@ import {
   type NativeScrollEvent,
   type NativeSyntheticEvent,
 } from 'react-native';
-import Clipboard from '@react-native-clipboard/clipboard';
+import { useTranslation } from 'react-i18next';
+import { useCopyFeedback } from '../hooks/useCopyFeedback';
 import Animated, { useAnimatedStyle } from 'react-native-reanimated';
 import { useDecorativeProgress } from '../hooks/useDecorativeProgress';
+import { useChatSearch } from '../hooks/useChatSearch';
+import { useScrollActivity } from '../hooks/useScrollActivity';
+import { chatSearchPresentation, EMPTY_CHAT_SEARCH_PRESENTATION } from '../lib/chatSearchPresentation';
+import { ChatSearchBar, chatSearchBarHeight } from './ChatSearchBar';
 
 import type {
   AgentChatState,
   TranscriptFileDiff,
   TranscriptMessage,
   TranscriptPart,
+  TranscriptQuestion,
   TranscriptToolPart,
   TranscriptTurn,
 } from '../agentChat';
-import { isRunningTool as isRunning, transcriptBlocks, type ChatBlock } from '../lib/agentChatBlocks';
+import { isQuestionTool, isRunningTool as isRunning, transcriptBlocks, type ChatBlock } from '../lib/agentChatBlocks';
 import type { ChatViewportState } from '../lib/chatViewportState';
-import type { ChatAgent } from '../lib/agentChatSession';
+import { chatAgentDisplayName, type ChatAgent } from '../lib/agentChatSession';
 import {
   operationalErrorDetails,
   recordOperationalDiagnostic,
 } from '../services/operationalDiagnostics';
 import { recordAgentChatDiagnostic } from '../services/agentChatDiagnostics';
-import { appGlassBackgroundClassName } from '../lib/appGlass';
-import { insetContentPadding, type VisualContentInsets } from '../lib/floatingChrome';
+import { reportBackgroundFailure } from '../services/backgroundOperations';
+import { hapticPress } from '../services/interactionFeedback';
+import { APP_GLASS_BORDER_CLASS_NAME, appGlassBackgroundClassName } from '../lib/appGlass';
+import { insetContentPadding, LATEST_BUTTON_CLASS_NAME, LATEST_BUTTON_ICON_SIZE, type VisualContentInsets } from '../lib/floatingChrome';
 import { scrollOffsetFromDrag, scrollThumbGeometry } from '../lib/terminalScroll';
-import { terminalFontFamily } from '../lib/terminalFonts';
 import { transcriptFileLinkTarget, type TranscriptFileLinkTarget } from '../lib/transcriptLinks';
 import { cn } from '../lib/utils';
-import { appGlassControlStyle, useTheme } from '../theme';
+import { latestButtonStyle, useTheme } from '../theme';
 import type { AgentStatus } from '../types';
 import { useReducedMotion } from './app-ui';
-import { useAppGlassEnabled } from './GlassSurface';
+import { GlassSurface, useAppGlassEnabled } from './GlassSurface';
 import { MarkdownText } from './MarkdownText';
+import { SelectableChatText } from './SelectableChatText';
+import { ChatComposerSelection } from './ChatComposerSelection';
+import { NativeCodeBlock } from './NativeCodeBlock';
+import { JsonOutputViewer } from './JsonOutputViewer';
+import { parseJsonToolOutput } from '../lib/toolOutput';
 import { OverlayScrollbar, type OverlayScrollbarDragEvent } from './OverlayScrollbar';
 import { Button } from './ui/button';
 import { Text } from './ui/text';
+import { ChatPromptImage } from './ChatPromptImage';
+import type { RemoteFileClient } from '../services/remoteFileTransfer';
 
 interface Props {
+  imageClient?: RemoteFileClient;
   state: AgentChatState;
   /** Selected and requested, including preparation before the viewport is revealed. */
   active?: boolean;
@@ -71,14 +94,16 @@ interface Props {
   agentStatus: AgentStatus;
   contentInsets: VisualContentInsets;
   latestButtonBottom: number;
+  searchOpen?: boolean;
+  onCloseSearch?: () => void;
   onOpenFile: (target: TranscriptFileLinkTarget) => void;
+  onOpenWebLink?: (url: string) => void;
   /** Called once per activation, after the initial or saved viewport is ready. */
   onInitialViewportReady?: () => void;
   savedViewport?: ChatViewportState;
   onSaveViewport?: (state: ChatViewportState) => void;
 }
 
-const COPY_FEEDBACK_MS = 1_500;
 const CHAT_CONTENT_TOP_GAP = 16;
 const CHAT_CONTENT_BOTTOM_GAP = 24;
 const CHAT_FOLLOW_END_THRESHOLD = 72;
@@ -87,6 +112,11 @@ const nearEnd = (offset: number, maximumOffset: number) =>
 const CHAT_INITIAL_END_THRESHOLD = 2;
 const CHAT_SCROLL_OFFSET_EPSILON = 1;
 const SMALL_ICON_HIT_SLOP = 8;
+const TOOL_HEADER_PREVIEW_LENGTH = 160;
+const CHAT_CONTEXT_PREVIEW_LENGTH = 256;
+const CHAT_CONTEXT_HEIGHT = 44;
+const CHAT_CONTEXT_GAP = 8;
+const NIX_EXECUTABLE_PREFIX = /\/nix\/store\/[^/\s"'`]+\/s?bin\//g;
 const CHAT_MAINTAIN_VISIBLE_CONTENT_POSITION = {
   startRenderingFromBottom: true,
 } as const;
@@ -119,6 +149,74 @@ interface InitialViewportReadiness {
 }
 
 type SavedChatViewport = Pick<ChatViewportState, 'offset' | 'followEnd' | 'anchor'>;
+
+function chatContextPreview(text: string): string {
+  const prefix = text.slice(0, CHAT_CONTEXT_PREVIEW_LENGTH)
+    .replace(/\p{Cc}/gu, ' ').replace(/\s+/g, ' ').trim()
+    .replace(/[\uD800-\uDBFF]$/u, '');
+  return text.length > CHAT_CONTEXT_PREVIEW_LENGTH ? `${prefix}…` : prefix;
+}
+
+function promptContextPreview(message: TranscriptMessage): string {
+  let text = '';
+  for (const part of message.parts) {
+    const value = part.type === 'text' ? part.text : part.type === 'image' ? '[Image]' : '';
+    if (value) text += `${text ? ' ' : ''}${value.slice(0, CHAT_CONTEXT_PREVIEW_LENGTH + 1 - text.length)}`;
+    if (text.length > CHAT_CONTEXT_PREVIEW_LENGTH) break;
+  }
+  return chatContextPreview(text);
+}
+
+/** Select against the natural viewport edge so showing the header cannot change its owner. */
+function usePinnedPrompt(blocks: ChatBlock[], list: RefObject<FlashListRef<ChatBlock> | null>, top: number) {
+  const prompts = useMemo(() => blocks.flatMap((block, index) => {
+    if (block.type !== 'user') return [];
+    const preview = promptContextPreview(block.message);
+    return preview ? [{ id: block.id, index, preview }] : [];
+  }), [blocks]);
+  const [promptId, setPromptId] = useState<string | null>(null);
+  const currentId = useRef<string | null>(null);
+  const update = useCallback((offset: number) => {
+    const edge = offset + top - (list.current?.getFirstItemOffset?.() ?? 0);
+    let low = 0;
+    let high = prompts.length;
+    while (low < high) {
+      const mid = Math.floor((low + high) / 2);
+      const layout = list.current?.getLayout?.(prompts[mid].index);
+      if (!layout) return;
+      if (layout.y <= edge) low = mid + 1;
+      else high = mid;
+    }
+    const candidate = prompts[low - 1];
+    const layout = candidate && list.current?.getLayout?.(candidate.index);
+    // A partially visible prompt supplies its own context, including long prompts.
+    const nextId = layout && layout.y + layout.height <= edge ? candidate.id : null;
+    if (currentId.current === nextId) return;
+    currentId.current = nextId;
+    setPromptId(nextId);
+  }, [list, prompts, top]);
+  return { prompt: prompts.find(prompt => prompt.id === promptId), update };
+}
+
+function currentActivity(blocks: ChatBlock[], turn?: TranscriptTurn) {
+  for (let index = blocks.length - 1; index >= 0; index--) {
+    const block = blocks[index];
+    if (block.turnId !== turn?.id) break;
+    if (block.type === 'thinking') break;
+    if (block.type !== 'part') continue;
+    const part = block.part;
+    if (part.type === 'tool' && isRunning(part)) {
+      const presentation = toolPresentation(part);
+      return { title: isQuestionTool(part) ? 'Question requested' : presentation.title,
+        detail: chatContextPreview(presentation.subtitle ?? '') };
+    }
+    if (block.streaming && (part.type === 'text' || part.type === 'reasoning')) {
+      return { title: part.type === 'reasoning' ? 'Thinking' : 'Responding',
+        detail: chatContextPreview(part.text.slice(-CHAT_CONTEXT_PREVIEW_LENGTH)) };
+    }
+  }
+  return { title: 'Thinking', detail: '' };
+}
 
 enum ChatScrollInteractionKind {
   AwaitingMomentum = 'awaiting-momentum',
@@ -162,6 +260,7 @@ type ToolKind = 'command' | 'file' | 'mcp' | 'web' | 'other';
 
 interface ToolPresentation {
   title: string;
+  icon?: LucideIcon;
   subtitle?: string;
   args: string[];
   command?: string;
@@ -195,7 +294,7 @@ function primitiveArgs(
 
 function toolKind(name: string): ToolKind {
   if (/^(?:patch|edit|write|file|read)$/i.test(name)) return 'file';
-  if (/^(?:shell|command|terminal)$/i.test(name)) return 'command';
+  if (/^(?:shell|bash|command|terminal)$/i.test(name)) return 'command';
   if (/web|search|fetch|open_page/i.test(name)) return 'web';
   if (/mcp| · /.test(name)) return 'mcp';
   return 'other';
@@ -211,19 +310,18 @@ function toolPresentation(item: TranscriptToolPart): ToolPresentation {
   const url = textValue(input.url)?.trim();
   const description = textValue(input.description)?.trim();
   if (kind === 'command') {
-    return { title: 'Shell', subtitle: command || item.state.title, args: [], command, kind };
+    return { title: 'Shell', icon: SquareTerminal, subtitle: command || item.state.title, args: [], command, kind };
   }
   if (kind === 'file') {
-    const lower = name.toLowerCase();
-    const title = /read/.test(lower)
-      ? 'Read'
-      : /write/.test(lower)
-        ? 'Write'
-        : /patch|apply/.test(lower)
-          ? 'Patch'
-          : 'Edit';
+    const action = /read/.test(name)
+      ? { title: 'Read', icon: File }
+      : /write/.test(name)
+        ? { title: 'Write', icon: FilePlus }
+        : /patch|apply/.test(name)
+          ? { title: 'Patch', icon: FileDiff }
+          : { title: 'Edit' };
     return {
-      title,
+      ...action,
       subtitle: filename(path) || item.state.title,
       args: primitiveArgs(input, ['path', 'old_string', 'new_string', 'content']),
       kind,
@@ -232,6 +330,7 @@ function toolPresentation(item: TranscriptToolPart): ToolPresentation {
   if (kind === 'web') {
     return {
       title: url ? 'Fetch' : 'Web search',
+      icon: url ? Link : Search,
       subtitle: url || query || item.state.title,
       args: primitiveArgs(input, ['url', 'query', 'queries']),
       href: url,
@@ -261,7 +360,14 @@ interface BlockExpansion {
   onToggle: () => void;
 }
 
-function ToolCard({ item, expanded, onToggle, active }: BlockExpansion & { item: TranscriptToolPart; active: boolean }) {
+function toolHeaderPreview(text: string): string {
+  // A native one-line limit still creates spans for the entire supplied string.
+  const preview = text.slice(0, TOOL_HEADER_PREVIEW_LENGTH).split(/[\r\n]/, 1)[0].trimEnd()
+    .replace(/[\uD800-\uDBFF]$/u, '');
+  return preview.length < text.length ? `${preview}…` : preview;
+}
+
+function ToolCard({ item, expanded, onToggle, active, onLinkPress }: BlockExpansion & { item: TranscriptToolPart; active: boolean; onLinkPress: (url: string) => void }) {
   const { colors } = useTheme();
   const failed = item.state.status === 'error';
   const presentation = toolPresentation(item);
@@ -276,26 +382,38 @@ function ToolCard({ item, expanded, onToggle, active }: BlockExpansion & { item:
   const shellCommand = presentation.kind === 'command' ? presentation.command : undefined;
   const shellOutput = presentation.kind === 'command' ? item.state.output : undefined;
   const markdownOutput = /^(?:list|glob|grep|websearch)$/.test(name) ? item.state.output : undefined;
+  const otherOutput = !shellOutput && !markdownOutput ? item.state.output : undefined;
   const writtenContent = name === 'write' ? textValue(item.state.input.content) : undefined;
   const error = item.state.error;
   const diagnostics = item.state.diagnostics
     .filter(diagnostic => diagnostic.severity === 'error')
     .slice(0, 3);
-  const hasDetail = Boolean(shellCommand || shellOutput || files.length || markdownOutput || writtenContent || error || item.state.loaded.length || diagnostics.length);
+  const hasDetail = Boolean(shellCommand || shellOutput || otherOutput || files.length || markdownOutput || writtenContent || error || item.state.loaded.length || diagnostics.length
+    || item.state.inputJson || Object.keys(item.state.input).length || item.timestamp !== undefined
+    || item.state.startedAt !== undefined || item.state.completedAt !== undefined || item.state.exitCode !== undefined || item.state.durationMs !== undefined);
   const subtitle = presentation.subtitle
     || (files.length === 1 ? filename(files[0].file) : files.length > 1 ? `${files.length} files` : undefined);
+  const displayedSubtitle = subtitle ? toolHeaderPreview(!expanded && presentation.kind === 'command'
+    ? subtitle.replace(NIX_EXECUTABLE_PREFIX, '')
+    : subtitle) : undefined;
+  const displayedTitle = toolHeaderPreview(presentation.title);
+  const displayedArgs = presentation.args.map(toolHeaderPreview);
+  const TitleIcon = presentation.icon;
   return (
     <View
-      className={cn('min-h-11 w-full overflow-hidden', failed && 'rounded-md bg-destructive/10 px-2')}
+      className={cn('min-h-11 w-full overflow-hidden rounded-md px-2', failed ? 'bg-destructive/10' : 'bg-primary/10')}
     >
       <Pressable
+        testID="agent-tool-toggle"
         accessibilityRole="button"
+        accessibilityLabel={TitleIcon
+          ? [displayedTitle, !isRunning(item) && displayedSubtitle, ...(!isRunning(item) ? displayedArgs : [])].filter(Boolean).join(', ')
+          : undefined}
         accessibilityState={{ expanded }}
         disabled={!hasDetail && !presentation.href}
         className="min-h-11 flex-row items-center py-1"
-        onPress={() => {
-          if (hasDetail) onToggle();
-          else if (presentation.href) openExternalUrl(presentation.href);
+        onPress={hasDetail ? hapticPress(onToggle) : () => {
+          if (presentation.href) onLinkPress(presentation.href);
         }}
       >
         {isRunning(item) && (
@@ -309,20 +427,22 @@ function ToolCard({ item, expanded, onToggle, active }: BlockExpansion & { item:
           </View>
         )}
         <View className="min-w-0 shrink flex-row items-center gap-1.5">
-          <Text numberOfLines={1} className="shrink-0 text-[13px] font-medium leading-5 text-foreground">
-            {presentation.title}
-          </Text>
-          {subtitle && !isRunning(item) && (
+          {TitleIcon
+            ? <TitleIcon size={16} color={colors.text} />
+            : <Text numberOfLines={1} className="shrink-0 text-[13px] font-medium leading-5 text-foreground">
+              <SearchText text={displayedTitle} />
+            </Text>}
+          {displayedSubtitle && !isRunning(item) && (
             <>
               <Text className="text-[11px] leading-5 text-muted-foreground">·</Text>
               <Text numberOfLines={1} className="min-w-0 shrink text-[13px] leading-5 text-muted-foreground">
-                {subtitle}
+                <SearchText text={displayedSubtitle} />
               </Text>
             </>
           )}
-          {!isRunning(item) && presentation.args.map(arg => (
-            <Text key={arg} numberOfLines={1} className="shrink text-[12px] leading-5 text-muted-foreground">
-              {arg}
+          {!isRunning(item) && displayedArgs.map((arg, index) => (
+            <Text key={presentation.args[index]} numberOfLines={1} className="shrink text-[12px] leading-5 text-muted-foreground">
+              <SearchText text={arg} />
             </Text>
           ))}
         </View>
@@ -333,7 +453,7 @@ function ToolCard({ item, expanded, onToggle, active }: BlockExpansion & { item:
           </View>
         )}
         {presentation.href && !isRunning(item) && (
-          <Pressable accessibilityLabel={`Open ${presentation.href}`} className="ml-1 size-7 items-center justify-center" hitSlop={SMALL_ICON_HIT_SLOP} onPress={event => { event.stopPropagation(); openExternalUrl(presentation.href!); }}>
+          <Pressable accessibilityLabel={`Open ${toolHeaderPreview(presentation.href)}`} className="ml-1 size-7 items-center justify-center" hitSlop={SMALL_ICON_HIT_SLOP} onPress={event => { event.stopPropagation(); onLinkPress(presentation.href!); }}>
             <ExternalLink size={14} color={colors.textTertiary} />
           </Pressable>
         )}
@@ -343,24 +463,27 @@ function ToolCard({ item, expanded, onToggle, active }: BlockExpansion & { item:
       </Pressable>
       {expanded && hasDetail && (
         <View className="mb-3 mt-1 gap-2">
+          <ToolMetadata item={item} />
+          <ToolInputDetails item={item} />
           {shellCommand
             ? <ShellToolBlock command={shellCommand} output={shellOutput} />
-            : shellOutput ? <ToolCodeBlock text={shellOutput} bordered copyable /> : null}
+            : shellOutput ? <ToolOutputBlock text={shellOutput} bordered copyable /> : null}
           {files.map(file => <ToolFileDiffBlock key={file.file} file={file} />)}
-          {markdownOutput && <View className="border-l border-border py-1 pl-3"><MarkdownText content={markdownOutput} variant="transcript" /></View>}
-          {writtenContent && <ToolCodeBlock text={writtenContent} bordered copyable />}
-          {error && <ToolCodeBlock text={error} error />}
+          {markdownOutput && <ToolOutputBlock text={markdownOutput} markdown bordered copyable onLinkPress={onLinkPress} />}
+          {otherOutput && <ToolOutputBlock text={otherOutput} bordered copyable />}
+          {writtenContent && <ToolOutputBlock text={writtenContent} bordered copyable />}
+          {error && <ToolOutputBlock text={error} error />}
           {diagnostics.length > 0 && (
             <View className="gap-1.5 rounded-md bg-destructive/10 px-2.5 py-2">
               {diagnostics.map(diagnostic => (
                 <View key={`${diagnostic.file}:${diagnostic.line}:${diagnostic.message}`} className="flex-row gap-2">
-                  <Text className="shrink-0 font-mono text-[9px] text-destructive">{filename(diagnostic.file)}{diagnostic.line ? `:${diagnostic.line}${diagnostic.column ? `:${diagnostic.column}` : ''}` : ''}</Text>
-                  <Text selectable className="min-w-0 flex-1 text-[10px] leading-4 text-destructive">{diagnostic.message}</Text>
+                  <Text className="shrink-0 font-mono text-[9px] text-destructive"><SearchText text={`${filename(diagnostic.file)}${diagnostic.line ? `:${diagnostic.line}${diagnostic.column ? `:${diagnostic.column}` : ''}` : ''}`} /></Text>
+                  <Text selectable className="min-w-0 flex-1 text-[10px] leading-4 text-destructive"><SearchText text={diagnostic.message} /></Text>
                 </View>
               ))}
             </View>
           )}
-          {item.state.loaded.map(path => <Text key={path} numberOfLines={1} className="px-1 font-mono text-[10px] text-muted-foreground">Loaded {path}</Text>)}
+          {item.state.loaded.map(path => <Text key={path} numberOfLines={1} className="px-1 font-mono text-[10px] text-muted-foreground">Loaded <SearchText text={path} /></Text>)}
         </View>
       )}
     </View>
@@ -375,71 +498,73 @@ function ToolCodeCopyButton({
   text: string;
 }) {
   const { colors } = useTheme();
+  const { t } = useTranslation();
+  const { copied, copyText } = useCopyFeedback();
   return (
     <Pressable
       accessibilityLabel={accessibilityLabel}
+      accessibilityRole="button"
+      accessibilityValue={{ text: copied ? t('markdown.copied') : '' }}
       className="absolute right-1 top-1 z-10 size-11 items-end justify-start"
-      onPress={() => Clipboard.setString(text)}
+      onPress={() => copyText(text)}
     >
       <View className="size-7 items-center justify-center rounded-md bg-background/90">
-        <Copy size={13} color={colors.textTertiary} />
+        {copied ? <Check size={13} color={colors.done} /> : <Copy size={13} color={colors.textTertiary} />}
       </View>
     </Pressable>
   );
 }
 
 function ShellToolBlock({ command, output }: { command: string; output?: string }) {
-  const { isDark } = useTheme();
-  const commandTheme = useMemo(() => {
-    const theme = isDark ? atomOneDarkReasonable : atomOneLight;
-    return {
-      ...theme,
-      // Whip owns the surface; the highlighter only supplies token colors.
-      hljs: { ...theme.hljs, background: 'transparent', backgroundColor: 'transparent' },
-    };
-  }, [isDark]);
-  const copyText = [`$ ${command}`, output].filter(Boolean).join('\n\n');
   return (
-    <View className="relative min-h-11 overflow-hidden rounded-md border border-border">
-      <ToolCodeCopyButton accessibilityLabel="Copy shell command and output" text={copyText} />
-      <CodeHighlighter
-        hljsStyle={commandTheme}
-        language="bash"
-        scrollViewProps={{
-          nestedScrollEnabled: true,
-          showsHorizontalScrollIndicator: false,
-          style: toolCodeStyles.scroll,
-          contentContainerStyle: toolCodeStyles.highlightedContent,
-        }}
-        textStyle={toolCodeStyles.text}
-      >
-        {`$ ${command}`}
-      </CodeHighlighter>
+    <View className="gap-2">
+      <NativeCodeBlock content={command} language="bash" />
       {output && (
-        <View className="border-t border-border px-2 py-1.5">
-          <ToolCodeBlock text={output} />
-        </View>
+        <ToolOutputBlock
+          text={output}
+          bordered
+          copyable
+          copyText={`$ ${command}\n\n${output}`}
+          copyAccessibilityLabel="Copy shell command and output"
+        />
       )}
     </View>
   );
 }
 
-function ToolCodeBlock({
+// Mounted only inside expanded tool cards; collapsed rows do no JSON work.
+const ToolOutputBlock = memo(function MemoizedToolOutput({
   text,
+  markdown = false,
+  onLinkPress,
   bordered = false,
   muted = false,
   error = false,
   copyable = false,
+  copyText,
+  copyAccessibilityLabel,
 }: {
   text: string;
+  markdown?: boolean;
+  onLinkPress?: (url: string) => void;
   bordered?: boolean;
   muted?: boolean;
   error?: boolean;
   copyable?: boolean;
+  copyText?: string;
+  copyAccessibilityLabel?: string;
 }) {
+  const json = useMemo(() => parseJsonToolOutput(text), [text]);
+  if (markdown && !json) {
+    return (
+      <View className="border-l border-border py-1 pl-3">
+        <MarkdownText content={text} variant="transcript" onLinkPress={({ url }) => onLinkPress?.(url)} />
+      </View>
+    );
+  }
   return (
     <View className={cn('relative overflow-hidden', bordered && 'rounded-md border border-border', copyable && 'min-h-11')}>
-      {copyable && <ToolCodeCopyButton text={text} />}
+      {copyable && <ToolCodeCopyButton text={copyText ?? text} accessibilityLabel={copyAccessibilityLabel} />}
       <ScrollView
         className="w-full"
         horizontal
@@ -447,40 +572,60 @@ function ToolCodeBlock({
         showsHorizontalScrollIndicator={false}
         contentContainerClassName={bordered ? 'min-w-full px-3 py-2.5 pr-10' : 'min-w-full px-1 py-1'}
       >
-        <Text
-          selectable
-          className={cn(
-            'font-mono text-[11px] leading-[17px] text-foreground',
-            muted && 'text-muted-foreground',
-            error && 'text-destructive',
+        <View>
+          {!json && (
+            <Text
+              selectable
+              className={cn(
+                'font-mono text-[11px] leading-[17px] text-foreground',
+                muted && 'text-muted-foreground',
+                error && 'text-destructive',
+              )}
+            >
+              <SearchText text={text} />
+            </Text>
           )}
-        >
-          {text}
-        </Text>
+          {json && <JsonOutputViewer key={text} value={json.value} />}
+        </View>
       </ScrollView>
+    </View>
+  );
+});
+
+function ToolInputDetails({ item }: { item: TranscriptToolPart }) {
+  const [open, setOpen] = useState(false);
+  const { colors } = useTheme();
+  const input = useMemo(() => item.state.inputJson
+    ?? (Object.keys(item.state.input).length ? JSON.stringify(item.state.input, null, 2) : undefined),
+  [item.state.inputJson, item.state.input]);
+  if (!input) return null;
+  return (
+    <View>
+      <Pressable accessibilityRole="button" accessibilityLabel="Tool input details" accessibilityState={{ expanded: open }}
+        className="min-h-11 flex-row items-center gap-2" onPress={() => setOpen(value => !value)}>
+        {open ? <ChevronDown size={13} color={colors.textTertiary} /> : <ChevronRight size={13} color={colors.textTertiary} />}
+        <Text className="text-[11px] text-muted-foreground">Input</Text>
+      </Pressable>
+      {open && <ToolOutputBlock text={input} bordered copyable copyAccessibilityLabel="Copy tool input" />}
     </View>
   );
 }
 
-const toolCodeStyles = StyleSheet.create({
-  highlightedContent: {
-    backgroundColor: 'transparent',
-    minWidth: '100%',
-    paddingBottom: 10,
-    paddingLeft: 12,
-    paddingRight: 40,
-    paddingTop: 10,
-  },
-  scroll: {
-    width: '100%',
-  },
-  text: {
-    fontFamily: terminalFontFamily,
-    fontSize: 11,
-    includeFontPadding: false,
-    lineHeight: 17,
-  },
-});
+function ToolMetadata({ item }: { item: TranscriptToolPart }) {
+  const { startedAt, completedAt, durationMs, exitCode } = item.state;
+  const duration = durationMs ?? (startedAt !== undefined && completedAt !== undefined && completedAt >= startedAt ? completedAt - startedAt : undefined);
+  const summary = [duration === undefined ? undefined : formatElapsed(duration),
+    exitCode !== undefined && toolKind(item.tool) === 'command' ? `Exit ${exitCode}` : undefined].filter(Boolean);
+  if (!summary.length && startedAt === undefined && completedAt === undefined && item.timestamp === undefined) return null;
+  return (
+    <View className="gap-1">
+      {summary.length > 0 && <Text className="text-[11px] text-muted-foreground">{summary.join(' · ')}</Text>}
+      {startedAt !== undefined && <MetadataLine label="Started" value={formatFullTime(startedAt)} />}
+      {completedAt !== undefined && <MetadataLine label="Finished" value={formatFullTime(completedAt)} />}
+      {startedAt === undefined && completedAt === undefined && item.timestamp !== undefined && <MetadataLine label="Recorded" value={formatFullTime(item.timestamp)} />}
+    </View>
+  );
+}
 
 const chatListStyles = StyleSheet.create({
   content: {
@@ -507,7 +652,7 @@ function ToolDiffBlock({ diff }: { diff: string }) {
                     : colors.text,
               }}
             >
-              {line}{index < lines.length - 1 ? '\n' : ''}
+              <SearchText text={line} />{index < lines.length - 1 ? '\n' : ''}
             </Text>
           ))}
         </Text>
@@ -531,7 +676,7 @@ function ToolFileDiffBlock({ file }: { file: TranscriptFileDiff }) {
     <View className="overflow-hidden rounded-md border border-border">
       <View className="min-h-8 flex-row items-center gap-2 border-b border-border px-2.5 py-1.5">
         <File size={13} color={colors.textTertiary} />
-        <Text numberOfLines={1} className="min-w-0 flex-1 font-mono text-[10px] text-foreground">{file.file}</Text>
+        <Text numberOfLines={1} className="min-w-0 flex-1 font-mono text-[10px] text-foreground"><SearchText text={file.file} /></Text>
         {file.additions > 0 && <Text className="font-mono text-[10px]" style={{ color: colors.done }}>+{file.additions}</Text>}
         {file.deletions > 0 && <Text className="font-mono text-[10px]" style={{ color: colors.error }}>−{file.deletions}</Text>}
       </View>
@@ -540,31 +685,54 @@ function ToolFileDiffBlock({ file }: { file: TranscriptFileDiff }) {
   );
 }
 
-function contextSummary(tools: readonly TranscriptToolPart[]): string {
-  const counts = [
-    ['read', tools.filter(tool => tool.tool === 'read').length],
-    ['search', tools.filter(tool => /^(?:glob|grep)$/i.test(tool.tool)).length],
-    ['list', tools.filter(tool => tool.tool === 'list').length],
-  ] as const;
-  const labels = counts.flatMap(([label, count]) => count ? [`${count} ${label}${count === 1 ? '' : 's'}`] : []);
-  return labels.length ? labels.join(' · ') : `${tools.length} operation${tools.length === 1 ? '' : 's'}`;
+function TranscriptNoticeCard({
+  error = false,
+  className,
+  ...props
+}: React.ComponentProps<typeof View> & { error?: boolean }) {
+  const glass = useAppGlassEnabled();
+  return (
+    <GlassSurface
+      {...props}
+      className={cn(
+        'w-full gap-2 rounded-md px-3 py-2.5',
+        glass && APP_GLASS_BORDER_CLASS_NAME,
+        className,
+      )}
+      fallbackClassName={error ? 'bg-destructive/10' : 'bg-muted'}
+    />
+  );
 }
 
-function ContextToolGroup({ tools, expanded, onToggle, active }: BlockExpansion & { tools: TranscriptToolPart[]; active: boolean }) {
+function CopyQuestionOption({ option }: { option: TranscriptQuestion['options'][number] }) {
   const { colors } = useTheme();
-  const running = tools.some(isRunning);
-  const failed = tools.some(tool => tool.state.status === 'error');
+  const { copied, copyText } = useCopyFeedback();
   return (
-    <View className="w-full">
-      <Pressable accessibilityRole="button" accessibilityState={{ expanded }} className="min-h-11 flex-row items-center py-1" onPress={onToggle}>
-        {running && <ActivityIndicator animating={active} className="mr-2" size={13} color={colors.textTertiary} />}
-        {failed && !running && <CircleAlert className="mr-2" size={14} color={colors.error} />}
-        <Text className="text-[13px] font-medium text-foreground">{running ? 'Gathering context' : 'Gathered context'}</Text>
-        <Text numberOfLines={1} className="ml-1.5 min-w-0 shrink text-[12px] text-muted-foreground">{contextSummary(tools)}</Text>
-        {expanded ? <ChevronDown className="ml-1" size={15} color={colors.textTertiary} /> : <ChevronRight className="ml-1" size={15} color={colors.textTertiary} />}
-      </Pressable>
-    </View>
+    <Pressable
+      accessibilityRole="button"
+      accessibilityLabel={`Copy option ${option.label}`}
+      accessibilityHint="Copies the option label to your clipboard"
+      className="min-h-11 flex-row items-center gap-3 rounded-md border border-border px-3 py-2"
+      onPress={() => copyText(option.label)}
+    >
+      <View className="min-w-0 flex-1 gap-1">
+        <Text className="text-[13px] font-medium leading-[18px] text-foreground"><SearchText text={option.label} /></Text>
+        {option.description && <Text className="text-[12px] leading-[18px] text-muted-foreground"><SearchText text={option.description} /></Text>}
+      </View>
+      {copied ? <Check size={15} color={colors.done} /> : <Copy size={15} color={colors.textTertiary} />}
+    </Pressable>
   );
+}
+
+function TranscriptQuestions({ questions }: { questions: readonly TranscriptQuestion[] }) {
+  return questions.map((question, index) => (
+    <View key={`${index}:${question.question}`} className="gap-2">
+      {question.header && <Text className="text-[12px] font-medium text-foreground"><SearchText text={question.header} /></Text>}
+      <Text selectable className="text-[12px] leading-[18px] text-muted-foreground"><SearchText text={question.question} /></Text>
+      {question.multiple && <Text className="text-[12px] text-muted-foreground">Choose one or more.</Text>}
+      {question.options.map((option, optionIndex) => <CopyQuestionOption key={`${optionIndex}:${option.label}`} option={option} />)}
+    </View>
+  ));
 }
 
 function AssistantPart({
@@ -594,27 +762,38 @@ function AssistantPart({
       </View>
     );
   }
-  if (part.type === 'tool') return <ToolCard item={part} expanded={expanded} onToggle={onToggle} active={active} />;
+  if (part.type === 'tool' && isQuestionTool(part)) {
+    return (
+      <TranscriptNoticeCard testID="agent-question-notice">
+        <Text className="text-[13px] font-medium text-foreground">Question requested</Text>
+        {part.state.questions?.length
+          ? <TranscriptQuestions questions={part.state.questions} />
+          : <Text selectable className="text-[12px] leading-[18px] text-muted-foreground">
+              <SearchText text={textValue(part.state.input.question_summary) || 'The agent requested user input.'} />
+            </Text>}
+        {part.state.output && <ToolOutputBlock text={part.state.output} bordered />}
+        {part.state.error && <ToolOutputBlock text={part.state.error} error />}
+        <ToolMetadata item={part} />
+        <ToolInputDetails item={part} />
+      </TranscriptNoticeCard>
+    );
+  }
+  if (part.type === 'tool') return <ToolCard item={part} expanded={expanded} onToggle={onToggle} active={active} onLinkPress={onLinkPress} />;
   if (part.type === 'plan') {
     return <View className="w-full py-1"><Text className="mb-2 text-[13px] font-medium leading-5 text-foreground">Plan</Text><MarkdownText content={part.text} variant="transcript" onLinkPress={({ url }) => onLinkPress(url)} /></View>;
   }
   if (part.type === 'notice') {
     return (
-      <View className={cn('w-full flex-row gap-2 rounded-md px-3 py-2.5', part.level === 'error' ? 'bg-destructive/10' : 'bg-muted')}>
+      <TranscriptNoticeCard error={part.level === 'error'} className="flex-row">
         {part.level === 'error' && <CircleAlert size={15} color={colors.error} />}
-        <Text selectable className="min-w-0 flex-1 text-[12px] leading-[18px] text-muted-foreground">{part.text}</Text>
-      </View>
+        <View className="min-w-0 flex-1 gap-2">
+          <Text selectable className="text-[12px] leading-[18px] text-muted-foreground"><SearchText text={part.text} /></Text>
+          {part.questions && <TranscriptQuestions questions={part.questions} />}
+        </View>
+      </TranscriptNoticeCard>
     );
   }
   return null;
-}
-
-function visibleUserText(message: TranscriptMessage | undefined): string {
-  return message?.parts
-    .filter(part => part.type === 'text')
-    .map(part => part.type === 'text' ? part.text : '')
-    .filter(Boolean)
-    .join('\n') || '';
 }
 
 function formatTime(value: number | undefined): string | undefined {
@@ -628,20 +807,76 @@ function formatDuration(start: number | undefined, end: number | undefined): str
   return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
 }
 
-function UserPrompt({ message }: { message: TranscriptMessage }) {
+function formatElapsed(milliseconds: number): string {
+  const seconds = milliseconds / 1000;
+  if (seconds < 10) return `${Number(seconds.toFixed(2))}s`;
+  const rounded = Math.round(seconds);
+  return rounded < 60 ? `${rounded}s` : `${Math.floor(rounded / 60)}m ${rounded % 60}s`;
+}
+
+function formatFullTime(value: number): string {
+  return new Date(value).toLocaleString();
+}
+
+function MetadataLine({ label, value }: { label: string; value?: string | number }) {
+  if (value === undefined) return null;
+  return <View className="flex-row gap-3"><Text className="w-24 text-[11px] text-muted-foreground">{label}</Text><Text selectable className="min-w-0 flex-1 text-[11px] text-foreground">{value}</Text></View>;
+}
+
+const TOKEN_FIELDS = [
+  ['input', 'Input'], ['cacheRead', 'Cache reads'], ['cacheWrite', 'Cache writes'],
+  ['output', 'Output'], ['reasoning', 'Reasoning'], ['total', 'Total'],
+] as const;
+
+const TURN_OUTCOME_LABELS = { completed: 'Completed', interrupted: 'Interrupted', failed: 'Failed' } as const;
+
+const tokenNumber = new Intl.NumberFormat(undefined, { notation: 'compact', maximumFractionDigits: 1 });
+const cachePercentNumber = new Intl.NumberFormat(undefined, { style: 'percent', maximumFractionDigits: 1 });
+const CACHE_STATUS_PRESENTATION = {
+  hit: { Icon: CircleCheck, label: 'Cache hit' },
+  miss: { Icon: CircleX, label: 'Cache miss' },
+  unknown: { Icon: CircleHelp, label: 'Cache unknown' },
+} as const;
+
+function cacheUsagePresentation(usage: NonNullable<TranscriptTurn['details']>['usage']) {
+  const input = usage?.input;
+  const read = usage?.cacheRead;
+  const ratio = input !== undefined && Number.isFinite(input) && input > 0
+    && read !== undefined && Number.isFinite(read) && read >= 0 && read <= input
+    ? read / input : undefined;
+  const status = ratio === undefined ? 'unknown' : ratio > 0 ? 'hit' : 'miss';
+  const presentation = CACHE_STATUS_PRESENTATION[status];
+  const percent = status === 'hit' && ratio !== undefined
+    ? ratio < 0.001 ? `<${cachePercentNumber.format(0.001)}` : cachePercentNumber.format(ratio)
+    : undefined;
+  return { ...presentation, status, percent, label: percent ? `${presentation.label} · ${percent}` : presentation.label };
+}
+
+function UserPrompt({ message, imageClient, directory, active }: {
+  message: TranscriptMessage;
+  imageClient?: RemoteFileClient;
+  directory?: string;
+  active: boolean;
+}) {
   const { colors } = useTheme();
-  const [copied, setCopied] = useState(false);
-  const text = visibleUserText(message);
+  const { copied, copyText } = useCopyFeedback();
+  const parts = message.parts.filter(part => part.type === 'text' || part.type === 'image');
+  const text = parts.map(part => part.type === 'image' ? part.source : part.type === 'text' ? part.text : '').join('\n');
+  const copyPrompt = () => copyText(text);
   if (!text) return null;
   const meta = formatTime(message.createdAt);
   return (
     <View className="ml-9 items-end">
-      <Pressable accessibilityLabel="Copy prompt" className="min-h-11 max-w-[86%] rounded-xl bg-muted px-3 py-2.5" onLongPress={() => Clipboard.setString(text)}>
-        <Text selectable className="text-[14px] leading-[20px] text-foreground">{text}</Text>
-      </Pressable>
-      <View className="mt-1 flex-row items-center gap-1 px-1">
-        {meta && <Text className="text-[9px] text-muted-foreground">{meta}</Text>}
-        <Button accessibilityLabel="Copy prompt" className="size-6 rounded-full px-0" variant="ghost" onPress={() => { Clipboard.setString(text); setCopied(true); setTimeout(() => setCopied(false), COPY_FEEDBACK_MS); }}>{copied ? <Check size={11} color={colors.done} /> : <Copy size={11} color={colors.textTertiary} />}</Button>
+      <View className="min-h-11 max-w-[86%] gap-2 rounded-xl bg-purple-950 px-3 py-2.5">
+        {parts.map(part => part.type === 'image'
+          ? <ChatPromptImage key={part.id} source={part.source} client={imageClient} directory={directory} active={active} />
+          : part.type === 'text' && part.text.trim()
+            ? <SelectableChatText key={part.id} text={part.text} color="#faf5ff" />
+            : null)}
+      </View>
+      <View className="mt-1 flex-row items-center gap-1 self-stretch px-1">
+        {meta && <Text numberOfLines={1} className="min-w-0 flex-1 text-right text-[9px] text-muted-foreground">{meta}</Text>}
+        <Button accessibilityLabel="Copy prompt" className="ml-auto size-6 shrink-0 rounded-full px-0" variant="ghost" onPress={copyPrompt}>{copied ? <Check size={11} color={colors.done} /> : <Copy size={11} color={colors.textTertiary} />}</Button>
       </View>
     </View>
   );
@@ -654,33 +889,64 @@ function assistantCopyText(turn: TranscriptTurn): string {
   }).join('\n\n');
 }
 
-function TurnMeta({ turn }: { turn: TranscriptTurn }) {
+function TurnMeta({ turn, expanded, onToggle }: BlockExpansion & { turn: TranscriptTurn }) {
   const { colors } = useTheme();
-  const [copied, setCopied] = useState(false);
+  const { copied, copyText } = useCopyFeedback();
   const duration = formatDuration(turn.startedAt, turn.completedAt);
+  const details = turn.details;
+  const usage = details?.usage;
+  const cache = cacheUsagePresentation(usage);
+  const CacheIcon = cache.Icon;
+  const outcome = details?.outcome ?? (turn.status === 'interrupted' ? 'interrupted' : undefined);
+  const outcomeLabel = outcome ? TURN_OUTCOME_LABELS[outcome] : turn.status === 'error' ? 'Error' : undefined;
   const values = [
     duration,
-    turn.status === 'interrupted' ? 'Interrupted' : undefined,
+    details?.model ?? details?.provider,
+    usage?.total === undefined ? undefined : `${tokenNumber.format(usage.total)} tokens`,
+    outcomeLabel,
   ].filter(Boolean);
   const copy = assistantCopyText(turn);
-  if (!values.length && !copy) return null;
+  const hasDetails = Boolean(details?.model || details?.provider || usage || outcomeLabel || turn.startedAt !== undefined || turn.completedAt !== undefined);
+  if (!values.length && !copy && !hasDetails) return null;
   return (
-    <View className="mt-2 min-h-7 flex-row items-center gap-2">
-      {values.length > 0 && <Text className="text-[10px] text-muted-foreground">{values.join(' · ')}</Text>}
-      {copy.length > 0 && (
-        <Button
-          accessibilityLabel="Copy response"
-          className="ml-auto size-7 rounded-full px-0"
-          variant="ghost"
-          onPress={() => {
-            Clipboard.setString(copy);
-            setCopied(true);
-            setTimeout(() => setCopied(false), COPY_FEEDBACK_MS);
-          }}
-        >
-          {copied ? <Check size={13} color={colors.done} /> : <Copy size={13} color={colors.textTertiary} />}
-        </Button>
-      )}
+    <View className="mt-2 gap-2">
+      <View className="min-h-7 flex-row items-center gap-2">
+        {hasDetails && <Pressable accessibilityRole="button" accessibilityLabel="Turn details" accessibilityState={{ expanded }}
+          accessibilityHint={cache.label}
+          className="min-h-11 min-w-0 flex-1 flex-row items-center gap-1" onPress={onToggle}>
+          <Text className="min-w-0 flex-1 text-[10px] text-muted-foreground">{values.join(' · ') || 'Details'}</Text>
+          <View accessible accessibilityLabel={cache.label} className="shrink-0 flex-row items-center gap-1">
+            <CacheIcon size={12} color={cache.status === 'hit' ? colors.done : colors.textTertiary} />
+            {cache.percent && <Text numberOfLines={1} className="shrink-0 text-[10px] text-muted-foreground">{cache.percent}</Text>}
+          </View>
+          {expanded ? <ChevronDown size={12} color={colors.textTertiary} /> : <ChevronRight size={12} color={colors.textTertiary} />}
+        </Pressable>}
+        {copy.length > 0 && (
+          <Button
+            accessibilityLabel="Copy response"
+            className="ml-auto size-7 rounded-full px-0"
+            variant="ghost"
+            onPress={() => copyText(copy)}
+          >
+            {copied ? <Check size={13} color={colors.done} /> : <Copy size={13} color={colors.textTertiary} />}
+          </Button>
+        )}
+      </View>
+      {expanded && hasDetails && <View className="gap-1.5 border-l border-border py-1 pl-3">
+        <MetadataLine label="Model" value={details?.model} />
+        <MetadataLine label="Provider" value={details?.provider} />
+        <MetadataLine label="Cache" value={cache.label} />
+        <MetadataLine label={outcome ? 'Outcome' : 'Status'} value={outcomeLabel} />
+        <MetadataLine label="Started" value={turn.startedAt === undefined ? undefined : formatFullTime(turn.startedAt)} />
+        <MetadataLine label="Finished" value={turn.completedAt === undefined ? undefined : formatFullTime(turn.completedAt)} />
+        {turn.assistants.flatMap((message, index) => message.parts.length > 0 && message.completedAt !== undefined
+          ? [<MetadataLine key={message.id} label={`Response ${index + 1}`} value={formatFullTime(message.completedAt)} />] : [])}
+        {usage && <View className="mt-1 gap-1.5">
+          {TOKEN_FIELDS.map(([key, label]) => <MetadataLine key={key} label={label} value={usage[key]?.toLocaleString()} />)}
+          {(usage.cacheRead !== undefined || usage.cacheWrite !== undefined || usage.reasoning !== undefined) &&
+            <Text className="text-[10px] text-muted-foreground">Input includes cache tokens. Output includes reasoning tokens.</Text>}
+        </View>}
+      </View>}
     </View>
   );
 }
@@ -705,26 +971,33 @@ function ChangedFiles({ turn, expanded, onToggle }: BlockExpansion & { turn: Tra
 }
 
 const TranscriptBlockView = memo(function TranscriptBlockRow({
-  block, active, expanded, onToggle, onLinkPress,
+  block, active, expanded, searchSelected, searchQuery, onToggle, onLinkPress, imageClient, directory, onAddToComposer,
 }: {
   block: ChatBlock;
   active: boolean;
   expanded: boolean;
+  searchSelected?: boolean;
+  searchQuery: string;
   onToggle: (id: string) => void;
   onLinkPress: (url: string) => void;
+  imageClient?: RemoteFileClient;
+  directory?: string;
+  onAddToComposer?: (text: string) => void;
 }) {
   const { colors } = useTheme();
   const toggle = () => onToggle(block.id);
   const content = () => {
     switch (block.type) {
-      case 'user': return <UserPrompt message={block.message} />;
-      case 'part': return <AssistantPart part={block.part} streaming={active && block.streaming} expanded={expanded} onToggle={toggle} active={active} onLinkPress={onLinkPress} />;
-      case 'context': return <ContextToolGroup tools={block.tools} expanded={expanded} onToggle={toggle} active={active} />;
+      case 'user': return <UserPrompt message={block.message} imageClient={imageClient} directory={directory} active={active} />;
+      case 'part': return <View className="gap-1">
+        {block.message?.createdAt !== undefined && <Text className="text-[9px] text-muted-foreground">Assistant · {new Date(block.message.createdAt).toLocaleTimeString()}</Text>}
+        <AssistantPart part={block.part} streaming={active && block.streaming} expanded={expanded} onToggle={toggle} active={active} onLinkPress={onLinkPress} />
+      </View>;
       case 'thinking': return <ThinkingIndicator active={active} />;
-      case 'error': return <View className="flex-row gap-2 rounded-md bg-destructive/10 px-3 py-2.5"><CircleAlert size={15} color={colors.error} /><Text selectable className="min-w-0 flex-1 text-[12px] leading-[18px] text-muted-foreground">{block.error}</Text></View>;
+      case 'error': return <TranscriptNoticeCard error className="flex-row"><CircleAlert size={15} color={colors.error} /><Text selectable className="min-w-0 flex-1 text-[12px] leading-[18px] text-muted-foreground"><SearchText text={block.error} /></Text></TranscriptNoticeCard>;
       case 'changes': return <ChangedFiles turn={block.turn} expanded={expanded} onToggle={toggle} />;
       case 'diff': return <ToolFileDiffBlock file={block.file} />;
-      case 'meta': return <TurnMeta turn={block.turn} />;
+      case 'meta': return <TurnMeta turn={block.turn} expanded={expanded} onToggle={toggle} />;
     }
   };
   return (
@@ -732,31 +1005,48 @@ const TranscriptBlockView = memo(function TranscriptBlockRow({
       'w-full',
       block.spacing === 'turn' && 'mt-7',
       block.spacing === 'part' && 'mt-3',
-      block.type === 'part' && block.nested && 'border-l border-border pl-3',
+      searchSelected && 'rounded-md bg-primary/10',
     )} style={block.type === 'meta' ? { minHeight: 1 } : undefined}>
-      {content()}
+      <ChatComposerSelection.Provider value={onAddToComposer}>
+        <ChatSearchQuery.Provider value={searchQuery}>{content()}</ChatSearchQuery.Provider>
+      </ChatComposerSelection.Provider>
     </View>
   );
 });
 
 export function AgentChatView({
+  imageClient,
   state,
   active = true,
   agent,
   agentStatus,
   contentInsets,
   latestButtonBottom,
+  searchOpen: searchRequested = false,
+  onCloseSearch,
   onOpenFile,
+  onOpenWebLink = openExternalUrl,
   onInitialViewportReady,
   savedViewport,
   onSaveViewport,
 }: Props) {
   const { colors } = useTheme();
+  const addToComposer = useContext(ChatComposerSelection);
+  const selectionOwner = useRef({ active, sessionId: state.sessionId });
+  selectionOwner.current = { active, sessionId: state.sessionId };
+  const addSelectionToComposer = useCallback((text: string) => {
+    if (selectionOwner.current.active && selectionOwner.current.sessionId === state.sessionId) {
+      addToComposer?.(text);
+    }
+  }, [addToComposer, state.sessionId]);
+  const searchSession = useRef(state.sessionId);
+  const searchOpen = active && searchRequested && searchSession.current === state.sessionId;
   const appGlassEnabled = useAppGlassEnabled();
   const [followEnd, setFollowEndState] = useState(
     savedViewport?.followEnd ?? true,
   );
   const [viewportReady, setViewportReady] = useState(false);
+  const { scrolling, beginScroll, endScroll, resetScroll } = useScrollActivity();
   // These refs belong to this binding/generation, and survive warm reuse.
   const savedViewportRef = useRef<SavedChatViewport | null>(
     savedViewport ?? null,
@@ -771,6 +1061,12 @@ export function AgentChatView({
   });
   const turns = state.transcript.turns;
   const agentWorking = agentStatus === 'working';
+  const searchPresentation = useMemo(() => searchOpen
+    ? chatSearchPresentation(turns, agentWorking)
+    : EMPTY_CHAT_SEARCH_PRESENTATION, [searchOpen, turns, agentWorking]);
+  const search = useChatSearch(searchPresentation.documents, searchOpen && active);
+  const pendingSearch = useRef<string | null>(null);
+  const lastSearchReveal = useRef('');
   const [expandedBlocks, setExpandedBlocks] = useState<ReadonlySet<string>>(
     () => savedViewport?.expandedBlocks ?? new Set(),
   );
@@ -810,7 +1106,7 @@ export function AgentChatView({
   const initialViewportReadyCallbackRef = useRef(onInitialViewportReady);
   initialViewportReadyCallbackRef.current = onInitialViewportReady;
   const lastInitialViewportDiagnosticRef = useRef('');
-  const agentName = agent === 'opencode' ? 'OpenCode' : 'Codex';
+  const agentName = chatAgentDisplayName(agent);
   const [initialScrollIndex] = useState(() => {
     if (!savedViewport?.anchor || savedViewport.followEnd) return undefined;
     const index = blocks.findIndex(
@@ -850,10 +1146,66 @@ export function AgentChatView({
       });
   }, []);
 
+  useEffect(() => {
+    if (searchSession.current === state.sessionId) return;
+    searchSession.current = state.sessionId;
+    if (active && searchRequested) onCloseSearch?.();
+  }, [state.sessionId, active, searchRequested, onCloseSearch]);
+
+  useLayoutEffect(() => {
+    if (!searchOpen) return;
+    followEndRef.current = false;
+    setFollowEndState(false);
+  }, [searchOpen]);
+
+  useLayoutEffect(() => {
+    const match = search.match;
+    if (!match || !active) {
+      pendingSearch.current = null;
+      lastSearchReveal.current = '';
+      return;
+    }
+    const key = JSON.stringify([search.query, match.documentId, String(match.offset), search.navigationRevision]);
+    if (lastSearchReveal.current === key) return;
+    lastSearchReveal.current = key;
+    pendingSearch.current = match.documentId;
+    followEndRef.current = false;
+    setFollowEndState(false);
+    setExpandedBlocks(current => new Set([...current, ...(searchPresentation.reveal.get(match.documentId) ?? [match.documentId])]));
+  }, [search.match, search.query, search.navigationRevision, searchPresentation, active]);
+
+  const searchBarHeight = searchOpen ? chatSearchBarHeight(search.query) : 0;
+  const contextTop = contentInsets.top + searchBarHeight;
+  const { prompt: pinnedPrompt, update: updatePinnedPrompt } = usePinnedPrompt(blocks, list, contextTop);
+  const latestTurn = turns.at(-1);
+  const activity = useMemo(() => state.status === 'live'
+    && (agentWorking || latestTurn?.status === 'working')
+    && latestTurn?.status !== 'error' && latestTurn?.status !== 'interrupted'
+      ? currentActivity(blocks, latestTurn)
+      : undefined, [state.status, agentWorking, latestTurn, blocks]);
+  const activityBottom = contentInsets.bottom + CHAT_CONTEXT_GAP;
+  const activityClearance = activity ? CHAT_CONTEXT_HEIGHT + CHAT_CONTEXT_GAP : 0;
+
+  useLayoutEffect(() => {
+    updatePinnedPrompt(scrollGeometryRef.current.offset);
+  }, [updatePinnedPrompt]);
+
+  const revealSearchMatch = () => {
+    if (pendingSearch.current && active && initialViewportRef.current.ready) {
+      const index = blocks.findIndex(block => block.id === pendingSearch.current);
+      if (index < 0) return;
+      pendingSearch.current = null;
+      const scroll = list.current?.scrollToIndex({
+        index, animated: false, viewOffset: contentInsets.top + searchBarHeight,
+      });
+      if (scroll) reportBackgroundFailure(scroll, 'chat-search-reveal');
+    }
+  };
+
   useLayoutEffect(() => () => saveViewport(), [saveViewport]);
   const contentPadding = insetContentPadding(contentInsets, {
-    top: CHAT_CONTENT_TOP_GAP,
-    bottom: CHAT_CONTENT_BOTTOM_GAP,
+    top: CHAT_CONTENT_TOP_GAP + searchBarHeight,
+    bottom: CHAT_CONTENT_BOTTOM_GAP + activityClearance,
   });
   const maxOffset = Math.max(0, scrollGeometry.contentHeight - scrollGeometry.viewportHeight);
   const scrollThumb = scrollThumbGeometry(
@@ -864,6 +1216,7 @@ export function AgentChatView({
 
   const updateScrollGeometry = (next: ChatScrollGeometry) => {
     scrollGeometryRef.current = next;
+    updatePinnedPrompt(next.offset);
     setScrollGeometry(current => (
       current.contentHeight === next.contentHeight
       && current.offset === next.offset
@@ -976,6 +1329,7 @@ export function AgentChatView({
     recordInitialViewportReadiness(source);
     if (!initialViewportConditionsSatisfied()) return;
     readiness.ready = true;
+    // Initial/returning viewports have already aligned to the remapped saved anchor.
     setViewportReady(true);
     recordInitialViewportReadiness('ready');
     recordAgentChatDiagnostic('viewport-ready', {
@@ -1026,6 +1380,10 @@ export function AgentChatView({
       };
     }
     updateInitialEndPosition(current.offset, contentHeight, viewportHeight);
+    if (active && initialViewportRef.current.ready && followEndRef.current
+      && current.viewportHeight > 0 && viewportHeight !== current.viewportHeight) {
+      list.current?.scrollToEnd({ animated: false });
+    }
   };
 
   const alignLoadedInitialViewport = () => {
@@ -1068,6 +1426,7 @@ export function AgentChatView({
     }
     readiness.ready = false;
     setViewportReady(false);
+    resetScroll();
     scrollInteractionRef.current = {
       kind: ChatScrollInteractionKind.Idle,
       lastOffset: scrollGeometryRef.current.offset,
@@ -1144,6 +1503,13 @@ export function AgentChatView({
     scrollInteractionRef.current = { ...interaction, lastOffset: offset };
   };
   const beginUserScroll = (event: NativeSyntheticEvent<NativeScrollEvent>) => {
+    beginScroll();
+    pendingSearch.current = null;
+    recordAgentChatDiagnostic('viewport-drag-start', {
+      active,
+      offset: event.nativeEvent.contentOffset.y,
+      stateRevision: state.revision,
+    });
     trackScroll(event);
     const maximumOffset = Math.max(
       0,
@@ -1158,10 +1524,12 @@ export function AgentChatView({
       kind: ChatScrollInteractionKind.AwaitingMomentum,
       lastOffset: scrollGeometryRef.current.offset,
     };
+    endScroll();
   };
   const beginMomentumScroll = () => {
     const interaction = scrollInteractionRef.current;
     if (interaction.kind !== ChatScrollInteractionKind.AwaitingMomentum) return;
+    beginScroll();
     scrollInteractionRef.current = { ...interaction, kind: ChatScrollInteractionKind.UserMomentum };
   };
   const endMomentumScroll = (event: NativeSyntheticEvent<NativeScrollEvent>) => {
@@ -1170,6 +1538,7 @@ export function AgentChatView({
       kind: ChatScrollInteractionKind.Idle,
       lastOffset: scrollGeometryRef.current.offset,
     };
+    endScroll();
   };
   const beginScrollbarDrag = ({
     trackHeight,
@@ -1181,6 +1550,7 @@ export function AgentChatView({
       scrollbarDragRef.current = null;
       return;
     }
+    beginScroll();
     scrollInteractionRef.current = {
       kind: ChatScrollInteractionKind.Idle,
       lastOffset: current.offset,
@@ -1245,6 +1615,7 @@ export function AgentChatView({
   }: {
     viewableItems: ViewToken<ChatBlock>[];
   }) => {
+    updatePinnedPrompt(scrollGeometryRef.current.offset);
     const currentLatestBlockId = latestBlockIdRef.current;
     initialViewportRef.current.viewableLatestBlockId =
       currentLatestBlockId !== null &&
@@ -1265,19 +1636,33 @@ export function AgentChatView({
         onOpenFile(file);
         return;
       }
-      if (/^(?:https?:|mailto:|tel:)/i.test(url)) openExternalUrl(url);
+      if (/^https?:/i.test(url)) onOpenWebLink(url);
+      else if (/^(?:mailto:|tel:)/i.test(url)) openExternalUrl(url);
     },
-    [onOpenFile, state.transcript.info?.directory],
+    [onOpenFile, onOpenWebLink, state.transcript.info?.directory],
   );
+
+  const viewportVisible = active && activeRef.current === active && viewportReady;
 
   return (
     <View
+      // Readiness/activity opacity changes must not flatten and reparent this layer.
+      collapsable={false}
+      testID="agent-chat-root"
+      pointerEvents={viewportVisible ? 'auto' : 'none'}
       className={cn('flex-1', appGlassBackgroundClassName(appGlassEnabled))}
-      style={{ opacity: active && activeRef.current === active && viewportReady ? 1 : 0 }}
+      style={{ opacity: viewportVisible ? 1 : 0 }}
     >
       <View
         testID="agent-chat-viewport"
         className="relative flex-1"
+        onTouchStart={event => {
+          recordAgentChatDiagnostic('viewport-touch-start', {
+            active,
+            target: event.nativeEvent.target,
+            stateRevision: state.revision,
+          });
+        }}
         onLayout={event => {
           initialViewportRef.current.viewportLaidOut = true;
           const current = scrollGeometryRef.current;
@@ -1290,6 +1675,10 @@ export function AgentChatView({
       >
         <FlashList
           ref={list}
+          onCommitLayoutEffect={() => {
+            updatePinnedPrompt(scrollGeometryRef.current.offset);
+            revealSearchMatch();
+          }}
           initialScrollIndex={initialScrollIndex}
           data={blocks}
           keyExtractor={block => block.id}
@@ -1300,8 +1689,13 @@ export function AgentChatView({
               block={item}
               active={active}
               expanded={expandedBlocks.has(item.id)}
+              searchSelected={search.match?.documentId === item.id}
+              searchQuery={searchOpen && search.ready ? search.query.trim() : ''}
               onToggle={toggleBlock}
               onLinkPress={openTranscriptLink}
+              imageClient={imageClient}
+              directory={state.transcript.info?.directory}
+              onAddToComposer={active && addToComposer ? addSelectionToComposer : undefined}
             />
           )}
           contentContainerStyle={chatListStyles.content}
@@ -1342,7 +1736,9 @@ export function AgentChatView({
             </>
           }
           ListFooterComponent={
-            <ChatBoundarySpacer height={contentPadding.bottom} />
+            <>
+              <ChatBoundarySpacer height={contentPadding.bottom} />
+            </>
           }
           ListEmptyComponent={
             state.status === 'live' && agentWorking ? (
@@ -1373,7 +1769,7 @@ export function AgentChatView({
             if (
               contentSizeWasKnown &&
               active && initialViewportRef.current.ready &&
-              height > current.contentHeight + CHAT_SCROLL_OFFSET_EPSILON &&
+              Math.abs(height - current.contentHeight) > CHAT_SCROLL_OFFSET_EPSILON &&
               followEndRef.current
             )
               list.current?.scrollToEnd({ animated: false });
@@ -1402,30 +1798,84 @@ export function AgentChatView({
           onViewableItemsChanged={trackViewableBlocks}
           scrollEventThrottle={16}
         />
-        {!followEnd && (
+        {active && !searchOpen && pinnedPrompt && (
+          <Pressable
+            testID="chat-pinned-prompt"
+            accessibilityRole="button"
+            accessibilityLabel={`Jump to prompt: ${pinnedPrompt.preview}`}
+            accessibilityHint="Scrolls to the original message"
+            className="absolute left-4 right-4 z-20 flex-row items-center gap-2 rounded-xl bg-purple-950 px-3"
+            style={{ top: contextTop, height: CHAT_CONTEXT_HEIGHT }}
+            onPress={hapticPress(() => {
+              pendingSearch.current = null;
+              setFollowEnd(false);
+              scrollInteractionRef.current = {
+                kind: ChatScrollInteractionKind.Idle,
+                lastOffset: scrollGeometryRef.current.offset,
+              };
+              const scroll = list.current?.scrollToIndex({
+                index: pinnedPrompt.index, animated: false, viewOffset: contextTop,
+              });
+              if (scroll) reportBackgroundFailure(scroll, 'chat-prompt-reveal');
+            })}
+          >
+            <Text numberOfLines={1} className="min-w-0 flex-1 text-[13px] leading-5 text-purple-50">{pinnedPrompt.preview}</Text>
+            <ChevronUp size={16} color="#faf5ff" />
+          </Pressable>
+        )}
+        {active && activity && (
+          <GlassSurface
+            testID="chat-pinned-activity"
+            className={cn('absolute left-4 right-4 z-20 rounded-xl', appGlassEnabled && APP_GLASS_BORDER_CLASS_NAME)}
+            fallbackClassName="border border-border bg-background"
+            style={{ bottom: activityBottom, height: CHAT_CONTEXT_HEIGHT }}
+          >
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel={`Current activity: ${activity.title}${activity.detail ? `, ${activity.detail}` : ''}`}
+              accessibilityHint="Jump to the latest output"
+              className="min-h-11 flex-row items-center gap-2 px-3"
+              onPress={hapticPress(() => {
+                pendingSearch.current = null;
+                setFollowEnd(true);
+                scrollToLatest(true);
+              })}
+            >
+              <ActivityIndicator animating={active} size={13} color={colors.textTertiary} />
+              <Text numberOfLines={1} className="min-w-0 flex-1 text-[12px] leading-5 text-foreground">
+                {activity.title}{activity.detail ? ` · ${activity.detail}` : ''}
+              </Text>
+              <ArrowDown size={16} color={colors.textSecondary} />
+            </Pressable>
+          </GlassSurface>
+        )}
+        {searchOpen && <ChatSearchBar search={search} top={contentInsets.top} onClose={() => {
+          pendingSearch.current = null;
+          onCloseSearch?.();
+          Keyboard.dismiss();
+        }} />}
+        {!followEnd && !scrolling && !nearEnd(scrollGeometry.offset, maxOffset) && (
           <Button
             accessibilityLabel="Jump to latest"
-            className={cn(
-              'absolute right-4 h-8 flex-row gap-1.5 rounded-full px-3 shadow-lg',
-              appGlassEnabled && 'border',
-            )}
+            className={LATEST_BUTTON_CLASS_NAME}
             style={[
-              { bottom: latestButtonBottom },
-              appGlassEnabled ? appGlassControlStyle(false, colors) : undefined,
+              { bottom: activity ? Math.max(latestButtonBottom, activityBottom + activityClearance) : latestButtonBottom },
+              latestButtonStyle(colors),
             ]}
-            variant={appGlassEnabled ? 'ghost' : 'secondary'}
+            variant="secondary"
+            size="icon"
             onPress={() => {
               setFollowEnd(true);
               scrollToLatest(true);
             }}
           >
-            <ChevronDown size={15} color={colors.text} />
-            <Text className="text-[10px] font-semibold">Latest</Text>
+            <ArrowDown size={LATEST_BUTTON_ICON_SIZE} color={colors.text} />
           </Button>
         )}
         {scrollThumb && (
           <OverlayScrollbar
             accessibilityLabel="Conversation scroll position"
+            glass={appGlassEnabled}
             heightPercent={scrollThumb.heightPercent}
             insets={contentInsets}
             topPercent={scrollThumb.topPercent}
@@ -1433,6 +1883,7 @@ export function AgentChatView({
             onDrag={dragScrollbar}
             onDragEnd={() => {
               scrollbarDragRef.current = null;
+              endScroll();
             }}
             onDragStart={beginScrollbarDrag}
           />

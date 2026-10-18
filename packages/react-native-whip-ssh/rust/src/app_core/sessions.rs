@@ -3,8 +3,10 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use super::terminal_rail::{TerminalRail, TerminalRailView};
-use crate::host_runtime::{HostConnectionState, HostRuntime};
-use crate::host_state::{HostFreshness, HostStateSnapshot};
+use crate::herdr_api::{HerdrControlError, HerdrPaneInfo};
+use crate::herdr_selection::{preferred_pane, preferred_tab, preferred_workspace_pane};
+use crate::host_runtime::{AgentControlView, HostConnectionState, HostRuntime};
+use crate::host_state::HostStateSnapshot;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum AppConnectionStatus {
@@ -33,6 +35,7 @@ pub struct AppSessionView {
     pub selection: SessionSelection,
     pub host_state: Option<HostStateSnapshot>,
     pub terminal_rail: TerminalRailView,
+    pub agent_controls: Vec<AgentControlView>,
 }
 
 #[derive(Clone, Debug, PartialEq, uniffi::Record)]
@@ -46,40 +49,56 @@ pub(super) struct AppSession {
     pub(super) id: String,
     pub(super) host_id: String,
     runtime: Option<Arc<HostRuntime>>,
+    cached_host_state: Option<HostStateSnapshot>,
     placeholder_status: AppConnectionStatus,
     placeholder_error: Option<String>,
     placeholder_reconnect_attempt: u32,
     selection: SessionSelection,
     observed_host_revision: u64,
+    observed_agent_controls: Vec<AgentControlView>,
     terminal_rail: TerminalRail,
 }
 
 impl AppSession {
+    fn host_state(&self) -> Option<HostStateSnapshot> {
+        let live = self.runtime.as_ref().map(|runtime| runtime.host_state());
+        self.host_state_with_cache(live)
+    }
+
+    fn host_state_with_cache(&self, live: Option<HostStateSnapshot>) -> Option<HostStateSnapshot> {
+        if live.as_ref().is_some_and(|state| state.snapshot.is_some()) {
+            live
+        } else {
+            self.cached_host_state.clone().or(live)
+        }
+    }
+
+    pub(super) fn agent_order(&self) -> Option<Vec<String>> {
+        self.runtime
+            .as_ref()
+            .and_then(|runtime| runtime.herd_agent_order())
+    }
+
     pub(super) fn view(&self) -> AppSessionView {
-        let host_state = self.runtime.as_ref().map(|runtime| runtime.host_state());
-        let (connection_status, connection_error, reconnect_attempt) =
+        let (live_host_state, connection_status, connection_error, reconnect_attempt) =
             self.runtime.as_ref().map_or_else(
                 || {
                     (
+                        None,
                         self.placeholder_status,
                         self.placeholder_error.clone(),
                         self.placeholder_reconnect_attempt,
                     )
                 },
                 |runtime| {
-                    let status = runtime.status();
+                    let (status, host_state, ready) = runtime.app_session_state();
                     let connection_status = match status.state {
                         HostConnectionState::Disconnected | HostConnectionState::Disconnecting => {
                             AppConnectionStatus::Disconnected
                         }
                         HostConnectionState::Connecting => AppConnectionStatus::Connecting,
                         HostConnectionState::Connected => {
-                            if host_state.as_ref().is_some_and(|state| {
-                                matches!(
-                                    state.freshness,
-                                    HostFreshness::Fresh | HostFreshness::Unavailable
-                                )
-                            }) {
+                            if ready {
                                 AppConnectionStatus::Ready
                             } else {
                                 AppConnectionStatus::Connected
@@ -88,9 +107,15 @@ impl AppSession {
                         HostConnectionState::Reconnecting => AppConnectionStatus::Reconnecting,
                         HostConnectionState::Failed => AppConnectionStatus::Error,
                     };
-                    (connection_status, status.error, status.reconnect_attempt)
+                    (
+                        Some(host_state),
+                        connection_status,
+                        status.error,
+                        status.reconnect_attempt,
+                    )
                 },
             );
+        let host_state = self.host_state_with_cache(live_host_state);
         AppSessionView {
             id: self.id.clone(),
             host_id: self.host_id.clone(),
@@ -100,14 +125,28 @@ impl AppSession {
             selection: self.selection.clone(),
             host_state,
             terminal_rail: self.terminal_rail.view(),
+            agent_controls: self.agent_controls(),
         }
     }
 
+    fn agent_controls(&self) -> Vec<AgentControlView> {
+        self.runtime
+            .as_ref()
+            .map_or_else(Vec::new, |runtime| runtime.agent_control_views())
+    }
+
     fn reconcile_selection(&mut self) -> bool {
+        let controls = self.agent_controls();
+        let controls_changed = controls != self.observed_agent_controls;
+        self.observed_agent_controls = controls;
         let Some(runtime) = &self.runtime else {
-            return false;
+            return controls_changed;
         };
         let host_state = runtime.host_state();
+        self.reconcile_host_state(&host_state) || controls_changed
+    }
+
+    fn reconcile_host_state(&mut self, host_state: &HostStateSnapshot) -> bool {
         if host_state.revision <= self.observed_host_revision {
             return false;
         }
@@ -115,6 +154,7 @@ impl AppSession {
         let Some(snapshot) = host_state.snapshot.as_ref() else {
             return true;
         };
+        self.cached_host_state = None;
         self.terminal_rail.reconcile(snapshot);
         if !valid_selection(snapshot, &self.selection) {
             let selection = server_focus_selection(snapshot);
@@ -211,11 +251,13 @@ impl AppCore {
                 id: session_id.clone(),
                 host_id,
                 runtime: None,
+                cached_host_state: None,
                 placeholder_status: AppConnectionStatus::Connecting,
                 placeholder_error: None,
                 placeholder_reconnect_attempt: 0,
                 selection: SessionSelection::default(),
                 observed_host_revision: 0,
+                observed_agent_controls: Vec::new(),
                 terminal_rail: TerminalRail::default(),
             });
         }
@@ -237,6 +279,34 @@ impl AppCore {
             session.observed_host_revision = 0;
             state.bump_revision();
         }
+        state.view()
+    }
+
+    /// Cache metadata is only a stale fallback; a runtime snapshot always wins.
+    pub fn restore_cached_host(&self, session_id: String, cache_blob: String) -> AppCoreView {
+        let mut state = self.state.lock();
+        let Some(session) = state
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == session_id)
+        else {
+            return state.view();
+        };
+        if session
+            .host_state()
+            .is_some_and(|state| state.snapshot.is_some())
+        {
+            return state.view();
+        }
+        let Some(cached) = super::offline::decode(&cache_blob) else {
+            return state.view();
+        };
+        if let Some(snapshot) = &cached.snapshot {
+            session.selection = server_focus_selection(snapshot);
+            session.terminal_rail.seed_cached(snapshot);
+        }
+        session.cached_host_state = Some(cached);
+        state.bump_revision();
         state.view()
     }
 
@@ -338,11 +408,7 @@ impl AppCore {
         else {
             return state.view();
         };
-        let Some(snapshot) = session
-            .runtime
-            .as_ref()
-            .and_then(|runtime| runtime.host_state().snapshot)
-        else {
+        let Some(snapshot) = session.host_state().and_then(|state| state.snapshot) else {
             return state.view();
         };
         let Some(workspace) = snapshot
@@ -367,11 +433,49 @@ impl AppCore {
         state.view()
     }
 
+    pub async fn open_workspace(
+        &self,
+        session_id: String,
+        workspace_id: String,
+    ) -> Result<Option<HerdrPaneInfo>, HerdrControlError> {
+        const SESSION_UNAVAILABLE: &str = "Host session is unavailable";
+        let (runtime, cached_pane) = {
+            let state = self.state.lock();
+            let session = state
+                .sessions
+                .iter()
+                .find(|session| session.id == session_id)
+                .ok_or_else(|| HerdrControlError::InvalidField(SESSION_UNAVAILABLE.to_owned()))?;
+            let runtime = session.runtime.clone();
+            let has_live_snapshot = runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.host_state().snapshot.is_some());
+            let cached_pane = if has_live_snapshot {
+                None
+            } else {
+                session
+                    .cached_host_state
+                    .as_ref()
+                    .and_then(|state| state.snapshot.as_ref())
+                    .and_then(|snapshot| preferred_workspace_pane(snapshot, &workspace_id))
+                    .cloned()
+            };
+            drop(state);
+            (runtime, cached_pane)
+        };
+        if cached_pane.is_some() {
+            return Ok(cached_pane);
+        }
+        let runtime = runtime.ok_or_else(|| {
+            HerdrControlError::TransportDisconnected(SESSION_UNAVAILABLE.to_owned())
+        })?;
+        runtime.open_workspace(workspace_id).await
+    }
+
     pub fn restore_terminals(
         &self,
         session_id: String,
-        terminal_ids: Vec<String>,
-        active_terminal_id: Option<String>,
+        resume_blob: Option<String>,
     ) -> AppCoreView {
         let mut state = self.state.lock();
         let Some(session) = state
@@ -381,19 +485,27 @@ impl AppCore {
         else {
             return state.view();
         };
-        let Some(snapshot) = session
-            .runtime
-            .as_ref()
-            .and_then(|runtime| runtime.host_state().snapshot)
-        else {
-            return state.view();
-        };
-        if session
-            .terminal_rail
-            .restore(terminal_ids, active_terminal_id, &snapshot)
-        {
-            state.bump_revision();
+        let snapshot = session.host_state().and_then(|state| state.snapshot);
+        let current_active = session.terminal_rail.view().active_terminal_id;
+        if let Some(snapshot) = snapshot {
+            session
+                .terminal_rail
+                .restore_blob(resume_blob.as_deref(), &snapshot);
+            if let Some(pane) = current_active.and_then(|active| {
+                snapshot
+                    .panes
+                    .iter()
+                    .find(|pane| pane.terminal_id == active)
+            }) {
+                session.terminal_rail.open_pane(pane);
+            }
+            if session.cached_host_state.is_some() {
+                session.terminal_rail.mark_cached();
+            }
+        } else {
+            session.terminal_rail.defer_restore(resume_blob.as_deref());
         }
+        state.bump_revision();
         state.view()
     }
 
@@ -407,17 +519,28 @@ impl AppCore {
             return state.view();
         };
         let pane = session
-            .runtime
-            .as_ref()
-            .and_then(|runtime| runtime.host_state().snapshot)
+            .host_state()
+            .and_then(|state| state.snapshot)
             .and_then(|snapshot| {
                 snapshot
                     .panes
                     .into_iter()
                     .find(|pane| pane.pane_id == pane_id)
             });
-        if pane.is_some_and(|pane| session.terminal_rail.open_pane(&pane)) {
-            state.bump_revision();
+        if let Some(pane) = pane {
+            let selection = SessionSelection {
+                workspace_id: Some(pane.workspace_id.clone()),
+                tab_id: Some(pane.tab_id.clone()),
+                pane_id: Some(pane.pane_id.clone()),
+            };
+            let changed = session.terminal_rail.open_pane(&pane) || session.selection != selection;
+            session.selection = selection;
+            if session.cached_host_state.is_some() {
+                session.terminal_rail.mark_cached();
+            }
+            if changed {
+                state.bump_revision();
+            }
         }
         state.view()
     }
@@ -429,6 +552,37 @@ impl AppCore {
             .iter_mut()
             .find(|session| session.id == session_id)
             .is_some_and(|session| session.terminal_rail.open_ssh_shell(title))
+        {
+            state.bump_revision();
+        }
+        state.view()
+    }
+
+    pub fn select_ssh_shell(&self, session_id: String, terminal_id: String) -> AppCoreView {
+        let mut state = self.state.lock();
+        if state
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == session_id)
+            .is_some_and(|session| session.terminal_rail.select_ssh_shell(&terminal_id))
+        {
+            state.bump_revision();
+        }
+        state.view()
+    }
+
+    pub fn rename_ssh_shell(
+        &self,
+        session_id: String,
+        terminal_id: String,
+        title: String,
+    ) -> AppCoreView {
+        let mut state = self.state.lock();
+        if state
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == session_id)
+            .is_some_and(|session| session.terminal_rail.rename_ssh_shell(&terminal_id, title))
         {
             state.bump_revision();
         }
@@ -568,68 +722,23 @@ fn server_focus_selection(snapshot: &crate::herdr_api::HerdrSessionSnapshot) -> 
     }
 }
 
-fn preferred_workspace_pane<'a>(
-    snapshot: &'a crate::herdr_api::HerdrSessionSnapshot,
-    workspace_id: &str,
-) -> Option<&'a crate::herdr_api::HerdrPaneInfo> {
-    let workspace = snapshot
-        .workspaces
-        .iter()
-        .find(|workspace| workspace.workspace_id == workspace_id)?;
-    let tab = preferred_tab(snapshot, workspace)?;
-    preferred_pane(snapshot, tab)
-}
-
-fn preferred_tab<'a>(
-    snapshot: &'a crate::herdr_api::HerdrSessionSnapshot,
-    workspace: &crate::herdr_api::HerdrWorkspaceInfo,
-) -> Option<&'a crate::herdr_api::HerdrTabInfo> {
-    snapshot
-        .tabs
-        .iter()
-        .filter(|tab| tab.workspace_id == workspace.workspace_id)
-        .find(|tab| tab.tab_id == workspace.active_tab_id)
-        .or_else(|| {
-            snapshot
-                .tabs
-                .iter()
-                .filter(|tab| tab.workspace_id == workspace.workspace_id)
-                .find(|tab| tab.focused)
-        })
-        .or_else(|| {
-            snapshot
-                .tabs
-                .iter()
-                .find(|tab| tab.workspace_id == workspace.workspace_id)
-        })
-}
-
-fn preferred_pane<'a>(
-    snapshot: &'a crate::herdr_api::HerdrSessionSnapshot,
-    tab: &crate::herdr_api::HerdrTabInfo,
-) -> Option<&'a crate::herdr_api::HerdrPaneInfo> {
-    snapshot
-        .panes
-        .iter()
-        .filter(|pane| pane.tab_id == tab.tab_id)
-        .find(|pane| pane.focused)
-        .or_else(|| snapshot.panes.iter().find(|pane| pane.tab_id == tab.tab_id))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host_state::HostFreshness;
 
     fn session(id: &str, host_id: &str) -> AppSession {
         AppSession {
             id: id.to_owned(),
             host_id: host_id.to_owned(),
             runtime: None,
+            cached_host_state: None,
             placeholder_status: AppConnectionStatus::Connecting,
             placeholder_error: None,
             placeholder_reconnect_attempt: 0,
             selection: SessionSelection::default(),
             observed_host_revision: 0,
+            observed_agent_controls: Vec::new(),
             terminal_rail: TerminalRail::default(),
         }
     }
@@ -751,5 +860,221 @@ mod tests {
     fn app_session_fixture_is_disconnected_from_runtime_truth() {
         let value = session("one", "host");
         assert_eq!(value.view().host_state, None);
+    }
+
+    fn cached_core() -> Arc<AppCore> {
+        let core = AppCore::new();
+        core.open_session("live".to_owned(), "host".to_owned(), true);
+        core.restore_cached_host(
+            "live".to_owned(),
+            super::super::offline::fixture().to_string(),
+        );
+        core
+    }
+
+    #[test]
+    fn cached_workspace_opens_before_a_runtime_attaches() {
+        let core = cached_core();
+        let pane = crate::runtime()
+            .unwrap()
+            .block_on(core.open_workspace("live".to_owned(), "workspace".to_owned()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(pane.pane_id, "one");
+        assert_eq!(pane.terminal_id, "terminal-one");
+    }
+
+    #[test]
+    fn rust_encoded_cache_restores_pane_navigation_and_offline_terminal_metadata() {
+        let snapshot = super::super::offline::decode(&super::super::offline::fixture().to_string())
+            .unwrap()
+            .snapshot
+            .unwrap();
+        let core = AppCore::new();
+        core.open_session("live".to_owned(), "host".to_owned(), true);
+        let view = core.restore_cached_host(
+            "live".to_owned(),
+            super::super::offline::encode(&snapshot, 5678).unwrap(),
+        );
+        let session = &view.sessions[0];
+        let host_state = session.host_state.as_ref().unwrap();
+        assert_eq!(host_state.freshness, HostFreshness::Stale);
+        assert_eq!(host_state.last_synced_at_ms, Some(5678));
+        assert_eq!(session.selection.pane_id.as_deref(), Some("one"));
+        assert_eq!(session.terminal_rail.terminals.len(), 2);
+        assert_eq!(
+            core.herd_view(Vec::new(), None, None).hosts[0]
+                .workspaces
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn offline_cache_projects_through_the_same_session_and_herd_views() {
+        let core = cached_core();
+        let view = core.view();
+        let session = &view.sessions[0];
+        assert_eq!(session.connection_status, AppConnectionStatus::Connecting);
+        assert_eq!(
+            session.host_state.as_ref().unwrap().freshness,
+            HostFreshness::Stale
+        );
+        assert_eq!(session.terminal_rail.terminals.len(), 2);
+        assert!(
+            session
+                .terminal_rail
+                .terminals
+                .iter()
+                .all(|terminal| { terminal.state == super::super::TerminalUiState::Disconnected })
+        );
+        let herd = core.herd_view(Vec::new(), None, None);
+        assert!(!herd.hosts[0].connected);
+        assert!(herd.hosts[0].running);
+        assert_eq!(herd.hosts[0].tabs.len(), 1);
+    }
+
+    #[test]
+    fn herd_focus_follows_pane_events_despite_stale_agent_flags() {
+        use crate::herdr_events::HerdrEvent;
+        use crate::host_state::{ApplyResult, HostState};
+
+        let mut cache = super::super::offline::fixture();
+        let mut agents = cache["snapshot"]["panes"].clone();
+        for agent in agents.as_array_mut().unwrap() {
+            agent["focused"] = true.into();
+        }
+        cache["snapshot"]["agents"] = agents;
+        let core = AppCore::new();
+        core.open_session("live".to_owned(), "host".to_owned(), true);
+        let view = core.restore_cached_host("live".to_owned(), cache.to_string());
+        let snapshot = view.sessions[0]
+            .host_state
+            .as_ref()
+            .unwrap()
+            .snapshot
+            .clone()
+            .unwrap();
+        let mut host_state = HostState::default();
+        host_state.connection_installed(1);
+        let token = host_state.begin_sync(1);
+        assert_eq!(
+            host_state.complete_sync(token, snapshot, 10),
+            ApplyResult::Applied
+        );
+
+        for pane_id in ["one", "two", "one"] {
+            assert_eq!(
+                host_state.apply_event(
+                    1,
+                    HerdrEvent::PaneFocused {
+                        workspace_id: "workspace".to_owned(),
+                        pane_id: pane_id.to_owned(),
+                    },
+                    20,
+                ),
+                ApplyResult::Applied
+            );
+            core.state.lock().sessions[0].cached_host_state = Some(host_state.projection());
+            let herd = core.herd_view(Vec::new(), None, None);
+            let focused_rows = herd
+                .agents
+                .iter()
+                .filter(|row| row.agent.focused)
+                .map(|row| row.agent.pane_id.as_str())
+                .collect::<Vec<_>>();
+            let focused_host_agents = herd.hosts[0]
+                .agents
+                .iter()
+                .filter(|agent| agent.focused)
+                .map(|agent| agent.pane_id.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(focused_rows, [pane_id]);
+            assert_eq!(focused_host_agents, [pane_id]);
+        }
+    }
+
+    #[test]
+    fn offline_selection_survives_resume_restore_and_live_metadata_reconciliation() {
+        let core = cached_core();
+        core.open_pane_terminal("live".to_owned(), "two".to_owned());
+        let view = core.restore_terminals(
+            "live".to_owned(),
+            Some(
+                r#"{"version":1,"terminalIds":["terminal-one"],"activeTerminalId":"terminal-one"}"#
+                    .to_owned(),
+            ),
+        );
+        assert_eq!(view.sessions[0].selection.pane_id.as_deref(), Some("two"));
+        assert_eq!(
+            view.sessions[0].terminal_rail.active_terminal_id.as_deref(),
+            Some("terminal-two")
+        );
+
+        let mut state = core.state.lock();
+        let session = &mut state.sessions[0];
+        let mut live = session.host_state().unwrap();
+        live.revision = 1;
+        live.freshness = HostFreshness::Fresh;
+        live.snapshot.as_mut().unwrap().panes[1].label = Some("Renamed".to_owned());
+        assert!(session.reconcile_host_state(&live));
+        assert!(session.cached_host_state.is_none());
+        assert_eq!(session.selection.pane_id.as_deref(), Some("two"));
+        let terminal_rail = session.terminal_rail.view();
+        drop(state);
+        assert_eq!(terminal_rail.terminals[1].title, "Renamed");
+    }
+
+    #[test]
+    fn fresh_snapshot_removes_missing_cached_panes_and_validates_selection() {
+        let core = cached_core();
+        core.open_pane_terminal("live".to_owned(), "two".to_owned());
+        let mut state = core.state.lock();
+        let session = &mut state.sessions[0];
+        let mut live = session.host_state().unwrap();
+        live.revision = 1;
+        live.snapshot.as_mut().unwrap().panes.pop();
+        session.reconcile_host_state(&live);
+        assert_eq!(session.selection.pane_id.as_deref(), Some("one"));
+        let terminal_rail = session.terminal_rail.view();
+        drop(state);
+        assert_eq!(terminal_rail.terminals.len(), 1);
+    }
+
+    #[test]
+    fn late_cache_loads_cannot_replace_a_hydrated_or_closed_session() {
+        let core = cached_core();
+        core.open_pane_terminal("live".to_owned(), "two".to_owned());
+        let original = core.view();
+        let mut cache = super::super::offline::fixture();
+        cache["snapshot"]["panes"][1]["label"] = "Older".into();
+        assert_eq!(
+            core.restore_cached_host("live".to_owned(), cache.to_string()),
+            original
+        );
+        core.close_session("live".to_owned());
+        assert!(
+            core.restore_cached_host("live".to_owned(), cache.to_string())
+                .sessions
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn runtime_metadata_wins_over_cache_even_when_the_live_snapshot_is_empty() {
+        let core = cached_core();
+        let state = core.state.lock();
+        let session = &state.sessions[0];
+        let mut live = session.host_state().unwrap();
+        live.revision = 1;
+        live.freshness = HostFreshness::Fresh;
+        let snapshot = live.snapshot.as_mut().unwrap();
+        snapshot.panes.clear();
+        snapshot.tabs.clear();
+        snapshot.workspaces.clear();
+        let projected = session.host_state_with_cache(Some(live));
+        drop(state);
+        assert_eq!(projected.as_ref().unwrap().freshness, HostFreshness::Fresh);
+        assert!(projected.unwrap().snapshot.unwrap().panes.is_empty());
     }
 }

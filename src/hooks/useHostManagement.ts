@@ -3,6 +3,7 @@ import { Alert } from 'react-native';
 import type { TFunction } from 'i18next';
 
 import { deleteAgentChatCachesForHost } from '../services/agentChatCache';
+import { herdrSnapshotCache } from '../services/herdrSnapshotCache';
 import { reportBackgroundFailure } from '../services/backgroundOperations';
 import {
   credentialRecoveryStatus,
@@ -21,6 +22,7 @@ import {
   markHostDisconnected,
   migrateCredentialBackupsIfNeeded,
   saveConnectionProfile,
+  subscribeToHostProfiles,
 } from '../services/hostProfiles';
 import {
   deleteKnownHost,
@@ -75,7 +77,6 @@ export interface HostManagementController {
   deleteHostBusy: boolean;
   getHosts: () => HostProfile[];
   setError: (error: string | null) => void;
-  replaceHosts: (hosts: HostProfile[]) => void;
   persistProfile: (
     profile: ConnectionProfile,
   ) => Promise<{ hosts: HostProfile[]; host: HostProfile }>;
@@ -171,6 +172,8 @@ export function useHostManagement({
     setHosts(value);
   }, []);
 
+  useEffect(() => subscribeToHostProfiles(replaceHosts), [replaceHosts]);
+
   const replaceKnownHostsState = useCallback((value: KnownHostsLoadState) => {
     knownHostsStateRef.current = value;
     setKnownHostsState(value);
@@ -198,13 +201,11 @@ export function useHostManagement({
           )
         : loadHostProfiles();
     withAppPerformanceTrace('Whip startup store: hosts', () => load)
-      .then(replaceHosts)
       .catch(loadError => {
         setError(t('app.loadHostsError', { error: String(loadError) }));
-        replaceHosts([]);
       })
       .finally(() => setProfilesLoaded(true));
-  }, [replaceHosts, startupStorage, t]);
+  }, [startupStorage, t]);
 
   useEffect(() => {
     if (!deferredHydrationReady || deferredHydrationStartedRef.current) return;
@@ -249,23 +250,16 @@ export function useHostManagement({
     );
   }, [deferredHydrationReady]);
 
-  const persistProfile = useCallback(
-    async (profile: ConnectionProfile) => {
-      const saved = await saveConnectionProfile(hostsRef.current, profile);
-      replaceHosts(saved.hosts);
-      return saved;
-    },
-    [replaceHosts],
-  );
+  const persistProfile = saveConnectionProfile;
 
   const markDisconnected = useCallback(
     (hostId: string) => {
       reportBackgroundFailure(
-        markHostDisconnected(hostsRef.current, hostId).then(replaceHosts),
+        markHostDisconnected(hostId),
         'host-disconnected-persist',
       );
     },
-    [replaceHosts],
+    [],
   );
 
   const unlockCredentialRecovery = useCallback(async (): Promise<boolean> => {
@@ -431,7 +425,8 @@ export function useHostManagement({
     onDeleteConnectedHostRef.current(target.id);
     try {
       await deleteAgentChatCachesForHost(target.id);
-      replaceHosts(await deleteHostProfile(hostsRef.current, target.id));
+      await herdrSnapshotCache.delete(target.id);
+      await deleteHostProfile(target.id);
       setCredentialRecovery(await credentialRecoveryStatus());
       setEditorProfile(null);
       setError(null);
@@ -442,7 +437,7 @@ export function useHostManagement({
     } finally {
       setDeleteHostBusy(false);
     }
-  }, [deleteHostBusy, deleteHostTarget, replaceHosts, t]);
+  }, [deleteHostBusy, deleteHostTarget, t]);
 
   const dismissTopOverlay = useCallback(() => {
     if (knownHostsOpen) setKnownHostsOpen(false);
@@ -504,7 +499,6 @@ export function useHostManagement({
       deleteHostBusy,
       getHosts,
       setError,
-      replaceHosts,
       persistProfile,
       markDisconnected,
       confirmUnknownHost,
@@ -570,7 +564,6 @@ export function useHostManagement({
       pairingSuccess,
       persistProfile,
       profilesLoaded,
-      replaceHosts,
       retryKnownHosts,
       resolveUnknownHost,
       saveHost,

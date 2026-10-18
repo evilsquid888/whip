@@ -44,7 +44,9 @@ authoritative per-host projection.
 
 Whip opens SSH stream-local channels directly to Herdr's local API socket. Short-lived request channels carry structured actions and snapshots; a persistent subscription channel carries events. The `whip-ssh` Rust core owns request IDs and JSON serialization, newline response framing, response/error validation, subscription serialization, incremental JSONL framing, event normalization, and conversion into typed domain events. It also owns cohesive launch semantics: one typed shell/command/agent tab operation performs tab creation and the exact follow-up action, including managed-agent naming and typed partial failure. React Native supplies explicit shell or agent intents for dedicated UI actions and passes command-runner text as a command intent without tokenizing it. Rust alone interprets direct managed-agent command lines, preserves shell-bearing input as an ordinary command, and sequences `tab.create` with exactly one `agent.start` or `pane.send_input`.
 
-Herdr protocol code asks a stable `HerdrConnection` for control, event, or terminal streams; it does not receive an `SshSession`, socket path, stream-local channel ID, framing flag, or SSH generation. The connection owns socket discovery and cached-hint invalidation, selects the API or client socket for the logical stream, filters callbacks from replaced sessions, and cancels in-flight handshakes when its transport is replaced. There is no C ABI, callback context, dynamic symbol lookup, or JSON dispatch between the SSH and Herdr modules. Herdr JSON does not cross the React Native boundary. Rust applies snapshots, events, and confirmed mutation results to one authoritative per-host domain model. TypeScript invokes semantic operations and renders a typed, versioned projection.
+On generation-1 endpoints (Herdr protocol 22), each runtime also observes the server's structured `shell.snapshot.v1` through an inactive endpoint connection. It requests no rendered surface, input routing, or geometry ownership. Herd uses the snapshot's already-filtered `agent_order` rather than interpreting view criteria in the app, and preserves that order within each host. The complete JSON topology remains available for terminals, navigation, and notifications. Saved ordering belongs to one connection: reconnect, replacement installation, and explicit disconnect invalidate it. Herd falls back to the complete agent projection until the replacement observer supplies a fresh snapshot. Across hosts, any server projection (including an empty one) keeps agent rows grouped in the existing host ranking: connected hosts first, then aggregate visible-agent attention. Within each group, hosts with a projection keep server order and hosts without one use attention priority. If no host has a server projection, the existing global attention ordering remains unchanged.
+
+Herdr protocol code asks a stable `HerdrConnection` for control, event, agent-view, or terminal streams; it does not receive an `SshSession`, socket path, stream-local channel ID, framing flag, or SSH generation. The connection owns socket discovery and cached-hint invalidation, selects the API or client socket for the logical stream, filters callbacks from replaced sessions, and cancels in-flight handshakes when its transport is replaced. There is no C ABI, callback context, dynamic symbol lookup, or JSON dispatch between the SSH and Herdr modules. Herdr JSON does not cross the React Native boundary. Rust applies snapshots, events, and confirmed mutation results to one authoritative per-host domain model. TypeScript invokes semantic operations and renders a typed, versioned projection.
 
 Runtime failures cross UniFFI as tagged errors. SSH failures retain a stable `SshErrorCode` plus their diagnostic message, and protocol mismatches retain their expected and received versions. The native TypeScript adapter maps those fields mechanically to presentation codes; React Native does not classify native exception text or extract structured fields with regular expressions.
 
@@ -379,12 +381,4 @@ Implemented:
   restoration plus authoritative workspace/tab/pane/layout/focus/agent state;
   `AppCore` references one runtime per application session, and React Native
   receives typed lifecycle and versioned state projections;
-- Android release signing/Play delivery and unsigned ARM64 iOS device artifacts.
-
-Current transport/product milestones:
-
-1. Signed iOS beta/release distribution.
-2. Compatibility work for newly released Herdr protocols beyond 20.
-3. Terminal release semantics and restoration across mobile process death.
-4. Broader accessibility, large-screen, keyboard, and device coverage.
-5. More Herdr-native mobile actions that do not reproduce the management TUI.
+- Android release signing/Play delivery, signed iOS App Store distribution, and unsigned ARM64 iOS device artifacts for CI compile validation.

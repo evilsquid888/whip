@@ -15,6 +15,15 @@ export interface OpenSourceLicenseNotice {
 
 export const OPEN_SOURCE_LICENSES: readonly OpenSourceLicenseNotice[] = [
   {
+    id: 'shizuku-api',
+    projectName: 'Shizuku API',
+    sourceUrl: 'https://github.com/RikkaApps/Shizuku-API',
+    attribution: 'Whip uses Shizuku API and its provider to request privileged Android access.',
+    licenseName: 'MIT License',
+    copyright: 'Copyright (c) 2021 RikkaW',
+    licenseAsset: bundledAsset(require('../../assets/licenses/shizuku-MIT.txt')),
+  },
+  {
     id: 'whip',
     projectName: 'Whip',
     sourceUrl: 'https://github.com/kosumic/whip',
@@ -26,7 +35,7 @@ export const OPEN_SOURCE_LICENSES: readonly OpenSourceLicenseNotice[] = [
     id: 'opencode-web',
     projectName: 'OpenCode Web',
     sourceUrl: 'https://github.com/anomalyco/opencode',
-    attribution: "Whip's Chat View is inspired by and adapted from OpenCode Web's conversation design.",
+    attribution: "Whip's Chat View is inspired by and adapted from OpenCode Web's conversation design. Whip's git diff viewer is also inspired by OpenCode v2.",
     attributionKey: 'licenses.opencodeAttribution',
     licenseName: 'MIT License',
     copyright: 'Copyright (c) 2025 opencode',

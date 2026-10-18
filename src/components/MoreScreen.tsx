@@ -18,9 +18,12 @@ import type { WhipTier } from '../billing/tiers';
 import type { WhipEntitlementsController } from '../billing/useWhipEntitlements';
 import { MembershipSection } from './MembershipSection';
 import { RancherPurchaseSheet } from './RancherPurchaseSheet';
+import { ShizukuSection } from './ShizukuSection';
 
 type Props = Omit<
   SettingsSectionProps,
+  | 'fullscreenAppUnlocked'
+  | 'fullscreenTerminalUnlocked'
   | 'customAppBackgroundUnlocked'
   | 'customTerminalBackgroundUnlocked'
   | 'glassUnlocked'
@@ -28,7 +31,7 @@ type Props = Omit<
 > & {
   accessTier: WhipTier;
   entitlements: WhipEntitlementsController;
-  membershipSimulationEnabled: boolean;
+  membershipEnabled: boolean;
   onOpenLicenses: () => void;
 };
 
@@ -36,7 +39,7 @@ export function MoreScreen(props: Props) {
   const { t } = useTranslation();
   const [purchaseScreenVisible, setPurchaseScreenVisible] = useState(false);
   const openRancher = () => {
-    if (!props.membershipSimulationEnabled) return Promise.resolve();
+    if (!props.membershipEnabled) return Promise.resolve();
     setPurchaseScreenVisible(true);
     return Promise.resolve();
   };
@@ -48,7 +51,7 @@ export function MoreScreen(props: Props) {
             {t('nav.more')}
           </Text>
         </GlassSurface>
-        {props.membershipSimulationEnabled ? (
+        {props.membershipEnabled ? (
           <MembershipSection
             entitlements={props.entitlements}
             onOpenPurchaseScreen={() => setPurchaseScreenVisible(true)}
@@ -69,6 +72,8 @@ export function MoreScreen(props: Props) {
           knownHostCount={props.knownHostCount}
           appearance={props.appearance}
           fullscreenApp={props.fullscreenApp}
+          fullscreenAppUnlocked={hasCapability(props.accessTier, 'fullscreen-app')}
+          fullscreenTerminalUnlocked={hasCapability(props.accessTier, 'fullscreen-terminal')}
           smoothSpinners={props.smoothSpinners}
           appBackgroundImageUri={props.appBackgroundImageUri}
           appBackgroundDimming={props.appBackgroundDimming}
@@ -88,6 +93,8 @@ export function MoreScreen(props: Props) {
           keepScreenOn={props.keepScreenOn}
           reopenTerminalOnLaunch={props.reopenTerminalOnLaunch}
           agentCommand={props.agentCommand}
+          reverseControlInstructions={props.reverseControlInstructions}
+          onReverseControlInstructionsChange={props.onReverseControlInstructionsChange}
           terminalHistory={props.terminalHistory}
           terminalPreferences={props.terminalPreferences}
           onAlertsChange={props.onAlertsChange}
@@ -123,6 +130,7 @@ export function MoreScreen(props: Props) {
           onTerminalPreferencesChange={props.onTerminalPreferencesChange}
         />
         {props.developerOptionsEnabled ? <AppLogsSection /> : null}
+        <ShizukuSection />
       </ScrollView>
       <RancherPurchaseSheet
         entitlements={props.entitlements}

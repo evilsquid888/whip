@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 
 use crate::herdr_api::{HerdrAgentInfo, HerdrAgentStatus, HerdrTabInfo, HerdrWorkspaceInfo};
+use crate::host_runtime::AgentControlView;
 use crate::host_state::HostSyncStatus;
 
 use super::sessions::{AppConnectionStatus, AppCoreState};
@@ -26,6 +27,7 @@ pub struct HerdHostView {
     pub agents: Vec<HerdrAgentInfo>,
     pub workspaces: Vec<HerdrWorkspaceInfo>,
     pub tabs: Vec<HerdrTabInfo>,
+    pub agent_controls: Vec<AgentControlView>,
 }
 
 #[derive(Clone, Debug, PartialEq, uniffi::Record)]
@@ -36,6 +38,7 @@ pub struct HerdAgentView {
     pub workspace_label: String,
     pub tab_label: String,
     pub primary_label: String,
+    pub control: Option<AgentControlView>,
 }
 
 #[derive(Clone, Debug, PartialEq, uniffi::Record)]
@@ -54,6 +57,18 @@ pub(super) fn project(
     requested_workspace_id: Option<String>,
 ) -> HerdView {
     state.reconcile_selections();
+    let agent_orders = state
+        .sessions
+        .iter()
+        .filter_map(|session| {
+            session
+                .agent_order()
+                .map(|order| (session.id.clone(), order))
+        })
+        .collect::<HashMap<_, _>>();
+    // Server orders are host-local. Mixed views keep the existing host ranking,
+    // with attention sorting inside groups that have no server projection.
+    let follow_server_order = !agent_orders.is_empty();
     let metadata = metadata
         .into_iter()
         .map(|entry| (entry.session_id.clone(), entry))
@@ -66,7 +81,31 @@ pub(super) fn project(
             let host_state = session_view.host_state.as_ref();
             let snapshot = host_state.and_then(|state| state.snapshot.as_ref());
             let meta = metadata.get(&session.id);
-            let agents = snapshot.map_or_else(Vec::new, |value| value.agents.clone());
+            let mut agents = snapshot.map_or_else(Vec::new, |snapshot| {
+                snapshot
+                    .agents
+                    .iter()
+                    .map(|agent| {
+                        let mut agent = agent.clone();
+                        // Agent-row flags can lag behind pane-focus events.
+                        agent.focused =
+                            snapshot.focused_pane_id.as_deref() == Some(agent.pane_id.as_str());
+                        agent
+                    })
+                    .collect::<Vec<_>>()
+            });
+            if let Some(order) = agent_orders.get(&session.id) {
+                let mut by_pane = agents
+                    .into_iter()
+                    .map(|agent| (agent.pane_id.clone(), agent))
+                    .collect::<HashMap<_, _>>();
+                agents = order
+                    .iter()
+                    .filter_map(|pane_id| by_pane.remove(pane_id))
+                    .collect();
+            } else if follow_server_order {
+                agents.sort_by(compare_agent_priority);
+            }
             HerdHostView {
                 id: session.id.clone(),
                 label: meta
@@ -84,14 +123,16 @@ pub(super) fn project(
                 agents,
                 workspaces: snapshot.map_or_else(Vec::new, |value| value.workspaces.clone()),
                 tabs: snapshot.map_or_else(Vec::new, |value| value.tabs.clone()),
+                agent_controls: session_view.agent_controls,
             }
         })
         .collect::<Vec<_>>();
     hosts.sort_by(|left, right| {
-        right
-            .connected
-            .cmp(&left.connected)
-            .then(status_priority(left.agent_status).cmp(&status_priority(right.agent_status)))
+        right.connected.cmp(&left.connected).then(
+            left.agent_status
+                .priority()
+                .cmp(&right.agent_status.priority()),
+        )
     });
 
     project_hosts(
@@ -99,6 +140,7 @@ pub(super) fn project(
         hosts,
         requested_host_id,
         requested_workspace_id,
+        follow_server_order,
     )
 }
 
@@ -107,6 +149,7 @@ fn project_hosts(
     hosts: Vec<HerdHostView>,
     requested_host_id: Option<String>,
     requested_workspace_id: Option<String>,
+    follow_server_order: bool,
 ) -> HerdView {
     let selected_host_id = if hosts.len() == 1 {
         Some(hosts[0].id.clone())
@@ -180,6 +223,11 @@ fn project_hosts(
                         workspace_label.clone()
                     };
                     HerdAgentView {
+                        control: host
+                            .agent_controls
+                            .iter()
+                            .find(|control| control.terminal_id == agent.terminal_id)
+                            .cloned(),
                         host_id: host.id.clone(),
                         host_label: host.label.clone(),
                         agent: agent.clone(),
@@ -191,17 +239,9 @@ fn project_hosts(
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
-    agents.sort_by(|left, right| {
-        status_priority(left.agent.agent_status)
-            .cmp(&status_priority(right.agent.agent_status))
-            .then_with(|| {
-                right
-                    .agent
-                    .state_change_seq
-                    .partial_cmp(&left.agent.state_change_seq)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-    });
+    if !follow_server_order {
+        agents.sort_by(|left, right| compare_agent_priority(&left.agent, &right.agent));
+    }
     HerdView {
         revision,
         selected_host_id,
@@ -211,20 +251,22 @@ fn project_hosts(
     }
 }
 
-fn aggregate_status(statuses: impl Iterator<Item = HerdrAgentStatus>) -> HerdrAgentStatus {
-    statuses
-        .min_by_key(|status| status_priority(*status))
-        .unwrap_or(HerdrAgentStatus::Idle)
+fn compare_agent_priority(left: &HerdrAgentInfo, right: &HerdrAgentInfo) -> std::cmp::Ordering {
+    left.agent_status
+        .priority()
+        .cmp(&right.agent_status.priority())
+        .then_with(|| {
+            right
+                .state_change_seq
+                .partial_cmp(&left.state_change_seq)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
 }
 
-fn status_priority(status: HerdrAgentStatus) -> u8 {
-    match status {
-        HerdrAgentStatus::Blocked => 0,
-        HerdrAgentStatus::Done => 1,
-        HerdrAgentStatus::Working => 2,
-        HerdrAgentStatus::Idle => 3,
-        HerdrAgentStatus::Unknown => 4,
-    }
+fn aggregate_status(statuses: impl Iterator<Item = HerdrAgentStatus>) -> HerdrAgentStatus {
+    statuses
+        .min_by_key(|status| status.priority())
+        .unwrap_or(HerdrAgentStatus::Idle)
 }
 
 #[cfg(test)]
@@ -297,6 +339,7 @@ mod tests {
             agents: workspace_ids.iter().map(|id| agent(id)).collect(),
             workspaces: workspace_ids.iter().map(|id| workspace(id)).collect(),
             tabs: workspace_ids.iter().map(|id| tab(id)).collect(),
+            agent_controls: Vec::new(),
         }
     }
 
@@ -314,6 +357,7 @@ mod tests {
             vec![host("host-1", &["space-a", "space-b"])],
             Some("host-1".to_owned()),
             Some("space-b".to_owned()),
+            false,
         );
 
         assert_eq!(view.selected_host_id.as_deref(), Some("host-1"));
@@ -323,7 +367,7 @@ mod tests {
 
     #[test]
     fn single_workspace_is_auto_selected_without_a_workspace_request() {
-        let view = project_hosts(7, vec![host("host-1", &["only-space"])], None, None);
+        let view = project_hosts(7, vec![host("host-1", &["only-space"])], None, None, false);
 
         assert_eq!(view.selected_host_id.as_deref(), Some("host-1"));
         assert_eq!(view.selected_workspace_id.as_deref(), Some("only-space"));
@@ -340,6 +384,7 @@ mod tests {
             ],
             Some("host-2".to_owned()),
             Some("space-b".to_owned()),
+            false,
         );
 
         assert_eq!(view.selected_host_id.as_deref(), Some("host-2"));
@@ -354,6 +399,7 @@ mod tests {
             vec![host("host-1", &["space-a", "space-b"])],
             Some("host-1".to_owned()),
             None,
+            false,
         );
 
         assert_eq!(view.selected_workspace_id, None);
@@ -369,7 +415,7 @@ mod tests {
             HerdrAgentStatus::Blocked,
             HerdrAgentStatus::Done,
         ];
-        statuses.sort_by_key(|status| status_priority(*status));
+        statuses.sort_by_key(|status| status.priority());
         assert_eq!(
             statuses,
             [
@@ -379,6 +425,15 @@ mod tests {
                 HerdrAgentStatus::Idle,
                 HerdrAgentStatus::Unknown,
             ]
+        );
+    }
+
+    #[test]
+    fn empty_herd_status_defaults_to_idle_but_unknown_agents_stay_unknown() {
+        assert_eq!(aggregate_status(std::iter::empty()), HerdrAgentStatus::Idle);
+        assert_eq!(
+            aggregate_status(std::iter::once(HerdrAgentStatus::Unknown)),
+            HerdrAgentStatus::Unknown
         );
     }
 }

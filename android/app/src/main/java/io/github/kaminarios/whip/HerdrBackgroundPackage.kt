@@ -9,7 +9,11 @@ class HerdrBackgroundPackage : ReactPackage {
   @Suppress("OVERRIDE_DEPRECATION")
   override fun createNativeModules(reactContext: ReactApplicationContext): List<NativeModule> =
     listOf(
+      WhipBrowserModule(reactContext),
+      WhipDeviceModule(reactContext),
+      WhipShizukuModule(reactContext),
       ClipboardAttachmentModule(reactContext),
+      ComposerFontModule(reactContext),
       CredentialVaultModule(reactContext),
       HerdrBackgroundModule(reactContext),
       HerdrSoftInputModule(reactContext),

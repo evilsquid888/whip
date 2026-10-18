@@ -1,4 +1,4 @@
-import { Check, Heart, Send } from 'lucide-react-native';
+import { Check, Heart, MessageSquare, Send } from 'lucide-react-native';
 import { useEffect, useState } from 'react';
 import { ActivityIndicator, View } from 'react-native';
 import { useTranslation } from 'react-i18next';
@@ -16,6 +16,7 @@ import {
 } from '@/src/services/revenueCat';
 import { hapticPress } from './app-ui';
 import { CollapsibleSectionCard } from './CollapsibleSectionCard';
+import { GlassButton } from './GlassControls';
 import { Button } from './ui/button';
 import { Icon } from './ui/icon';
 import { Input } from './ui/input';
@@ -128,6 +129,7 @@ export function FeedbackSection() {
     <View className="px-4 py-2">
       <CollapsibleSectionCard
         title={t('feedback.title')}
+        icon={MessageSquare}
         description={t('feedback.copy')}
         expanded={expanded}
         onToggle={() => setExpanded(value => !value)}
@@ -150,13 +152,13 @@ export function FeedbackSection() {
                 >
                   {t('feedback.tipThanks')}
                 </Text>
-                <Button
+                <GlassButton
                   className="mt-5"
                   variant="outline"
                   onPress={hapticPress(reset)}
                 >
                   <Text>{t('feedback.another')}</Text>
-                </Button>
+                </GlassButton>
               </View>
             ) : (
               <View className="mt-5">
@@ -176,7 +178,7 @@ export function FeedbackSection() {
                 ) : products.length ? (
                   <View className="mt-5 flex-row gap-2">
                     {products.map(product => (
-                      <Button
+                      <GlassButton
                         key={product.id}
                         accessibilityLabel={t('feedback.tipAmount', {
                           price: product.localizedPrice,
@@ -190,7 +192,7 @@ export function FeedbackSection() {
                           <ActivityIndicator size="small" />
                         ) : null}
                         <Text numberOfLines={1}>{product.localizedPrice}</Text>
-                      </Button>
+                      </GlassButton>
                     ))}
                   </View>
                 ) : (
@@ -248,7 +250,7 @@ export function FeedbackSection() {
                 {error}
               </Text>
             ) : null}
-            <Button
+            <GlassButton
               className="mt-4"
               disabled={submitting || !isFeedbackApiConfigured()}
               onPress={hapticPress(submit)}
@@ -261,7 +263,7 @@ export function FeedbackSection() {
               <Text>
                 {submitting ? t('feedback.submitting') : t('feedback.submit')}
               </Text>
-            </Button>
+            </GlassButton>
             <Text className="mt-3 text-xs leading-[18px] text-muted-foreground">
               {t('feedback.free')}
             </Text>

@@ -1,24 +1,40 @@
 //! Rust-owned lifecycle for remote coding-agent transcript sessions.
 
+mod codex_history;
+mod opencode_v2;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::NaiveDateTime;
 use parking_lot::{Mutex, RwLock};
 
 use crate::agent_transcript::{
     AgentCacheError, AgentTranscriptDelta, AgentTranscriptKind, AgentTranscriptState,
-    AgentTranscriptStatus, AgentTranscriptUpdate, AgentTurnStatus, CodexSessionCore,
-    OpenCodeSessionCore, parse_open_code_cursor,
+    AgentTranscriptStatus, AgentTranscriptUpdate, AgentTurnStatus, ClaudeSessionCore,
+    CodexInheritedHistory, CodexSessionCore, FileTranscriptCore, OpenCodeProtocol,
+    OpenCodeSessionCore, OpenCodeV2Page, OpenCodeV2Snapshot, OpenCodeV2Sync,
+    parse_open_code_cursor,
 };
+use crate::herdr_api::HerdrAgentStatus;
 use crate::herdr_connection::{ConnectionExecStream, HerdrConnection};
 
 const RETRY_DELAY: Duration = Duration::from_millis(1_500);
+const CODEX_DISCOVERY_RETRY_DELAYS: [Duration; 4] = [
+    Duration::from_millis(250),
+    Duration::from_millis(500),
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+];
+const FILE_SOURCE_POLL_DELAY: Duration = Duration::from_secs(2);
 const OPENCODE_POLL_DELAY: Duration = Duration::from_millis(1_200);
-const CODEX_CHECKPOINT_BYTES: u64 = 256 * 1024;
+const TRANSCRIPT_DRAIN_DELAY: Duration = Duration::from_secs(5);
+const IDLE_TRANSCRIPT_POLL_DELAY: Duration = Duration::from_secs(60);
+const FILE_CHECKPOINT_BYTES: u64 = 256 * 1024;
 const OPENCODE_CHECKPOINT_EVENTS: u64 = 64;
+const OPENCODE_V2_PAGE_SIZE: usize = 200;
 static NEXT_STREAM_CONTEXT: AtomicU64 = AtomicU64::new(1);
 static NEXT_OPERATION_EPOCH: AtomicU64 = AtomicU64::new(1);
 static STREAMS: OnceLock<RwLock<HashMap<u64, StreamContext>>> = OnceLock::new();
@@ -170,6 +186,34 @@ impl From<AgentCacheError> for AgentSessionError {
     }
 }
 
+/// Restore a saved conversation without opening a host transport or a live
+/// session. The cache decoder still validates its agent and session identity.
+#[uniffi::export]
+pub fn read_cached_agent_transcript(
+    agent: AgentTranscriptKind,
+    session_id: String,
+    cache_blob: Vec<u8>,
+) -> Result<AgentTranscriptState, AgentSessionError> {
+    let mut state = match agent {
+        AgentTranscriptKind::Claude => {
+            ClaudeSessionCore::new(session_id).restore_cache(&cache_blob)?
+        }
+        AgentTranscriptKind::Codex => {
+            let mut core = CodexSessionCore::new(session_id);
+            core.restore_cache(&cache_blob)?
+        }
+        AgentTranscriptKind::OpenCode => {
+            let mut core = OpenCodeSessionCore::new(session_id);
+            core.restore_cache(&cache_blob)?
+        }
+    };
+    // Offline viewing uses the saved projection itself. Live readiness still
+    // requires remote boundary validation in the session cores.
+    state.status = AgentTranscriptStatus::Stale;
+    state.error = None;
+    Ok(state)
+}
+
 #[derive(Debug)]
 struct SessionRuntime {
     key: String,
@@ -180,10 +224,102 @@ struct SessionRuntime {
     stream_context: Option<u64>,
     stream: Option<Arc<ConnectionExecStream>>,
     retry_running: bool,
+    discovery_retries: usize,
     pending_cache_offset: Option<u64>,
     started: bool,
     closed: bool,
     explicit_restart_pending: bool,
+    opencode_protocol: Option<OpenCodeProtocol>,
+    activity: TranscriptActivity,
+}
+
+/// Host status controls scheduling, never transcript readiness or retention.
+#[derive(Debug)]
+struct TranscriptActivity {
+    active: bool,
+    quiet_since: Instant,
+    paused: bool,
+}
+
+impl TranscriptActivity {
+    fn new(active: bool) -> Self {
+        Self {
+            active,
+            quiet_since: Instant::now(),
+            paused: false,
+        }
+    }
+
+    fn touch(&mut self, now: Instant) -> bool {
+        self.quiet_since = now;
+        std::mem::replace(&mut self.paused, false)
+    }
+
+    fn set_active(&mut self, active: bool, now: Instant) -> bool {
+        if self.active == active {
+            return false;
+        }
+        self.active = active;
+        self.touch(now)
+    }
+
+    fn pause_if_quiet(&mut self, now: Instant) -> bool {
+        if !self.active && now.saturating_duration_since(self.quiet_since) >= TRANSCRIPT_DRAIN_DELAY
+        {
+            self.paused = true;
+        }
+        self.paused
+    }
+
+    fn poll_delay(&self, normal: Duration) -> Duration {
+        if self.paused {
+            IDLE_TRANSCRIPT_POLL_DELAY
+        } else {
+            normal
+        }
+    }
+}
+
+fn transcript_active(
+    terminals: &HashSet<String>,
+    statuses: &HashMap<String, HerdrAgentStatus>,
+) -> bool {
+    terminals.iter().any(|terminal| {
+        matches!(
+            statuses
+                .get(terminal)
+                .copied()
+                .unwrap_or(HerdrAgentStatus::Unknown),
+            HerdrAgentStatus::Working | HerdrAgentStatus::Unknown
+        )
+    })
+}
+
+impl SessionRuntime {
+    fn pause_file_if_quiet(&mut self, remote_size: u64, now: Instant) {
+        let Some(core) = self.core.file() else {
+            return;
+        };
+        // Never close during history catch-up, or while tail still owes bytes
+        // observed by stat. Partial JSONL is replayed from its complete boundary.
+        if !core.initial_history_caught_up() || core.received_offset() < remote_size {
+            return;
+        }
+        if self.activity.pause_if_quiet(now) {
+            if let Some(context) = self.stream_context.take() {
+                streams().write().remove(&context);
+            }
+            if let Some(stream) = self.stream.take() {
+                let _ = stream.close();
+            }
+        }
+    }
+}
+
+enum OpenCodeSync<'a> {
+    Export { cursor: u64, payload: &'a str },
+    Events { cursor: u64, payload: &'a str },
+    V2(OpenCodeV2Sync),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -198,13 +334,23 @@ struct TerminalBinding {
 
 #[derive(Debug)]
 enum AgentSessionCore {
+    Claude(Box<ClaudeSessionCore>),
     Codex(Box<CodexSessionCore>),
     OpenCode(Box<OpenCodeSessionCore>),
 }
 
 impl AgentSessionCore {
+    fn file(&mut self) -> Option<&mut dyn FileTranscriptCore> {
+        match self {
+            Self::Claude(core) => Some(core.as_mut()),
+            Self::Codex(core) => Some(core.as_mut()),
+            Self::OpenCode(_) => None,
+        }
+    }
+
     fn kind(&self) -> AgentTranscriptKind {
         match self {
+            Self::Claude(_) => AgentTranscriptKind::Claude,
             Self::Codex(_) => AgentTranscriptKind::Codex,
             Self::OpenCode(_) => AgentTranscriptKind::OpenCode,
         }
@@ -212,14 +358,24 @@ impl AgentSessionCore {
 
     fn state(&self) -> AgentTranscriptState {
         match self {
+            Self::Claude(core) => core.state(),
             Self::Codex(core) => core.state(),
             Self::OpenCode(core) => core.state(),
+        }
+    }
+
+    fn revision(&self) -> u64 {
+        match self {
+            Self::Claude(core) => core.revision(),
+            Self::Codex(core) => core.revision(),
+            Self::OpenCode(core) => core.revision(),
         }
     }
 
     fn mark_stale_update(&mut self, reason: impl Into<String>) -> AgentTranscriptUpdate {
         let reason = reason.into();
         match self {
+            Self::Claude(core) => core.mark_stale_update(reason),
             Self::Codex(core) => core.mark_stale_update(reason),
             Self::OpenCode(core) => core.mark_stale_update(reason),
         }
@@ -228,6 +384,7 @@ impl AgentSessionCore {
     fn mark_restarting_update(&mut self, reason: impl Into<String>) -> AgentTranscriptUpdate {
         let reason = reason.into();
         match self {
+            Self::Claude(core) => core.mark_restarting_update(reason),
             Self::Codex(core) => core.mark_restarting_update(reason),
             Self::OpenCode(core) => core.mark_restarting_update(reason),
         }
@@ -236,6 +393,7 @@ impl AgentSessionCore {
     fn mark_unavailable_update(&mut self, reason: impl Into<String>) -> AgentTranscriptUpdate {
         let reason = reason.into();
         match self {
+            Self::Claude(core) => core.mark_unavailable_update(reason),
             Self::Codex(core) => core.mark_unavailable_update(reason),
             Self::OpenCode(core) => core.mark_unavailable_update(reason),
         }
@@ -243,6 +401,7 @@ impl AgentSessionCore {
 
     fn close_update(&mut self) -> AgentTranscriptUpdate {
         match self {
+            Self::Claude(core) => core.close_update(),
             Self::Codex(core) => core.close_update(),
             Self::OpenCode(core) => core.close_update(),
         }
@@ -250,6 +409,7 @@ impl AgentSessionCore {
 
     fn restore_cache(&mut self, bytes: &[u8]) -> Result<AgentTranscriptState, AgentCacheError> {
         match self {
+            Self::Claude(core) => core.restore_cache(bytes),
             Self::Codex(core) => core.restore_cache(bytes),
             Self::OpenCode(core) => core.restore_cache(bytes),
         }
@@ -257,6 +417,7 @@ impl AgentSessionCore {
 
     fn confirm_cache(&mut self, source_generation: u64, position: u64) -> bool {
         match self {
+            Self::Claude(core) => core.confirm_cache(source_generation, position),
             Self::Codex(core) => core.confirm_cache(source_generation, position),
             Self::OpenCode(core) => core.confirm_cache(source_generation, position),
         }
@@ -287,6 +448,8 @@ struct ManagerState {
     next_binding_generation: u64,
     closed: bool,
     retention_revision: Option<u64>,
+    agent_statuses: HashMap<String, HerdrAgentStatus>,
+    activity_revision: u64,
 }
 
 struct AgentSessionManagerInner {
@@ -337,6 +500,8 @@ impl AgentSessionManager {
                     next_binding_generation: 1,
                     closed: false,
                     retention_revision: None,
+                    agent_statuses: HashMap::new(),
+                    activity_revision: 0,
                 }),
             }),
         }
@@ -431,6 +596,7 @@ impl AgentSessionManager {
         identity: AuthoritativeAgentChatIdentity,
     ) -> Result<AgentChatBinding, AgentSessionError> {
         match identity.agent {
+            AgentTranscriptKind::Claude => validate_claude_session_id(&identity.session_id)?,
             AgentTranscriptKind::Codex => validate_codex_session_id(&identity.session_id)?,
             AgentTranscriptKind::OpenCode => validate_opencode_session_id(&identity.session_id)?,
         }
@@ -474,8 +640,15 @@ impl AgentSessionManager {
                     session_id: identity.session_id.clone(),
                 }
             });
+            let active = transcript_active(
+                &HashSet::from([identity.terminal_id.clone()]),
+                &state.agent_statuses,
+            );
             let session = state.sessions.entry(key.clone()).or_insert_with(|| {
                 let core = match identity.agent {
+                    AgentTranscriptKind::Claude => AgentSessionCore::Claude(Box::new(
+                        ClaudeSessionCore::new(identity.session_id.clone()),
+                    )),
                     AgentTranscriptKind::Codex => AgentSessionCore::Codex(Box::new(
                         CodexSessionCore::new(identity.session_id.clone()),
                     )),
@@ -492,10 +665,13 @@ impl AgentSessionManager {
                     stream_context: None,
                     stream: None,
                     retry_running: false,
+                    discovery_retries: 0,
                     pending_cache_offset: None,
                     started: false,
                     closed: false,
                     explicit_restart_pending: false,
+                    opencode_protocol: None,
+                    activity: TranscriptActivity::new(active),
                 }
             });
             session.terminals.insert(identity.terminal_id.clone());
@@ -551,6 +727,10 @@ impl AgentSessionManager {
             };
             let key = binding.key;
             let connected = state.connected;
+            let active = state
+                .sessions
+                .get(&key)
+                .map(|session| transcript_active(&session.terminals, &state.agent_statuses));
             let Some(session) = state.sessions.get_mut(&key) else {
                 return Ok(AgentChatStartResult::StaleBinding);
             };
@@ -562,8 +742,12 @@ impl AgentSessionManager {
                 session.started = true;
             }
             let state_snapshot = session.core.state();
+            session.activity.active = active.unwrap_or(true);
+            let was_paused = session.activity.touch(Instant::now());
             let should_start = session.explicit_restart_pending
-                || should_restart_on_start(connected, first_start, state_snapshot.status);
+                || (connected && was_paused)
+                || should_restart_on_start(connected, first_start, state_snapshot.status)
+                || (connected && session.discovery_retries > 0);
             session.explicit_restart_pending = false;
             let result = (key, state_snapshot, should_start, session.core.kind());
             drop(state);
@@ -571,6 +755,7 @@ impl AgentSessionManager {
         };
         if should_start {
             let label = match kind {
+                AgentTranscriptKind::Claude => "Opening Claude transcript",
                 AgentTranscriptKind::Codex => "Opening Codex transcript",
                 AgentTranscriptKind::OpenCode => "Opening OpenCode transcript",
             };
@@ -590,6 +775,73 @@ impl AgentSessionManager {
             .map(|session| session.core.state())
     }
 
+    pub(crate) fn update_agent_statuses(
+        &self,
+        statuses: HashMap<String, HerdrAgentStatus>,
+        revision: u64,
+    ) {
+        let wake = {
+            let mut state = self.inner.state.lock();
+            if revision < state.activity_revision {
+                return;
+            }
+            state.activity_revision = revision;
+            let now = Instant::now();
+            let mut wake = Vec::new();
+            for session in state.sessions.values_mut() {
+                let active = transcript_active(&session.terminals, &statuses);
+                let became_active = active && !session.activity.active;
+                let was_paused = session.activity.set_active(active, now);
+                let unavailable = became_active
+                    && matches!(
+                        session.core.state().status,
+                        AgentTranscriptStatus::Unavailable | AgentTranscriptStatus::Error
+                    );
+                if was_paused || unavailable {
+                    if became_active {
+                        session.discovery_retries = 0;
+                    }
+                    wake.push((session.key.clone(), session.operation_epoch));
+                }
+            }
+            state.agent_statuses = statuses;
+            drop(state);
+            wake
+        };
+        for (key, epoch) in wake {
+            self.restart_operation(key, "Agent activity resumed".to_owned(), Some(epoch));
+        }
+    }
+
+    /// Input can precede the host's working event, or leave status unchanged.
+    pub(crate) fn wake_pane(&self, pane_id: &str) {
+        let wake = {
+            let mut state = self.inner.state.lock();
+            let keys = state
+                .terminal_bindings
+                .values()
+                .filter(|binding| binding.pane_id == pane_id)
+                .map(|binding| binding.key.clone())
+                .collect::<HashSet<_>>();
+            let now = Instant::now();
+            let wake = keys
+                .into_iter()
+                .filter_map(|key| {
+                    let session = state.sessions.get_mut(&key)?;
+                    session
+                        .activity
+                        .touch(now)
+                        .then_some((key, session.operation_epoch))
+                })
+                .collect::<Vec<_>>();
+            drop(state);
+            wake
+        };
+        for (key, epoch) in wake {
+            self.restart_operation(key, "Chat input submitted".to_owned(), Some(epoch));
+        }
+    }
+
     pub(crate) fn accepts_event(&self, key: &str, operation_epoch: u64) -> bool {
         self.inner
             .state
@@ -599,7 +851,6 @@ impl AgentSessionManager {
             .is_some_and(|session| session.operation_epoch == operation_epoch)
     }
 
-    #[cfg(test)]
     pub(crate) fn has_terminal_binding(&self, terminal_id: &str) -> bool {
         self.inner
             .state
@@ -626,6 +877,26 @@ impl AgentSessionManager {
         })
     }
 
+    /// Check the UI's projection without cloning or serializing its history.
+    pub(crate) fn terminal_binding_is_current(
+        &self,
+        terminal_id: &str,
+        binding_token: &str,
+        revision: u64,
+    ) -> bool {
+        let state = self.inner.state.lock();
+        state
+            .terminal_bindings
+            .get(terminal_id)
+            .is_some_and(|binding| {
+                binding.token == binding_token
+                    && state
+                        .sessions
+                        .get(&binding.key)
+                        .is_some_and(|session| session.core.revision() == revision)
+            })
+    }
+
     #[cfg(test)]
     pub(crate) fn close_terminal(&self, terminal_id: &str) -> Option<String> {
         let _reconciliation = self.inner.reconciliation.lock();
@@ -650,6 +921,9 @@ impl AgentSessionManager {
                 // Freeze callbacks before taking the final checkpoint. Incomplete
                 // JSONL tails are intentionally replayed from the remote cursor.
                 let blob = match &session.core {
+                    AgentSessionCore::Claude(core) if core.committable_offset() > 0 => {
+                        Some(core.cache_blob()?)
+                    }
                     AgentSessionCore::Codex(core) if core.committable_offset() > 0 => {
                         Some(core.cache_blob()?)
                     }
@@ -790,6 +1064,7 @@ impl AgentSessionManager {
 
     fn transcript_key(&self, identity: &AuthoritativeAgentChatIdentity) -> String {
         let agent = match identity.agent {
+            AgentTranscriptKind::Claude => "claude",
             AgentTranscriptKind::Codex => "codex",
             AgentTranscriptKind::OpenCode => "opencode",
         };
@@ -822,20 +1097,36 @@ impl AgentSessionManager {
     }
 
     fn restart(&self, key: String, reason: String) {
+        self.restart_operation(key, reason, None);
+    }
+
+    fn prepare_restart(
+        &self,
+        key: &str,
+        reason: String,
+        expected_epoch: Option<u64>,
+    ) -> Option<(u64, String, AgentTranscriptUpdate, AgentTranscriptKind)> {
         let operation = {
             let mut state = self.inner.state.lock();
             if !state.connected {
-                return;
+                return None;
             }
-            let Some(session) = state.sessions.get_mut(&key) else {
-                return;
-            };
-            if !session.started || session.closed || session.terminals.is_empty() {
-                return;
+            let session = state.sessions.get_mut(key)?;
+            if !session.started
+                || session.closed
+                || session.terminals.is_empty()
+                || expected_epoch.is_some_and(|epoch| epoch != session.operation_epoch)
+            {
+                return None;
+            }
+            if expected_epoch.is_none() {
+                session.discovery_retries = 0;
             }
             session.operation_epoch = NEXT_OPERATION_EPOCH.fetch_add(1, Ordering::Relaxed);
             session.retry_running = false;
             session.pending_cache_offset = None;
+            session.opencode_protocol = None;
+            session.activity.touch(Instant::now());
             if let Some(context) = session.stream_context.take() {
                 streams().write().remove(&context);
             }
@@ -856,14 +1147,21 @@ impl AgentSessionManager {
             drop(state);
             operation
         };
+        Some(operation)
+    }
+
+    fn restart_operation(&self, key: String, reason: String, expected_epoch: Option<u64>) {
+        let Some(operation) = self.prepare_restart(&key, reason, expected_epoch) else {
+            return;
+        };
         emit(&self.inner, key.clone(), operation.0, operation.2, None);
         let manager = self.clone();
         if let Ok(runtime) = crate::runtime() {
             runtime.spawn(async move {
                 match operation.3 {
-                    AgentTranscriptKind::Codex => {
+                    AgentTranscriptKind::Claude | AgentTranscriptKind::Codex => {
                         manager
-                            .resolve_and_open(key, operation.0, operation.1)
+                            .resolve_and_open(key, operation.0, operation.1, operation.3)
                             .await;
                     }
                     AgentTranscriptKind::OpenCode => {
@@ -874,41 +1172,72 @@ impl AgentSessionManager {
         }
     }
 
-    async fn resolve_and_open(&self, key: String, operation_epoch: u64, session_id: String) {
+    async fn resolve_and_open(
+        &self,
+        key: String,
+        operation_epoch: u64,
+        session_id: String,
+        agent: AgentTranscriptKind,
+    ) {
         let connection = self.inner.connection.clone();
         let result = async {
-            let output = execute(&connection, codex_rollout_find_command(&session_id))
+            let command = if agent == AgentTranscriptKind::Claude {
+                claude_transcript_find_command(&session_id)
+            } else {
+                codex_rollout_find_command(&session_id)
+            };
+            let output = execute(&connection, command).await.map_err(|error| {
+                AgentSessionError::ReadFailed(format!(
+                    "{agent:?} transcript discovery failed: {error}"
+                ))
+            })?;
+            let path = if agent == AgentTranscriptKind::Claude {
+                resolve_claude_path(&output, &session_id)?
+            } else {
+                resolve_rollout_path(&output, &session_id)?
+            };
+            let Some(path) = path else {
+                return Err(AgentSessionError::SourceUnavailable(
+                    if agent == AgentTranscriptKind::Codex {
+                        "Codex has not created this rollout yet.".to_owned()
+                    } else {
+                        "Claude has not created this transcript yet.".to_owned()
+                    },
+                ));
+            };
+            let metadata = execute(&connection, file_metadata_command(&path))
                 .await
                 .map_err(|error| {
                     AgentSessionError::ReadFailed(format!(
-                        "Codex rollout discovery failed: {error}"
+                        "{agent:?} transcript metadata lookup failed: {error}"
                     ))
                 })?;
-            let path = resolve_rollout_path(&output, &session_id)?;
-            let Some(path) = path else {
-                return Err(AgentSessionError::SourceUnavailable(
-                    "Codex has not created this rollout yet.".to_owned(),
-                ));
-            };
-            let metadata = execute(
-                &connection,
-                format!(
-                    "stat -c '%d:%i %s' {} 2>/dev/null || stat -f '%d:%i %z' {}",
-                    shell_quote(&path),
-                    shell_quote(&path)
-                ),
-            )
-            .await
-            .map_err(|error| {
-                AgentSessionError::ReadFailed(format!(
-                    "Codex rollout metadata lookup failed: {error}"
-                ))
-            })?;
             let (file_id, size) = parse_metadata(&metadata)?;
-            Ok::<_, AgentSessionError>((path, file_id, size))
+            let history = if agent == AgentTranscriptKind::Codex {
+                codex_history::load(
+                    &path,
+                    |position| {
+                        let mut state = self.inner.state.lock();
+                        let session = current_session_mut(&mut state, &key, operation_epoch)?;
+                        let prefix = match &session.core {
+                            AgentSessionCore::Codex(core) => {
+                                codex_history::cached_prefix(core, position)
+                            }
+                            _ => None,
+                        };
+                        drop(state);
+                        prefix
+                    },
+                    |command| execute_bytes(&connection, command),
+                )
+                .await?
+            } else {
+                None
+            };
+            Ok::<_, AgentSessionError>((path, file_id, size, history))
         }
         .await;
-        let (path, file_id, size) = match result {
+        let (path, file_id, size, history) = match result {
             Ok(result) => result,
             Err(error) => {
                 let kind = if matches!(error, AgentSessionError::SourceUnavailable(_)) {
@@ -920,44 +1249,30 @@ impl AgentSessionManager {
                 return;
             }
         };
-        let opened = {
-            let mut state = self.inner.state.lock();
-            if !state.connected {
-                return;
-            }
-            let Some(session) = state.sessions.get_mut(&key) else {
-                return;
-            };
-            if session.operation_epoch != operation_epoch || session.closed {
-                return;
-            }
-            session.pending_cache_offset = None;
-            let AgentSessionCore::Codex(core) = &mut session.core else {
-                return;
-            };
-            let binding = core.bind_source(path.clone(), file_id.clone(), size);
-            let reset = binding
-                .rebuilt
-                .then(|| AgentTranscriptUpdate::reset(core.state()));
-            let context = NEXT_STREAM_CONTEXT.fetch_add(1, Ordering::Relaxed);
-            streams().write().insert(
-                context,
-                StreamContext {
-                    manager: Arc::downgrade(&self.inner),
-                    session_key: key.clone(),
-                    source_generation: binding.source_generation,
+        let opened = match self.bind_discovered_file_with_history(
+            &key,
+            operation_epoch,
+            &path,
+            &file_id,
+            size,
+            history,
+        ) {
+            Ok(Some(opened)) => opened,
+            Ok(None) => return,
+            Err(error) => {
+                self.fail_session(
+                    key,
                     operation_epoch,
-                },
-            );
-            session.stream_context = Some(context);
-            let opened = (context, binding.start_offset, reset);
-            drop(state);
-            opened
+                    error.to_string(),
+                    SessionFailureKind::Transient,
+                );
+                return;
+            }
         };
         if let Some(update) = opened.2 {
             emit(&self.inner, key.clone(), operation_epoch, update, None);
         }
-        let command = codex_stream_command(&path, opened.1);
+        let command = file_stream_command(&path, opened.1);
         let context = opened.0;
         let data = Arc::new(move |bytes| stream_data(context, bytes));
         let closed = Arc::new(move |reason| stream_failed(context, reason));
@@ -970,7 +1285,7 @@ impl AgentSessionManager {
                 self.fail_session(
                     key.clone(),
                     operation_epoch,
-                    format!("Codex rollout stream open failed: {error}"),
+                    format!("{agent:?} transcript stream open failed: {error}"),
                     SessionFailureKind::Transient,
                 );
                 false
@@ -989,14 +1304,24 @@ impl AgentSessionManager {
                 accepted
             }
         };
+        if stream_requested {
+            self.monitor_file_source(
+                key.clone(),
+                operation_epoch,
+                path,
+                file_id,
+                size,
+                (agent == AgentTranscriptKind::Codex).then_some(session_id),
+            );
+        }
         if stream_requested && size == opened.1 {
             let emission = {
                 let mut state = self.inner.state.lock();
                 current_session_mut(&mut state, &key, operation_epoch).and_then(|session| {
-                    match &mut session.core {
-                        AgentSessionCore::Codex(core) => core.mark_live_update(),
-                        AgentSessionCore::OpenCode(_) => None,
-                    }
+                    session
+                        .core
+                        .file()
+                        .and_then(FileTranscriptCore::mark_live_update)
                 })
             };
             if let Some(update) = emission {
@@ -1005,7 +1330,210 @@ impl AgentSessionManager {
         }
     }
 
+    #[cfg(test)]
+    fn bind_discovered_file(
+        &self,
+        key: &str,
+        operation_epoch: u64,
+        path: &str,
+        file_id: &str,
+        size: u64,
+    ) -> Option<(u64, u64, Option<AgentTranscriptUpdate>)> {
+        self.bind_discovered_file_with_history(key, operation_epoch, path, file_id, size, None)
+            .ok()
+            .flatten()
+    }
+
+    fn bind_discovered_file_with_history(
+        &self,
+        key: &str,
+        operation_epoch: u64,
+        path: &str,
+        file_id: &str,
+        size: u64,
+        history: Option<CodexInheritedHistory>,
+    ) -> Result<Option<(u64, u64, Option<AgentTranscriptUpdate>)>, AgentCacheError> {
+        let opened = {
+            let mut state = self.inner.state.lock();
+            if !state.connected {
+                return Ok(None);
+            }
+            let Some(session) = state.sessions.get_mut(key) else {
+                return Ok(None);
+            };
+            if session.operation_epoch != operation_epoch
+                || session.closed
+                || session.terminals.is_empty()
+            {
+                return Ok(None);
+            }
+            session.discovery_retries = 0;
+            session.pending_cache_offset = None;
+            let binding = match &mut session.core {
+                AgentSessionCore::Codex(core) => core.bind_source_with_history(
+                    path.to_owned(),
+                    file_id.to_owned(),
+                    size,
+                    history,
+                )?,
+                core => {
+                    let Some(core) = core.file() else {
+                        return Ok(None);
+                    };
+                    core.bind_source(path.to_owned(), file_id.to_owned(), size)
+                }
+            };
+            let Some(core) = session.core.file() else {
+                return Ok(None);
+            };
+            let reset = binding
+                .rebuilt
+                .then(|| AgentTranscriptUpdate::reset(core.state()));
+            let context = NEXT_STREAM_CONTEXT.fetch_add(1, Ordering::Relaxed);
+            streams().write().insert(
+                context,
+                StreamContext {
+                    manager: Arc::downgrade(&self.inner),
+                    session_key: key.to_owned(),
+                    source_generation: binding.source_generation,
+                    operation_epoch,
+                },
+            );
+            session.stream_context = Some(context);
+            let opened = (context, binding.start_offset, reset);
+            drop(state);
+            opened
+        };
+        Ok(Some(opened))
+    }
+
+    fn monitor_file_source(
+        &self,
+        key: String,
+        epoch: u64,
+        path: String,
+        file_id: String,
+        mut previous_size: u64,
+        rollout_session_id: Option<String>,
+    ) {
+        let manager = self.clone();
+        let command = file_source_poll_command(&path, rollout_session_id.as_deref());
+        if let Ok(runtime) = crate::runtime() {
+            runtime.spawn(async move {
+                loop {
+                    let delay = {
+                        let mut state = manager.inner.state.lock();
+                        let Some(session) = current_session_mut(&mut state, &key, epoch) else {
+                            return;
+                        };
+                        session.activity.poll_delay(FILE_SOURCE_POLL_DELAY)
+                    };
+                    tokio::time::sleep(delay).await;
+                    // Capture the received cursor BEFORE stat. Appends arriving
+                    // during the request must not look like remote truncation.
+                    let (received, paused) = {
+                        let mut state = manager.inner.state.lock();
+                        let Some(session) = current_session_mut(&mut state, &key, epoch) else {
+                            return;
+                        };
+                        if session.retry_running || session.terminals.is_empty() {
+                            return;
+                        }
+                        let Some(core) = session.core.file() else {
+                            return;
+                        };
+                        (core.received_offset(), session.activity.paused)
+                    };
+                    let metadata = execute(&manager.inner.connection, command.clone())
+                        .await
+                        .and_then(|output| {
+                            parse_file_source_poll(&output, rollout_session_id.as_deref())
+                        });
+                    let Ok(metadata) = metadata else {
+                        manager.fail_session(
+                            key,
+                            epoch,
+                            "Transcript source metadata became unavailable".to_owned(),
+                            SessionFailureKind::Transient,
+                        );
+                        return;
+                    };
+                    let source_changed = metadata.changed(&path, &file_id, previous_size, received);
+                    if source_changed || (paused && metadata.size > received) {
+                        // A different rollout path forces a fresh bind by itself.
+                        // Preserve the old identity for immutable prefix reuse,
+                        // but invalidate in-place replacements and truncations.
+                        let invalidate_source =
+                            metadata.file_changed(&file_id, previous_size, received);
+                        // Guard against a detached/rebound pane while stat was
+                        // in flight before restarting its current operation.
+                        let current = {
+                            let mut state = manager.inner.state.lock();
+                            current_session_mut(&mut state, &key, epoch)
+                                .and_then(|session| session.core.file())
+                                .map(|core| invalidate_source.then(|| core.invalidate_source()))
+                                .is_some()
+                        };
+                        if current {
+                            manager.restart_operation(
+                                key,
+                                "Transcript source changed or received new bytes".to_owned(),
+                                Some(epoch),
+                            );
+                        }
+                        return;
+                    }
+                    previous_size = metadata.size;
+                    let mut state = manager.inner.state.lock();
+                    if let Some(session) = current_session_mut(&mut state, &key, epoch) {
+                        session.pause_file_if_quiet(metadata.size, Instant::now());
+                    }
+                }
+            });
+        }
+    }
+
     async fn sync_opencode(&self, key: String, operation_epoch: u64, session_id: String) {
+        let protocol = match self.resolve_opencode_protocol(&key, operation_epoch).await {
+            Ok(protocol) => protocol,
+            Err(error) => {
+                self.fail_session(
+                    key,
+                    operation_epoch,
+                    error.to_string(),
+                    SessionFailureKind::Transient,
+                );
+                return;
+            }
+        };
+        if protocol == OpenCodeProtocol::V2 {
+            match self
+                .read_opencode_v2_sync(&key, operation_epoch, &session_id)
+                .await
+            {
+                Ok(sync) => {
+                    if let Err(error) =
+                        self.finish_opencode_sync(&key, operation_epoch, OpenCodeSync::V2(sync))
+                    {
+                        self.fail_session(
+                            key,
+                            operation_epoch,
+                            error,
+                            SessionFailureKind::Transient,
+                        );
+                        return;
+                    }
+                    self.schedule_opencode_poll(key, operation_epoch, session_id);
+                }
+                Err(error) => self.fail_session(
+                    key,
+                    operation_epoch,
+                    error.to_string(),
+                    SessionFailureKind::Transient,
+                ),
+            }
+            return;
+        }
         let connection = self.inner.connection.clone();
         let cursor_output = match execute(
             &connection,
@@ -1053,7 +1581,7 @@ impl AgentSessionManager {
                 current_session_mut(&mut state, &key, operation_epoch).and_then(|session| {
                     match &mut session.core {
                         AgentSessionCore::OpenCode(core) => Some(core.mark_live_update()),
-                        AgentSessionCore::Codex(_) => None,
+                        AgentSessionCore::Claude(_) | AgentSessionCore::Codex(_) => None,
                     }
                 })
             };
@@ -1084,8 +1612,18 @@ impl AgentSessionManager {
                 return;
             }
         };
-        let applied =
-            self.finish_opencode_sync(&key, operation_epoch, remote_cursor, &payload, needs_full);
+        let sync = if needs_full {
+            OpenCodeSync::Export {
+                cursor: remote_cursor,
+                payload: &payload,
+            }
+        } else {
+            OpenCodeSync::Events {
+                cursor: remote_cursor,
+                payload: &payload,
+            }
+        };
+        let applied = self.finish_opencode_sync(&key, operation_epoch, sync);
         if let Err(error) = applied {
             if needs_full {
                 self.fail_session(key, operation_epoch, error, SessionFailureKind::Transient);
@@ -1101,9 +1639,10 @@ impl AgentSessionManager {
                     if let Err(export_error) = self.finish_opencode_sync(
                         &key,
                         operation_epoch,
-                        remote_cursor,
-                        &export,
-                        true,
+                        OpenCodeSync::Export {
+                            cursor: remote_cursor,
+                            payload: &export,
+                        },
                     ) {
                         self.fail_session(
                             key,
@@ -1128,13 +1667,73 @@ impl AgentSessionManager {
         self.schedule_opencode_poll(key, operation_epoch, session_id);
     }
 
+    async fn resolve_opencode_protocol(
+        &self,
+        key: &str,
+        operation_epoch: u64,
+    ) -> Result<OpenCodeProtocol, AgentSessionError> {
+        {
+            let mut state = self.inner.state.lock();
+            let session = current_session_mut(&mut state, key, operation_epoch)
+                .ok_or_else(|| AgentSessionError::StaleGeneration(key.to_owned()))?;
+            let protocol = session.opencode_protocol;
+            drop(state);
+            if let Some(protocol) = protocol {
+                return Ok(protocol);
+            }
+        }
+        let version = execute(
+            &self.inner.connection,
+            opencode_login_command("opencode --version"),
+        )
+        .await?;
+        let protocol = parse_opencode_protocol(&version)?;
+        let mut state = self.inner.state.lock();
+        let session = current_session_mut(&mut state, key, operation_epoch)
+            .ok_or_else(|| AgentSessionError::StaleGeneration(key.to_owned()))?;
+        if let AgentSessionCore::OpenCode(core) = &mut session.core {
+            core.set_protocol(protocol);
+        }
+        session.opencode_protocol = Some(protocol);
+        drop(state);
+        Ok(protocol)
+    }
+
+    async fn read_opencode_v2_sync(
+        &self,
+        key: &str,
+        operation_epoch: u64,
+        session_id: &str,
+    ) -> Result<OpenCodeV2Sync, AgentSessionError> {
+        let cached = {
+            let mut state = self.inner.state.lock();
+            let session = current_session_mut(&mut state, key, operation_epoch)
+                .ok_or_else(|| AgentSessionError::StaleGeneration(key.to_owned()))?;
+            let cached = match &session.core {
+                AgentSessionCore::OpenCode(core) => core.v2_read_state(),
+                _ => return Err(AgentSessionError::StaleGeneration(key.to_owned())),
+            };
+            drop(state);
+            cached
+        };
+        opencode_v2::fetch(session_id, cached, |command| async move {
+            // Don't keep paging a transcript after the user switches sessions.
+            {
+                let mut state = self.inner.state.lock();
+                if current_session_mut(&mut state, key, operation_epoch).is_none() {
+                    return Err(AgentSessionError::StaleGeneration(key.to_owned()));
+                }
+            }
+            execute(&self.inner.connection, opencode_login_command(&command)).await
+        })
+        .await
+    }
+
     fn finish_opencode_sync(
         &self,
         key: &str,
         operation_epoch: u64,
-        remote_cursor: u64,
-        payload: &str,
-        full: bool,
+        sync: OpenCodeSync<'_>,
     ) -> Result<(), String> {
         let emission = {
             let mut state = self.inner.state.lock();
@@ -1144,32 +1743,51 @@ impl AgentSessionManager {
                 let AgentSessionCore::OpenCode(core) = &mut session.core else {
                     return Err("OpenCode transcript was rebound to another agent".to_owned());
                 };
-                let transcript_update = if full {
-                    core.bootstrap(remote_cursor, payload).map(|changed| {
-                        changed.then(|| AgentTranscriptUpdate {
-                            revision: core.revision(),
-                            deltas: Vec::new(),
+                let full = matches!(&sync, OpenCodeSync::Export { .. })
+                    || (matches!(&sync, OpenCodeSync::V2(_)) && core.cursor().is_none())
+                    || (matches!(
+                        &sync,
+                        OpenCodeSync::V2(OpenCodeV2Sync::Full {
+                            sequence: Some(_),
+                            ..
                         })
-                    })
-                } else {
-                    core.apply_events_incremental(remote_cursor, payload)
+                    ) && core.v2_sequence().is_none());
+                let transcript_update = match sync {
+                    OpenCodeSync::Export { cursor, payload } => {
+                        core.bootstrap(cursor, payload).map(|changed| {
+                            changed.then(|| AgentTranscriptUpdate {
+                                revision: core.revision(),
+                                deltas: Vec::new(),
+                            })
+                        })
+                    }
+                    OpenCodeSync::Events { cursor, payload } => {
+                        core.apply_events_incremental(cursor, payload)
+                    }
+                    OpenCodeSync::V2(sync) => core.apply_v2_sync(sync),
                 }
                 .map_err(|error| error.to_string())?;
+                if transcript_update.is_some() {
+                    session.activity.touch(Instant::now());
+                }
                 let mut update = core.finish_live_update(transcript_update);
                 if full && let Some(update) = &mut update {
                     update.deltas = vec![AgentTranscriptDelta::Reset {
                         state: core.state(),
                     }];
                 }
-                let cursor = core.cursor().unwrap_or(remote_cursor);
+                let cursor = core.cursor().unwrap_or_default();
                 let checkpoint_base = session.pending_cache_offset.or(core.committed_cursor());
                 let checkpoint_due = full
                     || update.as_ref().is_some_and(completes_turn)
                     || checkpoint_base.is_none_or(|base| {
                         cursor.saturating_sub(base) >= OPENCODE_CHECKPOINT_EVENTS
                     });
-                let new_checkpoint =
-                    checkpoint_due && (full || checkpoint_base.is_none_or(|base| cursor > base));
+                // A checkpoint serializes the entire transcript. Wait for SQLite
+                // confirmation before producing another full copy of it.
+                let new_checkpoint = session.pending_cache_offset.is_none()
+                    && checkpoint_due
+                    && (full || checkpoint_base.is_none_or(|base| cursor > base));
                 let cache = new_checkpoint
                     .then(|| core.cache_blob().ok())
                     .flatten()
@@ -1215,25 +1833,26 @@ impl AgentSessionManager {
     }
 
     fn schedule_opencode_poll(&self, key: String, operation_epoch: u64, session_id: String) {
-        let scheduled = {
+        let delay = {
             let mut state = self.inner.state.lock();
             let Some(session) = current_session_mut(&mut state, &key, operation_epoch) else {
                 return;
             };
             if session.retry_running || session.terminals.is_empty() {
-                false
+                None
             } else {
                 session.retry_running = true;
-                true
+                session.activity.pause_if_quiet(Instant::now());
+                Some(session.activity.poll_delay(OPENCODE_POLL_DELAY))
             }
         };
-        if !scheduled {
+        let Some(delay) = delay else {
             return;
-        }
+        };
         let manager = self.clone();
         if let Ok(runtime) = crate::runtime() {
             runtime.spawn(async move {
-                tokio::time::sleep(OPENCODE_POLL_DELAY).await;
+                tokio::time::sleep(delay).await;
                 let should_poll = {
                     let mut state = manager.inner.state.lock();
                     let Some(session) = current_session_mut(&mut state, &key, operation_epoch)
@@ -1259,7 +1878,18 @@ impl AgentSessionManager {
         reason: String,
         kind: SessionFailureKind,
     ) {
-        let emission = {
+        self.fail_session_inner(key, operation_epoch, reason, kind, None);
+    }
+
+    fn fail_session_inner(
+        &self,
+        key: String,
+        operation_epoch: u64,
+        reason: String,
+        kind: SessionFailureKind,
+        stream_context: Option<u64>,
+    ) {
+        let (emission, retry_delay) = {
             let mut state = self.inner.state.lock();
             let session = current_session_mut(&mut state, &key, operation_epoch);
             let Some(session) = session else {
@@ -1268,42 +1898,44 @@ impl AgentSessionManager {
             if session.retry_running || session.terminals.is_empty() {
                 return;
             }
-            let emission = match kind {
-                SessionFailureKind::SourceUnavailable => {
-                    session.core.mark_unavailable_update(reason)
-                }
-                SessionFailureKind::Transient => {
+            if stream_context.is_some_and(|context| session.stream_context != Some(context)) {
+                return;
+            }
+            let result = match (&mut session.core, kind) {
+                (AgentSessionCore::Codex(core), SessionFailureKind::SourceUnavailable)
+                    if session.discovery_retries < CODEX_DISCOVERY_RETRY_DELAYS.len() =>
+                {
+                    let delay = CODEX_DISCOVERY_RETRY_DELAYS[session.discovery_retries];
+                    session.discovery_retries += 1;
                     session.retry_running = true;
-                    session.core.mark_stale_update(reason)
+                    (core.mark_discovery_retry_update(reason), Some(delay))
+                }
+                (core, SessionFailureKind::SourceUnavailable) => {
+                    (core.mark_unavailable_update(reason), None)
+                }
+                (core, SessionFailureKind::Transient) => {
+                    session.retry_running = true;
+                    (core.mark_stale_update(reason), Some(RETRY_DELAY))
                 }
             };
             drop(state);
-            emission
+            result
         };
         emit(&self.inner, key.clone(), operation_epoch, emission, None);
-        if kind == SessionFailureKind::SourceUnavailable {
-            // Codex deliberately defers creating a new rollout until the first
-            // prompt is persisted. Missing history for an untouched TUI is a
-            // stable result, not a transport failure. A later explicit Chat
-            // open retries through `should_restart_on_start`.
+        let Some(retry_delay) = retry_delay else {
             return;
-        }
+        };
         let manager = self.clone();
         if let Ok(runtime) = crate::runtime() {
             runtime.spawn(async move {
-                tokio::time::sleep(RETRY_DELAY).await;
-                let should_retry = {
-                    let mut state = manager.inner.state.lock();
-                    let Some(session) = current_session_mut(&mut state, &key, operation_epoch)
-                    else {
-                        return;
-                    };
-                    session.retry_running = false;
-                    !session.terminals.is_empty() && !session.closed
-                };
-                if should_retry {
-                    manager.restart(key, "Rebinding remote transcript".to_owned());
-                }
+                tokio::time::sleep(retry_delay).await;
+                // Validate and replace the epoch under one lock. An explicit
+                // open, reconnect, or detach supersedes this pending retry.
+                manager.restart_operation(
+                    key,
+                    "Rebinding remote transcript".to_owned(),
+                    Some(operation_epoch),
+                );
             });
         }
     }
@@ -1403,7 +2035,14 @@ fn stream_data(context: u64, bytes: Vec<u8>) {
             ) else {
                 return;
             };
-            let AgentSessionCore::Codex(core) = &mut session.core else {
+            // A callback may have copied its context before an idle pause.
+            if session.stream_context != Some(context) {
+                return;
+            }
+            if !bytes.is_empty() {
+                session.activity.touch(Instant::now());
+            }
+            let Some(core) = session.core.file() else {
                 return;
             };
             match core.ingest(context_value.source_generation, &bytes) {
@@ -1420,9 +2059,14 @@ fn stream_data(context: u64, bytes: Vec<u8>) {
                         .unwrap_or_else(|| core.committed_offset());
                     let checkpoint_due = update.as_ref().is_some_and(completes_turn)
                         || result.committable_offset.saturating_sub(checkpoint_base)
-                            >= CODEX_CHECKPOINT_BYTES;
-                    let new_checkpoint =
-                        checkpoint_due && result.committable_offset > checkpoint_base;
+                            >= FILE_CHECKPOINT_BYTES;
+                    // Each cache blob contains all prior JSONL lines. Sending
+                    // another while one is crossing the bridge can retain many
+                    // large copies of the same history in native and JS memory.
+                    let new_checkpoint = core.initial_history_caught_up()
+                        && session.pending_cache_offset.is_none()
+                        && checkpoint_due
+                        && result.committable_offset > checkpoint_base;
                     let cache = new_checkpoint
                         .then(|| core.cache_blob().ok())
                         .flatten()
@@ -1483,11 +2127,12 @@ fn stream_failed(context: u64, reason: String) {
     let Some(manager) = context_value.manager.upgrade() else {
         return;
     };
-    AgentSessionManager { inner: manager }.fail_session(
+    AgentSessionManager { inner: manager }.fail_session_inner(
         context_value.session_key,
         context_value.operation_epoch,
         reason,
         SessionFailureKind::Transient,
+        Some(context),
     );
 }
 
@@ -1495,6 +2140,14 @@ async fn execute(
     connection: &HerdrConnection,
     command: String,
 ) -> Result<String, AgentSessionError> {
+    let bytes = execute_bytes(connection, command).await?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+async fn execute_bytes(
+    connection: &HerdrConnection,
+    command: String,
+) -> Result<Vec<u8>, AgentSessionError> {
     let output = connection
         .execute(&command)
         .await
@@ -1508,7 +2161,12 @@ async fn execute(
             stderr.to_owned()
         }));
     }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    if output.stdout_truncated {
+        return Err(AgentSessionError::ReadFailed(
+            "remote transcript output was truncated".into(),
+        ));
+    }
+    Ok(output.stdout)
 }
 
 fn validate_codex_session_id(value: &str) -> Result<(), AgentSessionError> {
@@ -1546,7 +2204,7 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-fn opencode_login_command(command: &str) -> String {
+pub(crate) fn opencode_login_command(command: &str) -> String {
     // SSH hands this string to the user's login shell first. Keep that outer
     // layer valid in Bash and Fish, then let POSIX sh select the configured
     // login shell so its PATH setup remains available to OpenCode.
@@ -1560,6 +2218,107 @@ fn opencode_login_command(command: &str) -> String {
 
 fn opencode_export_command(session_id: &str) -> String {
     format!("opencode export {}", shell_quote(session_id))
+}
+
+pub(crate) fn parse_opencode_protocol(
+    version: &str,
+) -> Result<OpenCodeProtocol, AgentSessionError> {
+    let version = version.trim();
+    let version = version
+        .strip_prefix("opencode ")
+        .unwrap_or(version)
+        .trim_start();
+    let version = version.strip_prefix('v').unwrap_or(version);
+    match version.split_once('.').map(|(major, _)| major) {
+        Some("1") => Ok(OpenCodeProtocol::V1),
+        Some("2") => Ok(OpenCodeProtocol::V2),
+        _ => Err(AgentSessionError::SourceUnavailable(format!(
+            "Unsupported OpenCode version: {version}"
+        ))),
+    }
+}
+
+fn opencode_v2_api_command(path: &str) -> String {
+    // The CLI resolves the local service and its authentication itself. No
+    // service passwords, HTTP ports, or additional remote runtimes are needed.
+    format!("opencode api GET {}", shell_quote(path))
+}
+
+fn opencode_v2_messages_command(session_id: &str, cursor: Option<&str>) -> String {
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
+    query.append_pair("limit", &OPENCODE_V2_PAGE_SIZE.to_string());
+    if let Some(cursor) = cursor {
+        query.append_pair("cursor", cursor);
+    } else {
+        query.append_pair("order", "asc");
+    }
+    opencode_v2_api_command(&format!(
+        "/api/session/{session_id}/message?{}",
+        query.finish()
+    ))
+}
+
+async fn fetch_opencode_v2_info<F, Fut>(
+    session_id: &str,
+    mut execute: F,
+) -> Result<serde_json::Value, AgentSessionError>
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Result<String, AgentSessionError>>,
+{
+    #[derive(serde::Deserialize)]
+    struct SessionResponse {
+        data: serde_json::Value,
+    }
+    let output = execute(opencode_v2_api_command(&format!(
+        "/api/session/{session_id}"
+    )))
+    .await?;
+    let info = serde_json::from_str::<SessionResponse>(&output)
+        .map_err(|error| {
+            AgentSessionError::ReadFailed(format!("Invalid OpenCode v2 session: {error}"))
+        })?
+        .data;
+    if info.get("id").and_then(serde_json::Value::as_str) != Some(session_id) {
+        return Err(AgentSessionError::ReadFailed(
+            "OpenCode v2 returned a different session".to_owned(),
+        ));
+    }
+    Ok(info)
+}
+
+async fn fetch_opencode_v2_snapshot<F, Fut>(
+    session_id: &str,
+    mut execute: F,
+) -> Result<OpenCodeV2Snapshot, AgentSessionError>
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Result<String, AgentSessionError>>,
+{
+    let mut snapshot = OpenCodeV2Snapshot {
+        info: fetch_opencode_v2_info(session_id, &mut execute).await?,
+        messages: Vec::new(),
+    };
+    let mut cursor = None;
+    let mut seen = HashSet::new();
+    loop {
+        let output = execute(opencode_v2_messages_command(session_id, cursor.as_deref())).await?;
+        let page = serde_json::from_str::<OpenCodeV2Page>(&output).map_err(|error| {
+            AgentSessionError::ReadFailed(format!("Invalid OpenCode v2 messages: {error}"))
+        })?;
+        if page.data.is_empty() {
+            break;
+        }
+        snapshot.messages.extend(page.data);
+        let Some(next) = page.cursor.next else { break };
+        if next.is_empty() || !seen.insert(next.clone()) {
+            return Err(AgentSessionError::ReadFailed(
+                "OpenCode v2 returned a repeated pagination cursor".to_owned(),
+            ));
+        }
+        cursor = Some(next);
+    }
+    Ok(snapshot)
 }
 
 fn sqlite_text_literal(value: &str) -> String {
@@ -1589,6 +2348,57 @@ fn opencode_events_command(session_id: &str, after_sequence: u64) -> String {
     format!("opencode db {} --format json", shell_quote(&query))
 }
 
+fn validate_claude_session_id(value: &str) -> Result<(), AgentSessionError> {
+    if parse_uuid_bytes(value).is_some() {
+        Ok(())
+    } else {
+        Err(AgentSessionError::InvalidSession(
+            "Claude session ID must be a UUID".to_owned(),
+        ))
+    }
+}
+
+fn claude_transcript_find_command(session_id: &str) -> String {
+    let name = shell_quote(&format!("{session_id}.jsonl"));
+    // GNU and BSD stat both work; separate the numeric mtime from the exact
+    // pathname with a tab. All dynamic arguments remain shell-quoted.
+    format!(
+        r#"find "$HOME/.claude/projects" -type f -name {name} -exec sh -c 'for p do t=$(stat -c %Y "$p" 2>/dev/null || stat -f %m "$p") || continue; printf "%s\t%s\n" "$t" "$p"; done' sh {{}} +"#
+    )
+}
+
+fn resolve_claude_path(
+    output: &str,
+    session_id: &str,
+) -> Result<Option<String>, AgentSessionError> {
+    validate_claude_session_id(session_id)?;
+    let filename = format!("{session_id}.jsonl");
+    let candidate = output
+        .lines()
+        .filter_map(|line| {
+            let (mtime, path) = line.split_once('\t')?;
+            let mtime = mtime.parse::<i64>().ok()?;
+            if !path.starts_with('/')
+                || !path.contains("/.claude/projects/")
+                || path.chars().any(char::is_control)
+                || path.rsplit('/').next() != Some(filename.as_str())
+                || path
+                    .split('/')
+                    .any(|part| matches!(part, ".." | "subagents" | "tool-results"))
+            {
+                return None;
+            }
+            Some((mtime, path))
+        })
+        .max();
+    if candidate.is_none() && !output.trim().is_empty() {
+        return Err(AgentSessionError::SourceUnavailable(
+            "Claude returned no valid transcript for the session ID".into(),
+        ));
+    }
+    Ok(candidate.map(|(_, path)| path.to_owned()))
+}
+
 fn codex_rollout_find_command(session_id: &str) -> String {
     let ordinary = shell_quote(&format!("rollout-*-{session_id}.jsonl"));
     let reverted = shell_quote(&format!("rollout-*-{session_id}_*.jsonl"));
@@ -1602,9 +2412,9 @@ fn codex_rollout_find_command(session_id: &str) -> String {
 /// Keep this as one direct exec rather than a remote shell supervisor. Besides
 /// avoiding login-shell differences, this is the exact transport shape used
 /// by the previous working TypeScript implementation. `-F` also survives a
-/// same-path replacement; a new reverted-rollout filename is selected by the
-/// Rust resolver whenever the stream is opened or rebound.
-fn codex_stream_command(path: &str, offset: u64) -> String {
+/// same-path replacement; the file-source monitor triggers a rebind when the
+/// Rust resolver selects a new reverted-rollout filename.
+fn file_stream_command(path: &str, offset: u64) -> String {
     let start = shell_quote(&format!("+{}", offset.saturating_add(1)));
     format!("exec tail -c {start} -F {}", shell_quote(path))
 }
@@ -1704,6 +2514,61 @@ fn parse_uuid_bytes(value: &str) -> Option<[u8; 16]> {
     (nibble_index == 32).then_some(bytes)
 }
 
+fn file_metadata_command(path: &str) -> String {
+    let path = shell_quote(path);
+    format!("stat -c '%d:%i %s' {path} 2>/dev/null || stat -f '%d:%i %z' {path}")
+}
+
+fn file_source_poll_command(path: &str, rollout_session_id: Option<&str>) -> String {
+    let metadata = file_metadata_command(path);
+    match rollout_session_id {
+        // SSH parses this in the user's shell. Parenthesized grouping is a
+        // command substitution in Fish. Both POSIX shells and Fish evaluate
+        // &&/|| left-to-right, so discovery runs only if either stat succeeds.
+        // Keep one SSH exec per poll and Claude's stat-only behavior.
+        Some(session_id) => format!("{metadata} && {}", codex_rollout_find_command(session_id)),
+        None => metadata,
+    }
+}
+
+struct FileSourceMetadata {
+    file_id: String,
+    size: u64,
+    rollout_path: Option<String>,
+}
+
+impl FileSourceMetadata {
+    fn changed(&self, path: &str, file_id: &str, previous_size: u64, received: u64) -> bool {
+        self.rollout_path.as_deref().is_some_and(|new| new != path)
+            || self.file_changed(file_id, previous_size, received)
+    }
+
+    fn file_changed(&self, file_id: &str, previous_size: u64, received: u64) -> bool {
+        self.file_id != file_id || self.size < previous_size || self.size < received
+    }
+}
+
+fn parse_file_source_poll(
+    output: &str,
+    rollout_session_id: Option<&str>,
+) -> Result<FileSourceMetadata, AgentSessionError> {
+    let (metadata, paths) = if rollout_session_id.is_some() {
+        output.split_once('\n').unwrap_or((output, ""))
+    } else {
+        (output, "")
+    };
+    let (file_id, size) = parse_metadata(metadata)?;
+    let rollout_path = rollout_session_id
+        .map(|session_id| resolve_rollout_path(paths, session_id))
+        .transpose()?
+        .flatten();
+    Ok(FileSourceMetadata {
+        file_id,
+        size,
+        rollout_path,
+    })
+}
+
 fn parse_metadata(output: &str) -> Result<(String, u64), AgentSessionError> {
     let mut fields = output.split_whitespace();
     let file_id = fields.next().unwrap_or_default();
@@ -1716,11 +2581,11 @@ fn parse_metadata(output: &str) -> Result<(String, u64), AgentSessionError> {
     });
     if !file_id_valid || fields.next().is_some() {
         return Err(AgentSessionError::SourceUnavailable(
-            "Codex returned invalid rollout metadata".to_owned(),
+            "Invalid transcript file metadata".to_owned(),
         ));
     }
     let size = size.ok_or_else(|| {
-        AgentSessionError::SourceUnavailable("Codex returned invalid rollout metadata".to_owned())
+        AgentSessionError::SourceUnavailable("Invalid transcript file metadata".to_owned())
     })?;
     Ok((file_id.to_owned(), size))
 }
@@ -1728,6 +2593,7 @@ fn parse_metadata(output: &str) -> Result<(String, u64), AgentSessionError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
 
     const SESSION: &str = "11111111-1111-4111-8111-111111111111";
 
@@ -1740,11 +2606,582 @@ mod tests {
     }
 
     #[test]
+    fn idle_transcripts_drain_late_writes_and_use_slow_fallback() {
+        let now = Instant::now();
+        let mut activity = TranscriptActivity::new(true);
+        activity.set_active(false, now);
+        assert!(!activity.pause_if_quiet(now + TRANSCRIPT_DRAIN_DELAY / 2));
+        let late_write = now + TRANSCRIPT_DRAIN_DELAY / 2;
+        activity.touch(late_write);
+        // Repeated idle snapshots must not keep extending the drain period.
+        activity.set_active(false, late_write + TRANSCRIPT_DRAIN_DELAY / 2);
+        assert!(!activity.pause_if_quiet(now + TRANSCRIPT_DRAIN_DELAY));
+        assert!(activity.pause_if_quiet(late_write + TRANSCRIPT_DRAIN_DELAY));
+        for normal in [FILE_SOURCE_POLL_DELAY, OPENCODE_POLL_DELAY] {
+            assert_eq!(activity.poll_delay(normal), IDLE_TRANSCRIPT_POLL_DELAY);
+        }
+        assert!(activity.set_active(true, late_write + TRANSCRIPT_DRAIN_DELAY));
+        assert!(!activity.pause_if_quiet(now + IDLE_TRANSCRIPT_POLL_DELAY));
+        assert_eq!(
+            activity.poll_delay(FILE_SOURCE_POLL_DELAY),
+            FILE_SOURCE_POLL_DELAY
+        );
+    }
+
+    #[test]
+    fn shared_transcripts_poll_if_any_terminal_is_working_or_unknown() {
+        let terminals = HashSet::from(["one".into(), "two".into()]);
+        for idle in [
+            HerdrAgentStatus::Idle,
+            HerdrAgentStatus::Done,
+            HerdrAgentStatus::Blocked,
+        ] {
+            let mut statuses = HashMap::from([("one".into(), idle), ("two".into(), idle)]);
+            assert!(!transcript_active(&terminals, &statuses));
+            statuses.insert("two".into(), HerdrAgentStatus::Working);
+            assert!(transcript_active(&terminals, &statuses));
+            statuses.insert("two".into(), HerdrAgentStatus::Unknown);
+            assert!(transcript_active(&terminals, &statuses));
+            statuses.remove("two");
+            assert!(transcript_active(&terminals, &statuses));
+        }
+    }
+
+    #[test]
+    fn idle_opencode_fallback_stays_slow_until_content_changes() {
+        for protocol in [OpenCodeProtocol::V1, OpenCodeProtocol::V2] {
+            let manager = test_manager("idle-opencode");
+            manager.inner.state.lock().connected = true;
+            manager.update_agent_statuses(
+                HashMap::from([("terminal".into(), HerdrAgentStatus::Idle)]),
+                1,
+            );
+            let binding = manager
+                .bind_opencode("terminal".into(), "ses_idle".into())
+                .unwrap();
+            let epoch =
+                manager.inner.state.lock().sessions[&binding.transcript_key].operation_epoch;
+            let apply = |text: &str| {
+                match protocol {
+                    OpenCodeProtocol::V1 => manager.finish_opencode_sync(&binding.transcript_key, epoch,
+                        OpenCodeSync::Export { cursor: 1, payload: &serde_json::json!({
+                            "info":{"id":"ses_idle"},
+                            "messages":[{"info":{"id":"msg_user", "sessionID":"ses_idle", "role":"user"},
+                                "parts":[{"id":"part_user", "type":"text", "text":text}]}]
+                        }).to_string() }),
+                    OpenCodeProtocol::V2 => manager.finish_opencode_sync(&binding.transcript_key, epoch,
+                        OpenCodeSync::V2(OpenCodeV2Sync::Full { snapshot: OpenCodeV2Snapshot {
+                            info: serde_json::json!({"id":"ses_idle"}),
+                            messages: vec![serde_json::json!({"id":"msg_user", "type":"user", "text":text})],
+                        }, sequence: None })),
+                }.unwrap();
+            };
+            apply("hello");
+            let quiet_since = Instant::now().checked_sub(TRANSCRIPT_DRAIN_DELAY).unwrap();
+            {
+                let mut state = manager.inner.state.lock();
+                let session = state.sessions.get_mut(&binding.transcript_key).unwrap();
+                session.activity.quiet_since = quiet_since;
+                assert!(session.activity.pause_if_quiet(Instant::now()));
+                drop(state);
+            }
+            apply("hello");
+            {
+                let state = manager.inner.state.lock();
+                let activity = &state.sessions[&binding.transcript_key].activity;
+                assert!(
+                    activity.paused,
+                    "{protocol:?}: unchanged fallback stays paused"
+                );
+                assert_eq!(activity.quiet_since, quiet_since);
+                assert_eq!(
+                    activity.poll_delay(OPENCODE_POLL_DELAY),
+                    IDLE_TRANSCRIPT_POLL_DELAY
+                );
+                drop(state);
+            }
+            apply("updated from another client");
+            {
+                let state = manager.inner.state.lock();
+                let session = &state.sessions[&binding.transcript_key];
+                assert!(!session.activity.paused);
+                assert_eq!(
+                    session.activity.poll_delay(OPENCODE_POLL_DELAY),
+                    OPENCODE_POLL_DELAY
+                );
+                assert_eq!(session.core.state().messages.len(), 1);
+                drop(state);
+            }
+            manager.disconnected(false, "test finished");
+        }
+    }
+
+    #[test]
+    fn idle_file_pause_preserves_history_and_replays_partial_record_on_resume() {
+        let (manager, binding, epoch) = discovery_fixture();
+        discovered_history(&manager, &binding.transcript_key, epoch);
+        let line = format!(
+            "{}\n",
+            serde_json::json!({
+                "type":"event_msg", "payload":{"type":"user_message", "message":"late reply"}
+            })
+        );
+        let (context, complete_offset) = {
+            let mut state = manager.inner.state.lock();
+            let session = state.sessions.get_mut(&binding.transcript_key).unwrap();
+            let offset = session.core.file().unwrap().received_offset();
+            let result = (session.stream_context.unwrap(), offset);
+            drop(state);
+            result
+        };
+        let partial = line.as_bytes()[..line.len() / 2].to_vec();
+        stream_data(context, partial.clone());
+        let before = manager.state(&binding.transcript_key).unwrap();
+        let now = Instant::now();
+        {
+            let mut state = manager.inner.state.lock();
+            let session = state.sessions.get_mut(&binding.transcript_key).unwrap();
+            session.activity.set_active(false, now);
+            session.pause_file_if_quiet(
+                complete_offset + line.len() as u64,
+                now + TRANSCRIPT_DRAIN_DELAY,
+            );
+            assert!(
+                !session.activity.paused,
+                "unreceived bytes prevent closing tail"
+            );
+            session.pause_file_if_quiet(
+                complete_offset + partial.len() as u64,
+                now + TRANSCRIPT_DRAIN_DELAY,
+            );
+            assert!(session.activity.paused);
+            assert!(session.stream_context.is_none());
+            drop(state);
+        }
+        assert!(!streams().read().contains_key(&context));
+        stream_data(context, line.as_bytes().to_vec());
+        // Also reject a close callback that already copied the old context.
+        manager.fail_session_inner(
+            binding.transcript_key.clone(),
+            epoch,
+            "closed for idle".into(),
+            SessionFailureKind::Transient,
+            Some(context),
+        );
+        assert_eq!(manager.state(&binding.transcript_key).unwrap(), before);
+        let reopened = manager
+            .bind_discovered_file(
+                &binding.transcript_key,
+                epoch,
+                "/rollout",
+                "1:2",
+                complete_offset + line.len() as u64,
+            )
+            .unwrap();
+        assert_eq!(reopened.1, complete_offset);
+        assert!(
+            reopened.2.is_none(),
+            "append resumes without resetting history"
+        );
+        stream_data(reopened.0, line.into_bytes());
+        let after = manager.state(&binding.transcript_key).unwrap();
+        assert_eq!(after.messages.len(), before.messages.len() + 1);
+        assert_eq!(after.status, AgentTranscriptStatus::Live);
+        manager.disconnected(false, "test finished");
+    }
+
+    #[test]
+    fn idle_pause_waits_for_initial_history() {
+        let (manager, binding, epoch) = discovery_fixture();
+        let opened = manager
+            .bind_discovered_file(&binding.transcript_key, epoch, "/rollout", "1:2", 100)
+            .unwrap();
+        let now = Instant::now();
+        {
+            let mut state = manager.inner.state.lock();
+            let session = state.sessions.get_mut(&binding.transcript_key).unwrap();
+            session.activity.set_active(false, now);
+            session.pause_file_if_quiet(0, now + TRANSCRIPT_DRAIN_DELAY);
+            assert!(!session.activity.paused);
+            assert_eq!(session.stream_context, Some(opened.0));
+            drop(state);
+        }
+        manager.disconnected(false, "test finished");
+    }
+
+    #[test]
+    fn working_status_input_and_explicit_open_wake_idle_sessions() {
+        for trigger in ["working", "input", "open", "unknown"] {
+            let (manager, binding, epoch) = discovery_fixture();
+            discovered_history(&manager, &binding.transcript_key, epoch);
+            manager.update_agent_statuses(
+                HashMap::from([("terminal".into(), HerdrAgentStatus::Idle)]),
+                2,
+            );
+            let now = Instant::now();
+            {
+                let mut state = manager.inner.state.lock();
+                let session = state.sessions.get_mut(&binding.transcript_key).unwrap();
+                let size = session.core.file().unwrap().received_offset();
+                session.pause_file_if_quiet(size, now + TRANSCRIPT_DRAIN_DELAY);
+                assert!(session.activity.paused);
+                drop(state);
+            }
+            // An older status snapshot must neither wake nor change the policy.
+            manager.update_agent_statuses(HashMap::new(), 1);
+            assert!(
+                manager.inner.state.lock().sessions[&binding.transcript_key]
+                    .activity
+                    .paused
+            );
+            match trigger {
+                "working" => manager.update_agent_statuses(
+                    HashMap::from([("terminal".into(), HerdrAgentStatus::Working)]),
+                    3,
+                ),
+                "unknown" => manager.update_agent_statuses(HashMap::new(), 3),
+                "input" => manager.wake_pane(&binding.pane_id),
+                "open" => {
+                    manager.start_bound(&binding.binding_token, None).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            {
+                let state = manager.inner.state.lock();
+                let session = &state.sessions[&binding.transcript_key];
+                assert!(!session.activity.paused, "{trigger}");
+                assert_ne!(
+                    session.operation_epoch, epoch,
+                    "{trigger} replaces sleeping operations"
+                );
+                drop(state);
+            }
+            manager.disconnected(false, "test finished");
+        }
+    }
+
+    #[test]
+    fn working_status_retries_an_exhausted_rollout_discovery() {
+        let (manager, binding, epoch) = discovery_fixture();
+        manager.update_agent_statuses(
+            HashMap::from([("terminal".into(), HerdrAgentStatus::Idle)]),
+            1,
+        );
+        {
+            let mut state = manager.inner.state.lock();
+            let session = state.sessions.get_mut(&binding.transcript_key).unwrap();
+            session.discovery_retries = CODEX_DISCOVERY_RETRY_DELAYS.len();
+            drop(state);
+        }
+        missing_rollout(&manager, &binding.transcript_key, epoch);
+        assert_eq!(
+            manager.state(&binding.transcript_key).unwrap().status,
+            AgentTranscriptStatus::Unavailable
+        );
+        manager.update_agent_statuses(
+            HashMap::from([("terminal".into(), HerdrAgentStatus::Working)]),
+            2,
+        );
+        {
+            let state = manager.inner.state.lock();
+            let session = &state.sessions[&binding.transcript_key];
+            assert_ne!(session.operation_epoch, epoch);
+            assert_eq!(session.discovery_retries, 0);
+            drop(state);
+        }
+        manager.disconnected(false, "test finished");
+    }
+
+    #[test]
+    fn opencode_versions_select_separate_transports() {
+        for version in ["1.18.31\n", "v1.2.0", "opencode v1.2.0"] {
+            assert_eq!(
+                parse_opencode_protocol(version).unwrap(),
+                OpenCodeProtocol::V1
+            );
+        }
+        for version in ["2.0.19\n", "v2.0.0-beta.1", "opencode v2.0.29+042d083\n"] {
+            assert_eq!(
+                parse_opencode_protocol(version).unwrap(),
+                OpenCodeProtocol::V2
+            );
+        }
+        assert!(parse_opencode_protocol("3.0.0").is_err());
+        assert!(parse_opencode_protocol("opencode v3.0.0").is_err());
+        assert!(parse_opencode_protocol("other v2.0.29").is_err());
+        assert!(parse_opencode_protocol("command not found").is_err());
+    }
+
+    #[test]
+    fn opencode_v2_pagination_reads_all_pages_and_encodes_opaque_cursors() {
+        let cursor = "opaque/+?&'$(false)";
+        let mut responses = [
+            serde_json::json!({ "data": { "id": "ses_v2" } }),
+            serde_json::json!({ "data": [{ "id": "msg_one", "type": "user", "text": "hello" }], "cursor": { "next": cursor } }),
+            serde_json::json!({ "data": [{ "id": "msg_two", "type": "assistant", "content": [] }], "cursor": { "next": "last" } }),
+            serde_json::json!({ "data": [], "cursor": {} }),
+        ].into_iter();
+        let mut commands = Vec::new();
+        let snapshot =
+            futures::executor::block_on(fetch_opencode_v2_snapshot("ses_v2", |command| {
+                commands.push(command);
+                std::future::ready(Ok(responses.next().unwrap().to_string()))
+            }))
+            .unwrap();
+        assert_eq!(snapshot.messages.len(), 2);
+        assert_eq!(commands.len(), 4);
+        let request = |command: &str| {
+            let argv = shlex::split(command).unwrap();
+            assert_eq!(&argv[..3], ["opencode", "api", "GET"]);
+            assert_eq!(argv.len(), 4);
+            url::Url::parse(&format!("http://localhost{}", argv[3])).unwrap()
+        };
+        let first = request(&commands[1]);
+        assert_eq!(first.path(), "/api/session/ses_v2/message");
+        assert_eq!(
+            first
+                .query_pairs()
+                .collect::<HashMap<_, _>>()
+                .get("order")
+                .unwrap(),
+            "asc"
+        );
+        let second = request(&commands[2]);
+        let query = second.query_pairs().collect::<HashMap<_, _>>();
+        assert_eq!(query.get("cursor").unwrap(), cursor);
+        assert!(!query.contains_key("order"));
+        assert_eq!(query.get("limit").unwrap(), "200");
+    }
+
+    #[test]
+    fn opencode_v2_pagination_rejects_cycles_and_incomplete_reads() {
+        for fail_read in [false, true] {
+            let mut calls = 0;
+            let result = futures::executor::block_on(fetch_opencode_v2_snapshot("ses_v2", |_| {
+                calls += 1;
+                std::future::ready(if calls == 1 {
+                    Ok(serde_json::json!({ "data": { "id": "ses_v2" } }).to_string())
+                } else if fail_read && calls == 3 {
+                    Err(AgentSessionError::ReadFailed("SSH disconnected".into()))
+                } else {
+                    Ok(serde_json::json!({ "data": [{ "id": "msg_one" }], "cursor": { "next": "same" } }).to_string())
+                })
+            }));
+            assert!(result.is_err());
+            assert_eq!(calls, 3);
+        }
+    }
+
+    #[test]
+    fn opencode_v2_sync_becomes_live_and_checkpoints_without_rewriting_unchanged_history() {
+        let manager = test_manager("v2-sync");
+        manager.inner.state.lock().connected = true;
+        let binding = manager
+            .bind_opencode("terminal".into(), "ses_v2".into())
+            .unwrap();
+        let epoch = manager.inner.state.lock().sessions[&binding.transcript_key].operation_epoch;
+        let snapshot = || OpenCodeV2Snapshot {
+            info: serde_json::json!({ "id": "ses_v2" }),
+            messages: vec![
+                serde_json::json!({ "id": "msg_user", "type": "user", "text": "Hello" }),
+            ],
+        };
+        manager
+            .finish_opencode_sync(
+                &binding.transcript_key,
+                epoch,
+                OpenCodeSync::V2(OpenCodeV2Sync::Full {
+                    snapshot: snapshot(),
+                    sequence: None,
+                }),
+            )
+            .unwrap();
+        let state = manager.state(&binding.transcript_key).unwrap();
+        assert_eq!(state.status, AgentTranscriptStatus::Live);
+        assert_eq!(state.messages.len(), 1);
+        let token = manager
+            .inner
+            .state
+            .lock()
+            .checkpoints
+            .keys()
+            .next()
+            .unwrap()
+            .clone();
+        assert!(manager.confirm_cache(&token));
+        manager
+            .finish_opencode_sync(
+                &binding.transcript_key,
+                epoch,
+                OpenCodeSync::V2(OpenCodeV2Sync::Full {
+                    snapshot: snapshot(),
+                    sequence: None,
+                }),
+            )
+            .unwrap();
+        assert_eq!(manager.state(&binding.transcript_key).unwrap(), state);
+        assert!(manager.inner.state.lock().checkpoints.is_empty());
+        assert!(
+            manager
+                .finish_opencode_sync(
+                    &binding.transcript_key,
+                    epoch + 1,
+                    OpenCodeSync::V2(OpenCodeV2Sync::Full {
+                        snapshot: snapshot(),
+                        sequence: None
+                    })
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn saved_transcripts_open_without_a_host_runtime_and_validate_identity() {
+        let codex_lines = [
+            serde_json::json!({"type":"session_meta","payload":{}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"user_message","message":"hello"}}),
+        ]
+        .into_iter()
+        .fold(String::new(), |mut lines, line| {
+            writeln!(lines, "{line}").unwrap();
+            lines
+        });
+        let mut codex = CodexSessionCore::new(SESSION);
+        let source = codex.bind_source("/rollout".into(), "1:2".into(), codex_lines.len() as u64);
+        codex
+            .ingest(source.source_generation, codex_lines.as_bytes())
+            .unwrap();
+        let blob = codex.cache_blob().unwrap();
+        let saved =
+            read_cached_agent_transcript(AgentTranscriptKind::Codex, SESSION.into(), blob.clone())
+                .unwrap();
+        assert_eq!(saved.status, AgentTranscriptStatus::Stale);
+        assert!(!saved.messages.is_empty());
+        assert!(matches!(
+            read_cached_agent_transcript(AgentTranscriptKind::Codex, "other".into(), blob),
+            Err(AgentSessionError::CorruptedCache(_))
+        ));
+
+        let mut opencode = OpenCodeSessionCore::new("ses_saved");
+        opencode
+            .bootstrap(1, r#"{"info":{"id":"ses_saved"},"messages":[]}"#)
+            .unwrap();
+        let saved = read_cached_agent_transcript(
+            AgentTranscriptKind::OpenCode,
+            "ses_saved".into(),
+            opencode.cache_blob().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(saved.status, AgentTranscriptStatus::Stale);
+    }
+
+    #[test]
     fn validates_session_ids_before_building_remote_commands() {
         assert!(validate_codex_session_id(SESSION).is_ok());
         assert!(validate_codex_session_id(&format!("{SESSION}; uname -a")).is_err());
         assert!(validate_opencode_session_id("ses_abc123").is_ok());
         assert!(validate_opencode_session_id("ses_x'; DROP TABLE event;--").is_err());
+    }
+
+    #[test]
+    fn claude_discovery_selects_newest_exact_session_and_rejects_unsafe_candidates() {
+        let older = format!("/home/me/.claude/projects/old/{SESSION}.jsonl");
+        let newer = format!("/home/me/.claude/projects/new/{SESSION}.jsonl");
+        let listing =
+            format!("1\t{older}\n2\t{newer}\n99\t/home/me/.claude/projects/x/other.jsonl\n");
+        assert_eq!(
+            resolve_claude_path(&listing, SESSION).unwrap(),
+            Some(newer.clone())
+        );
+        let tied = format!("2\t{older}\n2\t{newer}\n");
+        assert_eq!(resolve_claude_path(&tied, SESSION).unwrap(), Some(older));
+        assert!(resolve_claude_path("", SESSION).unwrap().is_none());
+        for path in [
+            format!("/tmp/{SESSION}.jsonl"),
+            format!("/home/me/.claude/projects/x/subagents/{SESSION}.jsonl"),
+            format!("/home/me/.claude/projects/../{SESSION}.jsonl"),
+        ] {
+            assert!(resolve_claude_path(&format!("1\t{path}\n"), SESSION).is_err());
+        }
+        for id in ["../escape", "*", "$(uname)", "id'; echo oops", "a\nb"] {
+            assert!(validate_claude_session_id(id).is_err());
+        }
+    }
+
+    #[test]
+    fn claude_find_and_metadata_commands_work_with_shell_metacharacters_in_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let projects = root.path().join(".claude/projects");
+        let project = projects.join("a 'quoted' $project");
+        std::fs::create_dir_all(&project).unwrap();
+        let path = project.join(format!("{SESSION}.jsonl"));
+        std::fs::write(&path, b"{}\n").unwrap();
+        let command = claude_transcript_find_command(SESSION).replace(
+            "\"$HOME/.claude/projects\"",
+            &shell_quote(projects.to_str().unwrap()),
+        );
+        let output = std::process::Command::new("sh")
+            .args(["-c", &command])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            resolve_claude_path(std::str::from_utf8(&output.stdout).unwrap(), SESSION).unwrap(),
+            Some(path.to_str().unwrap().to_owned())
+        );
+        let output = std::process::Command::new("sh")
+            .args(["-c", &file_metadata_command(path.to_str().unwrap())])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            parse_metadata(std::str::from_utf8(&output.stdout).unwrap())
+                .unwrap()
+                .1,
+            3
+        );
+    }
+
+    #[test]
+    fn claude_checkpoint_opens_offline_and_archives_from_the_same_pane() {
+        let fixture = include_bytes!("../test-fixtures/claude/main.jsonl");
+        let mut core = ClaudeSessionCore::new(SESSION);
+        let binding = core.bind_source("/transcript".into(), "1:2".into(), fixture.len() as u64);
+        core.ingest(binding.source_generation, fixture).unwrap();
+        let blob = core.cache_blob().unwrap();
+        let saved =
+            read_cached_agent_transcript(AgentTranscriptKind::Claude, SESSION.into(), blob.clone())
+                .unwrap();
+        assert_eq!(saved.agent, AgentTranscriptKind::Claude);
+        assert_eq!(saved.status, AgentTranscriptStatus::Stale);
+        assert_eq!(saved.messages.len(), 5);
+        assert!(
+            read_cached_agent_transcript(AgentTranscriptKind::Codex, SESSION.into(), blob).is_err()
+        );
+        let manager = test_manager("claude-cache");
+        let identity = AuthoritativeAgentChatIdentity {
+            terminal_id: "terminal".into(),
+            pane_id: "pane".into(),
+            agent: AgentTranscriptKind::Claude,
+            session_id: SESSION.into(),
+        };
+        let binding = manager.bind_authoritative(identity).unwrap();
+        {
+            let mut state = manager.inner.state.lock();
+            state
+                .sessions
+                .get_mut(&binding.transcript_key)
+                .unwrap()
+                .core = AgentSessionCore::Claude(Box::new(core));
+        }
+        let archive = manager.detach_terminal("terminal").unwrap().unwrap();
+        assert_eq!(archive.key, binding.transcript_key);
+        assert_eq!(
+            read_cached_agent_transcript(AgentTranscriptKind::Claude, SESSION.into(), archive.blob)
+                .unwrap()
+                .messages,
+            saved.messages
+        );
     }
 
     #[test]
@@ -1798,6 +3235,181 @@ mod tests {
         );
     }
 
+    fn run_file_source_poll(
+        path: &std::path::Path,
+        sessions: &std::path::Path,
+    ) -> std::process::Output {
+        let command = file_source_poll_command(path.to_str().unwrap(), Some(SESSION)).replace(
+            "\"$HOME/.codex/sessions\"",
+            &shell_quote(sessions.to_str().unwrap()),
+        );
+        // Exercise the actual SSH command under another login shell too,
+        // e.g. WHIP_TEST_REMOTE_SHELL=fish; CI defaults to POSIX sh.
+        let shell = std::env::var_os("WHIP_TEST_REMOTE_SHELL").unwrap_or_else(|| "sh".into());
+        std::process::Command::new(shell)
+            .args(["-c", &command])
+            .output()
+            .unwrap()
+    }
+
+    #[test]
+    fn file_source_poll_does_not_discover_rollouts_when_stat_fails() {
+        let root = tempfile::tempdir().unwrap();
+        let sibling = root
+            .path()
+            .join(format!("rollout-2026-08-26T10-20-30-{SESSION}.jsonl"));
+        std::fs::write(&sibling, b"{}\n").unwrap();
+        let output = run_file_source_poll(&root.path().join("missing.jsonl"), root.path());
+        assert!(!output.status.success(), "{output:?}");
+        // A successful find would print this existing sibling despite failed stat.
+        assert!(!String::from_utf8_lossy(&output.stdout).contains(sibling.to_str().unwrap()));
+    }
+
+    fn assert_live_codex_switches_to_reverted_rollout(timestamp: &str, rollout_id: &str) {
+        use std::io::Write as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join(".codex/sessions");
+        let directory = sessions.join("a 'quoted' $directory");
+        std::fs::create_dir_all(&directory).unwrap();
+        let ordinary = directory.join(format!("rollout-2026-08-26T10-20-30-{SESSION}.jsonl"));
+        let reverted = directory.join(format!("rollout-{timestamp}-{SESSION}_{rollout_id}.jsonl"));
+        let original_bytes = include_str!("../test-fixtures/codex/paginated-rollout.jsonl")
+            .replace("thread-current", SESSION);
+        let reverted_bytes = original_bytes
+            .lines()
+            .take(15)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(&ordinary, &reverted_bytes).unwrap();
+
+        // Run the same combined command and change detection as the live
+        // monitor, against real files rather than mocked discovery output.
+        let poll = |path: &std::path::Path| {
+            let output = run_file_source_poll(path, &sessions);
+            assert!(output.status.success(), "{output:?}");
+            parse_file_source_poll(std::str::from_utf8(&output.stdout).unwrap(), Some(SESSION))
+                .unwrap()
+        };
+        let original = poll(&ordinary);
+        assert_eq!(original.rollout_path.as_deref(), ordinary.to_str());
+        let mut core = CodexSessionCore::new(SESSION);
+        let binding = core.bind_source(
+            original.rollout_path.clone().unwrap(),
+            original.file_id.clone(),
+            original.size,
+        );
+        core.ingest(binding.source_generation, reverted_bytes.as_bytes())
+            .unwrap();
+        let retained = core.state();
+        assert_eq!(retained.turns.len(), 1);
+        let unchanged = poll(&ordinary);
+        assert!(!unchanged.changed(
+            ordinary.to_str().unwrap(),
+            &original.file_id,
+            original.size,
+            core.received_offset(),
+        ));
+
+        let appended_bytes = &original_bytes.as_bytes()[reverted_bytes.len()..];
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&ordinary)
+            .unwrap()
+            .write_all(appended_bytes)
+            .unwrap();
+        let appended = poll(&ordinary);
+        assert!(appended.size > original.size);
+        assert!(!appended.changed(
+            ordinary.to_str().unwrap(),
+            &original.file_id,
+            original.size,
+            core.received_offset(),
+        ));
+        core.ingest(binding.source_generation, appended_bytes)
+            .unwrap();
+        assert_eq!(core.state().turns.len(), 3);
+        let original = appended;
+
+        // The old file is still intact: identity and size alone cannot detect
+        // the revert. Only the newly selected rollout triggers invalidation.
+        std::fs::write(&reverted, &reverted_bytes).unwrap();
+        let changed = poll(&ordinary);
+        assert_eq!(changed.file_id, original.file_id);
+        assert_eq!(changed.size, original.size);
+        assert_eq!(std::fs::read_to_string(&ordinary).unwrap(), original_bytes);
+        assert_eq!(changed.rollout_path.as_deref(), reverted.to_str());
+        assert!(changed.changed(
+            ordinary.to_str().unwrap(),
+            &original.file_id,
+            original.size,
+            core.received_offset(),
+        ));
+        assert!(!changed.file_changed(&original.file_id, original.size, core.received_offset()));
+        assert_eq!(core.rollout_path(), ordinary.to_str());
+
+        let replacement = poll(&reverted);
+        let rebound = core.bind_source(
+            replacement.rollout_path.unwrap(),
+            replacement.file_id,
+            replacement.size,
+        );
+        assert!(rebound.rebuilt);
+        assert_eq!(rebound.start_offset, 0);
+        let reset = AgentTranscriptUpdate::reset(core.state());
+        assert!(matches!(
+            &reset.deltas[..],
+            [AgentTranscriptDelta::Reset { state }] if state.messages.is_empty() && state.turns.is_empty()
+        ));
+        core.ingest(rebound.source_generation, reverted_bytes.as_bytes())
+            .unwrap();
+        let state = core.state();
+        assert_eq!(state.status, AgentTranscriptStatus::Live);
+        assert_eq!(state.turns.len(), 1);
+        assert_eq!(state.turns[0].id, "turn-current-1");
+        assert_eq!(state.messages, retained.messages);
+        assert_eq!(state.turns, retained.turns);
+        assert!(!state.messages.iter().any(|message| {
+            matches!(
+                message.id.as_str(),
+                "user-continue-1" | "user-continue-2" | "agent-current-2"
+            )
+        }));
+        // Late bytes from the old tail cannot reintroduce reverted turns.
+        assert!(
+            !core
+                .ingest(binding.source_generation, original_bytes.as_bytes())
+                .unwrap()
+                .changed
+        );
+        assert_eq!(core.state(), state);
+        let saved = read_cached_agent_transcript(
+            AgentTranscriptKind::Codex,
+            SESSION.into(),
+            core.cache_blob().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(saved.messages, state.messages);
+        assert_eq!(saved.turns, state.turns);
+    }
+
+    #[test]
+    fn live_codex_poll_switches_to_newer_reverted_sibling_and_removes_turns() {
+        assert_live_codex_switches_to_reverted_rollout(
+            "2026-08-26T10-21-30",
+            "0198e6cc-9d62-7000-8000-000000000001",
+        );
+    }
+
+    #[test]
+    fn live_codex_poll_switches_to_reverted_sibling_created_in_the_same_second() {
+        assert_live_codex_switches_to_reverted_rollout(
+            "2026-08-26T10-20-30",
+            "ffffffff-ffff-4fff-8fff-ffffffffffff",
+        );
+    }
+
     #[test]
     fn rollout_resolution_uses_rollout_uuid_to_break_timestamp_ties() {
         let first_rollout = "0198e6cc-9d62-7000-8000-000000000001";
@@ -1837,16 +3449,74 @@ mod tests {
         assert!(matches!(
             parse_metadata("12:34 nope"),
             Err(AgentSessionError::SourceUnavailable(message))
-                if message == "Codex returned invalid rollout metadata"
+                if message == "Invalid transcript file metadata"
         ));
+    }
+
+    #[test]
+    fn file_source_poll_preserves_stat_only_append_and_truncation_checks() {
+        let path = "/claude/transcript.jsonl";
+        assert_eq!(
+            file_source_poll_command(path, None),
+            file_metadata_command(path)
+        );
+        let appended = parse_file_source_poll("12:34 101\n", None).unwrap();
+        assert!(!appended.changed(path, "12:34", 100, 100));
+        assert!(appended.changed(path, "12:35", 100, 100));
+        assert!(appended.changed(path, "12:34", 102, 100));
+        assert!(appended.changed(path, "12:34", 100, 102));
+        assert!(parse_file_source_poll("12:34 nope\n", None).is_err());
     }
 
     #[test]
     fn stream_command_matches_the_pre_migration_binary_path() {
         assert_eq!(
-            codex_stream_command("/tmp/rollout's file.jsonl", 123),
+            file_stream_command("/tmp/rollout's file.jsonl", 123),
             "exec tail -c '+124' -F '/tmp/rollout'\\''s file.jsonl'"
         );
+    }
+
+    #[test]
+    fn binding_revision_check_rejects_changed_replaced_and_closed_transcripts() {
+        let manager = test_manager("host");
+        let binding = manager
+            .bind_codex("terminal".into(), SESSION.into())
+            .unwrap();
+        let token = &binding.binding_token;
+        let revision = binding.state.revision;
+        assert!(manager.terminal_binding_is_current("terminal", token, revision));
+        assert!(!manager.terminal_binding_is_current("missing", token, revision));
+        assert!(!manager.terminal_binding_is_current("terminal", "old-token", revision));
+        {
+            let mut state = manager.inner.state.lock();
+            state
+                .sessions
+                .get_mut(&binding.transcript_key)
+                .unwrap()
+                .core
+                .mark_stale_update("connection interrupted");
+        }
+        assert!(!manager.terminal_binding_is_current("terminal", token, revision));
+        let updated = manager.terminal_binding("terminal").unwrap();
+        assert!(manager.terminal_binding_is_current("terminal", token, updated.state.revision));
+        let replacement = manager
+            .bind_codex(
+                "terminal".into(),
+                "22222222-2222-4222-8222-222222222222".into(),
+            )
+            .unwrap();
+        assert!(!manager.terminal_binding_is_current("terminal", token, updated.state.revision));
+        assert!(manager.terminal_binding_is_current(
+            "terminal",
+            &replacement.binding_token,
+            replacement.state.revision,
+        ));
+        manager.close_terminal("terminal");
+        assert!(!manager.terminal_binding_is_current(
+            "terminal",
+            &replacement.binding_token,
+            replacement.state.revision,
+        ));
     }
 
     #[test]
@@ -1893,6 +3563,57 @@ mod tests {
             .bind_codex("terminal-rebound".into(), SESSION.into())
             .unwrap();
         assert_eq!(rebound.transcript_key, codex.transcript_key);
+    }
+
+    #[test]
+    fn codex_stream_checkpoints_after_history_and_waits_for_confirmation() {
+        let manager = test_manager("checkpoint-host");
+        manager.connected();
+        let binding = manager
+            .bind_codex("terminal".into(), SESSION.into())
+            .unwrap();
+        let context = NEXT_STREAM_CONTEXT.fetch_add(1, Ordering::Relaxed);
+        let chunk = format!(
+            "{{\"type\":\"ignored\",\"data\":\"{}\"}}\n",
+            "x".repeat(usize::try_from(FILE_CHECKPOINT_BYTES).unwrap())
+        )
+        .into_bytes();
+        let stream_context = {
+            let mut state = manager.inner.state.lock();
+            let session = state.sessions.get_mut(&binding.transcript_key).unwrap();
+            session.stream_context = Some(context);
+            let AgentSessionCore::Codex(core) = &mut session.core else {
+                panic!("expected Codex core");
+            };
+            let source =
+                core.bind_source("/rollout".into(), "1:2".into(), (chunk.len() * 3) as u64);
+            let stream_context = StreamContext {
+                manager: Arc::downgrade(&manager.inner),
+                session_key: binding.transcript_key.clone(),
+                source_generation: source.source_generation,
+                operation_epoch: session.operation_epoch,
+            };
+            drop(state);
+            stream_context
+        };
+        streams().write().insert(context, stream_context);
+
+        stream_data(context, chunk.clone());
+        stream_data(context, chunk.clone());
+        assert!(manager.inner.state.lock().checkpoints.is_empty());
+        stream_data(context, chunk.clone());
+        let first_token = {
+            let state = manager.inner.state.lock();
+            assert_eq!(state.checkpoints.len(), 1);
+            state.checkpoints.keys().next().unwrap().clone()
+        };
+        stream_data(context, chunk.clone());
+        assert_eq!(manager.inner.state.lock().checkpoints.len(), 1);
+
+        assert!(manager.confirm_cache(&first_token));
+        stream_data(context, chunk);
+        assert_eq!(manager.inner.state.lock().checkpoints.len(), 1);
+        streams().write().remove(&context);
     }
 
     #[test]
@@ -2246,48 +3967,287 @@ mod tests {
         assert_eq!(manager.state(&replacement.transcript_key).unwrap(), before);
     }
 
-    #[test]
-    fn missing_codex_rollout_stays_unavailable_until_explicit_reopen() {
-        let manager = test_manager("host");
-        manager.connected();
+    fn discovery_fixture() -> (AgentSessionManager, AgentChatBinding, u64) {
+        let manager = test_manager("discovery");
+        manager.inner.state.lock().connected = true;
         let binding = manager
             .bind_codex("terminal".into(), SESSION.into())
             .unwrap();
-        let operation_epoch = manager
-            .inner
-            .state
-            .lock()
-            .sessions
-            .get(&binding.transcript_key)
-            .unwrap()
-            .operation_epoch;
+        let epoch = {
+            let mut state = manager.inner.state.lock();
+            let session = state.sessions.get_mut(&binding.transcript_key).unwrap();
+            session.started = true;
+            let epoch = session.operation_epoch;
+            drop(state);
+            epoch
+        };
+        (manager, binding, epoch)
+    }
 
+    fn missing_rollout(manager: &AgentSessionManager, key: &str, epoch: u64) {
         manager.fail_session(
-            binding.transcript_key.clone(),
-            operation_epoch,
-            "Codex has not created this rollout yet.".to_owned(),
+            key.to_owned(),
+            epoch,
+            "Codex has not created this rollout yet.".into(),
             SessionFailureKind::SourceUnavailable,
         );
+    }
 
+    fn discovered_history(manager: &AgentSessionManager, key: &str, epoch: u64) {
+        let bytes = format!(
+            "{}\n{}\n",
+            serde_json::json!({"type":"session_meta","payload":{"id":SESSION}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"user_message","message":"history"}})
+        );
+        let opened = manager
+            .bind_discovered_file(key, epoch, "/rollout", "1:2", bytes.len() as u64)
+            .unwrap();
+        stream_data(opened.0, bytes.into_bytes());
+    }
+
+    #[test]
+    fn missing_codex_rollout_appears_on_automatic_retry() {
+        let (manager, binding, epoch) = discovery_fixture();
+        assert_eq!(resolve_rollout_path("", SESSION).unwrap(), None);
+        missing_rollout(&manager, &binding.transcript_key, epoch);
+        let before = manager.state(&binding.transcript_key).unwrap();
+        assert_eq!(before.status, AgentTranscriptStatus::Loading);
+        assert_eq!(before.error, None);
+        // Duplicate failures cannot schedule a second loop for this epoch.
+        missing_rollout(&manager, &binding.transcript_key, epoch);
+        assert_eq!(manager.state(&binding.transcript_key).unwrap(), before);
+        assert_eq!(
+            manager.inner.state.lock().sessions[&binding.transcript_key].discovery_retries,
+            1
+        );
+
+        let retry = manager
+            .prepare_restart(&binding.transcript_key, "retry".into(), Some(epoch))
+            .unwrap();
+        discovered_history(&manager, &binding.transcript_key, retry.0);
+        let recovered = manager.state(&binding.transcript_key).unwrap();
+        assert_eq!(recovered.status, AgentTranscriptStatus::Live);
+        assert_eq!(recovered.messages.len(), 1);
+        assert_eq!(
+            manager.inner.state.lock().sessions[&binding.transcript_key].discovery_retries,
+            0
+        );
+        manager.close_terminal("terminal");
+    }
+
+    #[test]
+    fn undiscoverable_existing_or_cached_codex_history_stays_stale_through_retry() {
+        for cached in [false, true] {
+            let (manager, binding, epoch) = discovery_fixture();
+            discovered_history(&manager, &binding.transcript_key, epoch);
+            let usable = manager.state(&binding.transcript_key).unwrap();
+            if cached {
+                let mut state = manager.inner.state.lock();
+                let session = state.sessions.get_mut(&binding.transcript_key).unwrap();
+                let AgentSessionCore::Codex(core) = &mut session.core else {
+                    panic!("Codex");
+                };
+                let blob = core.cache_blob().unwrap();
+                **core = CodexSessionCore::new(SESSION);
+                core.restore_cache(&blob).unwrap();
+                drop(state);
+            }
+            let opening = manager
+                .prepare_restart(&binding.transcript_key, "reconnect".into(), None)
+                .unwrap();
+            missing_rollout(&manager, &binding.transcript_key, opening.0);
+            let stale = manager.state(&binding.transcript_key).unwrap();
+            assert_eq!(stale.status, AgentTranscriptStatus::Stale);
+            assert_eq!(stale.messages, usable.messages);
+            assert_eq!(stale.turns, usable.turns);
+            let retry = manager
+                .prepare_restart(&binding.transcript_key, "retry".into(), Some(opening.0))
+                .unwrap();
+            let size = manager
+                .inner
+                .state
+                .lock()
+                .sessions
+                .get_mut(&binding.transcript_key)
+                .unwrap()
+                .core
+                .file()
+                .unwrap()
+                .received_offset();
+            manager
+                .bind_discovered_file(
+                    &binding.transcript_key,
+                    retry.0,
+                    "/rollout",
+                    "1:2",
+                    size + 1,
+                )
+                .unwrap();
+            // Even while an appended suffix is pending, rebinding the same file
+            // must not revoke eligibility of the already displayed history.
+            assert_eq!(
+                manager.state(&binding.transcript_key).unwrap().status,
+                AgentTranscriptStatus::Stale
+            );
+            let mut state = manager.inner.state.lock();
+            let session = state.sessions.get_mut(&binding.transcript_key).unwrap();
+            let AgentSessionCore::Codex(core) = &mut session.core else {
+                panic!("Codex");
+            };
+            core.ingest(core.source_generation(), b"\n").unwrap();
+            core.mark_live_update();
+            drop(state);
+            let recovered = manager.state(&binding.transcript_key).unwrap();
+            assert_eq!(recovered.status, AgentTranscriptStatus::Live);
+            assert_eq!(recovered.messages, usable.messages);
+            assert_eq!(recovered.turns, usable.turns);
+            manager.close_terminal("terminal");
+        }
+    }
+
+    #[test]
+    fn codex_discovery_exhausts_its_bounded_budget() {
+        assert!(CODEX_DISCOVERY_RETRY_DELAYS.iter().sum::<Duration>() < Duration::from_secs(5));
+        for usable in [false, true] {
+            let (manager, binding, mut epoch) = discovery_fixture();
+            if usable {
+                discovered_history(&manager, &binding.transcript_key, epoch);
+            }
+            let history = manager.state(&binding.transcript_key).unwrap();
+            for _ in CODEX_DISCOVERY_RETRY_DELAYS {
+                missing_rollout(&manager, &binding.transcript_key, epoch);
+                assert_eq!(
+                    manager.state(&binding.transcript_key).unwrap().status,
+                    if usable {
+                        AgentTranscriptStatus::Stale
+                    } else {
+                        AgentTranscriptStatus::Loading
+                    }
+                );
+                epoch = manager
+                    .prepare_restart(&binding.transcript_key, "retry".into(), Some(epoch))
+                    .unwrap()
+                    .0;
+            }
+            missing_rollout(&manager, &binding.transcript_key, epoch);
+            let state = manager.inner.state.lock();
+            let session = &state.sessions[&binding.transcript_key];
+            assert_eq!(
+                session.core.state().status,
+                if usable {
+                    AgentTranscriptStatus::Stale
+                } else {
+                    AgentTranscriptStatus::Unavailable
+                }
+            );
+            assert_eq!(session.core.state().messages, history.messages);
+            assert!(!session.retry_running);
+            assert_eq!(
+                session.discovery_retries,
+                CODEX_DISCOVERY_RETRY_DELAYS.len()
+            );
+            drop(state);
+            // Even retained stale history can explicitly restart an exhausted
+            // discovery budget without waiting for a host reconnect.
+            manager.start_bound(&binding.binding_token, None).unwrap();
+            let state = manager.inner.state.lock();
+            let session = &state.sessions[&binding.transcript_key];
+            assert_ne!(session.operation_epoch, epoch);
+            assert_eq!(session.discovery_retries, 0);
+            drop(state);
+            manager.close_terminal("terminal");
+        }
+    }
+
+    #[test]
+    fn explicit_reopen_supersedes_pending_codex_discovery_retry() {
+        let (manager, binding, epoch) = discovery_fixture();
+        missing_rollout(&manager, &binding.transcript_key, epoch);
+        // start_bound invokes the same immediate restart even though the current
+        // status is Loading rather than Error/Unavailable.
+        manager.start_bound(&binding.binding_token, None).unwrap();
         let state = manager.inner.state.lock();
-        let session = state.sessions.get(&binding.transcript_key).unwrap();
-        assert_eq!(
-            session.core.state().status,
-            AgentTranscriptStatus::Unavailable
-        );
-        assert_eq!(
-            session.core.state().error.as_deref(),
-            Some("Codex has not created this rollout yet.")
-        );
-        assert!(!session.retry_running);
-        assert_eq!(session.operation_epoch, operation_epoch);
+        let session = &state.sessions[&binding.transcript_key];
+        assert_ne!(session.operation_epoch, epoch);
+        assert_eq!(session.discovery_retries, 0);
+        let new_epoch = session.operation_epoch;
         drop(state);
+        assert!(
+            manager
+                .prepare_restart(&binding.transcript_key, "old timer".into(), Some(epoch))
+                .is_none()
+        );
+        assert!(
+            manager
+                .bind_discovered_file(&binding.transcript_key, epoch, "/old", "1:2", 0)
+                .is_none()
+        );
+        missing_rollout(&manager, &binding.transcript_key, epoch);
+        assert_eq!(
+            manager.inner.state.lock().sessions[&binding.transcript_key].operation_epoch,
+            new_epoch
+        );
+        manager.close_terminal("terminal");
+    }
 
-        assert!(should_restart_on_start(
-            true,
-            false,
+    #[test]
+    fn detached_replaced_or_disconnected_bindings_reject_pending_retry_results() {
+        for action in ["detach", "replace", "disconnect", "teardown"] {
+            let (manager, binding, epoch) = discovery_fixture();
+            missing_rollout(&manager, &binding.transcript_key, epoch);
+            match action {
+                "detach" => {
+                    manager.detach_terminal("terminal").unwrap();
+                }
+                "replace" => {
+                    manager
+                        .bind_codex(
+                            "terminal".into(),
+                            "22222222-2222-4222-8222-222222222222".into(),
+                        )
+                        .unwrap();
+                }
+                "disconnect" => manager.disconnected(false, "offline"),
+                "teardown" => manager.disconnected(true, "closed"),
+                _ => unreachable!(),
+            }
+            let before = manager.terminal_binding("terminal");
+            assert!(
+                manager
+                    .prepare_restart(&binding.transcript_key, "old timer".into(), Some(epoch))
+                    .is_none()
+            );
+            assert!(
+                manager
+                    .bind_discovered_file(&binding.transcript_key, epoch, "/old", "1:2", 0)
+                    .is_none()
+            );
+            missing_rollout(&manager, &binding.transcript_key, epoch);
+            assert_eq!(manager.terminal_binding("terminal"), before);
+            manager.close_terminal("terminal");
+        }
+    }
+
+    #[test]
+    fn missing_claude_transcript_keeps_its_existing_failure_policy() {
+        let manager = test_manager("claude");
+        manager.inner.state.lock().connected = true;
+        let binding = manager
+            .bind_authoritative(AuthoritativeAgentChatIdentity {
+                terminal_id: "terminal".into(),
+                pane_id: "pane-terminal".into(),
+                agent: AgentTranscriptKind::Claude,
+                session_id: SESSION.into(),
+            })
+            .unwrap();
+        let epoch = manager.inner.state.lock().sessions[&binding.transcript_key].operation_epoch;
+        missing_rollout(&manager, &binding.transcript_key, epoch);
+        assert_eq!(
+            manager.state(&binding.transcript_key).unwrap().status,
             AgentTranscriptStatus::Unavailable
-        ));
+        );
+        assert!(!manager.inner.state.lock().sessions[&binding.transcript_key].retry_running);
+        manager.close_terminal("terminal");
     }
 
     #[test]

@@ -9,17 +9,18 @@ use crate::agent_sessions::{
 };
 use crate::herdr_api::{
     HerdrAgentKind, HerdrAgentSessionInfo, HerdrAgentSessionKind, HerdrAgentStatus,
-    HerdrControlError, HerdrControlRequest, HerdrControlResult, HerdrPaneInfo,
-    HerdrSessionSnapshot, HerdrTabInfo, HerdrTabLaunch, HerdrTabLaunchResult, HerdrTabLaunchStage,
-    HerdrWorkspaceInfo,
+    HerdrControlError, HerdrControlRequest, HerdrControlResult, HerdrIntegrationInfo,
+    HerdrIntegrationInstallResult, HerdrIntegrationState, HerdrPaneInfo, HerdrSessionSnapshot,
+    HerdrTabInfo, HerdrTabLaunch, HerdrTabLaunchResult, HerdrTabLaunchStage, HerdrWorkspaceInfo,
 };
 use crate::herdr_codec::{MAX_PROTOCOL, MIN_PROTOCOL};
 use crate::herdr_connection::HerdrRequestReplay;
 use crate::herdr_events::HerdrEvent;
 use crate::herdr_terminal::HerdrBridgeError;
 use crate::host_state::ApplyResult;
+use crate::remote_ops::{TransferResult, TransferState};
 
-static EVENT_SINK_TEST_LOCK: Mutex<()> = Mutex::new(());
+pub(super) static EVENT_SINK_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
 fn terminal_geometry_normalization_enforces_runtime_minimums() {
@@ -52,8 +53,8 @@ impl HostRuntimeEventSink for ReentrantRuntimeSink {
 }
 
 #[derive(Default)]
-struct RecordingRuntimeSink {
-    events: Mutex<Vec<HostRuntimeEvent>>,
+pub(super) struct RecordingRuntimeSink {
+    pub(super) events: Mutex<Vec<HostRuntimeEvent>>,
 }
 
 impl HostRuntimeEventSink for RecordingRuntimeSink {
@@ -104,12 +105,24 @@ fn runtime_inner_with_state(
         runtime_config.cached_socket_path.clone(),
     );
     Arc::new(RuntimeInner {
+        interaction_response: AsyncMutex::new(HashMap::new()),
         id: id.to_owned(),
         incarnation: 1,
         config: runtime_config,
         state: Mutex::new(state),
         agents: AgentSessionManager::new(id.to_owned(), 1, herdr.clone()),
         operations: RemoteOperationManager::default(),
+        git_discovery: Mutex::new(git_discovery::GitDiscoveryCache::default()),
+        git_discovery_operation: AsyncMutex::new(()),
+        directory_cache: Mutex::new(directory_cache::DirectoryCache::default()),
+        reverse_control: Arc::new(crate::reverse_control::ReverseControl::default()),
+        agent_preferences: Mutex::new(agent_controls::AgentPreferences::default()),
+        agent_control_operation: AsyncMutex::new(()),
+        agent_view: Mutex::new(None),
+        agent_view_start: AsyncMutex::new(()),
+        agent_view_task: Mutex::new(None),
+        agent_view_refresh: Arc::new(Notify::new()),
+        latency_transport: AsyncMutex::new(None),
         herdr,
         jump_sessions: Mutex::new(Vec::new()),
         herdr_startup: AsyncMutex::new(()),
@@ -124,7 +137,7 @@ fn runtime_inner_with_state(
     })
 }
 
-fn connected_runtime_inner(id: &str) -> Arc<RuntimeInner> {
+pub(super) fn connected_runtime_inner(id: &str) -> Arc<RuntimeInner> {
     let runtime_config = config();
     let mut state = RuntimeState::new(&runtime_config);
     state.connection = HostConnectionState::Connected;
@@ -136,6 +149,279 @@ fn connected_runtime_inner(id: &str) -> Arc<RuntimeInner> {
         retry_running: false,
     });
     runtime_inner_with_state(id, runtime_config, state)
+}
+
+#[test]
+fn remote_stat_follows_relative_symlinks_and_preserves_link_paths()
+-> Result<(), Box<dyn std::error::Error>> {
+    crate::runtime()?.block_on(async {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        std::fs::create_dir(root.join("target-directory"))?;
+        std::fs::write(root.join("target-file"), b"target contents")?;
+        for (link, target) in [
+            ("directory-link", "target-directory"),
+            ("chained-link", "directory-link"),
+            ("file-link", "target-file"),
+            ("broken-link", "absent"),
+        ] {
+            std::os::unix::fs::symlink(target, root.join(link))?;
+        }
+        let fixture = crate::ssh::ReverseForwardFixture::new(true, Duration::ZERO).await?;
+        let inner = connected_runtime_inner("symlink-stat");
+        inner.herdr.install(1, fixture.ssh.clone());
+        let runtime = HostRuntime { inner };
+        for (link, expected) in [
+            (
+                "directory-link",
+                crate::remote_ops::RemoteFileKind::Directory,
+            ),
+            ("chained-link", crate::remote_ops::RemoteFileKind::Directory),
+            ("file-link", crate::remote_ops::RemoteFileKind::File),
+        ] {
+            let path = root.join(link).to_string_lossy().into_owned();
+            let entry = runtime.stat_remote_path(path.clone()).await?;
+            assert_eq!(entry.kind, expected);
+            assert_eq!(entry.path, path);
+            assert_eq!(entry.name, link);
+        }
+        assert!(
+            runtime
+                .stat_remote_path(root.join("broken-link").to_string_lossy().into_owned())
+                .await
+                .is_err()
+        );
+        assert_eq!(fixture.sftp_requests(), 1);
+        Ok(())
+    })
+}
+
+#[test]
+fn directory_snapshots_are_normalized_and_isolated_by_host_and_connection() {
+    let inner = connected_runtime_inner("directory-cache-host");
+    let runtime = HostRuntime {
+        inner: inner.clone(),
+    };
+    let other = HostRuntime {
+        inner: connected_runtime_inner("directory-cache-other"),
+    };
+    let now = std::time::Instant::now();
+    let listing = crate::remote_ops::RemoteDirectoryListing {
+        path: "/home/projects".to_owned(),
+        entries: Vec::new(),
+    };
+    let request = inner.directory_cache.lock().begin(1, now);
+    inner.directory_cache.lock().insert(request, listing, now);
+    assert_eq!(
+        runtime
+            .cached_directory(" /home//projects/./ ".into())
+            .unwrap()
+            .path,
+        "/home/projects"
+    );
+    assert!(runtime.cached_directory("~".into()).is_none());
+    assert!(other.cached_directory("/home/projects".into()).is_none());
+    inner.state.lock().connection = HostConnectionState::Disconnected;
+    assert!(runtime.cached_directory("/home/projects".into()).is_none());
+    {
+        let mut state = inner.state.lock();
+        state.connection = HostConnectionState::Connected;
+        state.generation += 1;
+    }
+    assert!(runtime.cached_directory("/home/projects".into()).is_none());
+}
+
+#[test]
+fn absolute_remote_paths_skip_home_lookup_and_preserve_validation()
+-> Result<(), Box<dyn std::error::Error>> {
+    crate::runtime()?.block_on(async {
+        let fixture = crate::ssh::ReverseForwardFixture::new(true, Duration::ZERO).await?;
+        let inner = connected_runtime_inner("absolute-remote-paths");
+        inner.herdr.install(1, fixture.ssh.clone());
+        assert_eq!(
+            resolved_remote_path(&inner, Some(" /a//b/../c ")).await?,
+            "/a/c"
+        );
+        assert_eq!(resolved_remote_path(&inner, Some("/../../")).await?, "/");
+        assert!(resolved_remote_path(&inner, Some("/a\0b")).await.is_err());
+        assert!(resolved_remote_path(&inner, Some("/a\\b")).await.is_err());
+        assert_eq!(fixture.home_lookups(), 0);
+        Ok(())
+    })
+}
+
+#[test]
+fn relative_remote_paths_share_one_home_lookup() -> Result<(), Box<dyn std::error::Error>> {
+    crate::runtime()?.block_on(async {
+        let fixture = crate::ssh::ReverseForwardFixture::new(true, Duration::ZERO).await?;
+        let inner = connected_runtime_inner("relative-remote-paths");
+        inner.herdr.install(1, fixture.ssh.clone());
+        for path in [None, Some(""), Some("  "), Some("~")] {
+            assert_eq!(resolved_remote_path(&inner, path).await?, "/home/test");
+        }
+        for path in ["~/project/../a", "a", "./a"] {
+            assert_eq!(
+                resolved_remote_path(&inner, Some(path)).await?,
+                "/home/test/a"
+            );
+        }
+        assert_eq!(fixture.shared_ssh().remote_home().await?, "/home/test");
+        assert_eq!(fixture.home_lookups(), 1);
+        Ok(())
+    })
+}
+
+#[test]
+fn concurrent_remote_paths_initialize_home_once() -> Result<(), Box<dyn std::error::Error>> {
+    crate::runtime()?.block_on(async {
+        let fixture =
+            crate::ssh::ReverseForwardFixture::new(true, Duration::from_millis(30)).await?;
+        let inner = connected_runtime_inner("concurrent-remote-paths");
+        inner.herdr.install(1, fixture.ssh.clone());
+        let wrapper = fixture.shared_ssh();
+        let (first, second, third) = tokio::join!(
+            resolved_remote_path(&inner, Some("a")),
+            resolved_remote_path(&inner, Some("~/b")),
+            wrapper.remote_home(),
+        );
+        assert_eq!(first?, "/home/test/a");
+        assert_eq!(second?, "/home/test/b");
+        assert_eq!(third?, "/home/test");
+        assert_eq!(fixture.home_lookups(), 1);
+        Ok(())
+    })
+}
+
+#[test]
+fn reconnected_remote_paths_use_the_new_connections_home() -> Result<(), Box<dyn std::error::Error>>
+{
+    crate::runtime()?.block_on(async {
+        let first = crate::ssh::ReverseForwardFixture::new(true, Duration::ZERO).await?;
+        let inner = connected_runtime_inner("reconnected-remote-paths");
+        inner.herdr.install(1, first.ssh.clone());
+        assert_eq!(
+            resolved_remote_path(&inner, Some("a")).await?,
+            "/home/test/a"
+        );
+        first.ssh.disconnect().await;
+        let second = crate::ssh::ReverseForwardFixture::new(true, Duration::ZERO).await?;
+        second.set_home("/srv/new-user");
+        inner.state.lock().generation = 2;
+        inner.herdr.install(2, second.ssh.clone());
+        assert_eq!(
+            resolved_remote_path(&inner, Some("a")).await?,
+            "/srv/new-user/a"
+        );
+        assert_eq!(first.home_lookups(), 1);
+        assert_eq!(second.home_lookups(), 1);
+        assert!(first.ssh.remote_home().await.is_err());
+        Ok(())
+    })
+}
+
+#[test]
+fn transfer_setup_cancellation_preempts_ready_and_pending_work() {
+    crate::runtime().unwrap().block_on(async {
+        let (sender, mut cancel) = watch::channel(false);
+        sender.send(true).unwrap();
+        let mut polled = false;
+        let ready = std::future::poll_fn(|_| {
+            polled = true;
+            std::task::Poll::Ready(Ok::<(), String>(()))
+        });
+        let error = transfer_setup_step(&mut cancel, ready).await.unwrap_err();
+        assert_eq!(error, "transfer cancelled");
+        assert!(!polled);
+
+        let (sender, mut cancel) = watch::channel(false);
+        let pending = std::future::poll_fn(|_| {
+            sender.send(true).unwrap();
+            std::task::Poll::<Result<(), String>>::Pending
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            transfer_setup_step(&mut cancel, pending),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.unwrap_err(), error);
+    });
+}
+
+#[test]
+fn transfer_completion_rejects_replaced_or_disconnected_connections() {
+    let _guard = EVENT_SINK_TEST_LOCK.lock();
+    clear_host_runtime_event_sink();
+    crate::runtime().unwrap().block_on(async {
+        for (generation, connection) in [
+            (2, HostConnectionState::Connected),
+            (1, HostConnectionState::Disconnected),
+        ] {
+            let inner = connected_runtime_inner("stale-transfer-test");
+            let (id, _, notify) = inner.operations.begin_transfer(1).unwrap();
+            {
+                let mut state = inner.state.lock();
+                state.generation = generation;
+                state.connection = connection;
+            }
+            finish_transfer(
+                &inner,
+                &id,
+                1,
+                Ok(TransferResult {
+                    transfer_id: id.clone(),
+                    local_path: None,
+                    remote_path: None,
+                }),
+            );
+            tokio::time::timeout(Duration::from_secs(1), notify.notified())
+                .await
+                .unwrap();
+            let runtime = HostRuntime { inner };
+            assert_eq!(
+                runtime.transfer_progress(id.clone()).unwrap().state,
+                TransferState::Failed
+            );
+            assert!(matches!(
+                runtime.await_transfer(id).await,
+                Err(HostRuntimeError::TransferFailure(message))
+                    if message == "host connection changed during transfer"
+            ));
+        }
+    });
+}
+
+#[test]
+fn transfer_cancellation_wins_over_late_progress_and_success_after_reconnect() {
+    let _guard = EVENT_SINK_TEST_LOCK.lock();
+    clear_host_runtime_event_sink();
+    crate::runtime().unwrap().block_on(async {
+        let inner = connected_runtime_inner("cancelled-transfer-test");
+        let (id, cancel, _) = inner.operations.begin_transfer(1).unwrap();
+        update_transfer_progress(&inner, &id, 3, Some(10));
+        let runtime = HostRuntime { inner };
+        assert!(runtime.cancel_transfer(id.clone()));
+        assert!(*cancel.borrow());
+        runtime.inner.state.lock().generation = 2;
+        update_transfer_progress(&runtime.inner, &id, 10, Some(10));
+        finish_transfer(
+            &runtime.inner,
+            &id,
+            1,
+            Ok(TransferResult {
+                transfer_id: id.clone(),
+                local_path: None,
+                remote_path: None,
+            }),
+        );
+        let progress = runtime.transfer_progress(id.clone()).unwrap();
+        assert_eq!(progress.state, TransferState::Cancelled);
+        assert_eq!(progress.bytes_transferred, 3);
+        assert!(matches!(
+            runtime.await_transfer(id).await,
+            Err(HostRuntimeError::TransferCancelled(message)) if message == "transfer cancelled"
+        ));
+    });
 }
 
 fn desired_ssh_shell(
@@ -188,29 +474,153 @@ fn managed_agent_names_are_native_owned_and_stable() {
     );
 }
 
+fn integration_info(target: HerdrAgentKind, state: HerdrIntegrationState) -> HerdrIntegrationInfo {
+    HerdrIntegrationInfo {
+        target: target.as_str().to_owned(),
+        label: target.as_str().to_owned(),
+        command: target.as_str().to_owned(),
+        available: true,
+        state,
+    }
+}
+
 #[test]
-fn integration_status_command_and_parser_are_native_owned() {
-    let command = integration_status_command("/opt/herdr current/herdr");
-    assert!(command.contains("integration status"));
-    assert!(command.contains("/opt/herdr current/herdr"));
-    assert_eq!(
-        parse_agent_integration_status(
-            "claude: not installed\ncodex: current (v2)\n",
-            HerdrAgentKind::Codex,
-        ),
-        AgentIntegrationStatus::Current
-    );
-    assert_eq!(
-        parse_agent_integration_status(
-            "opencode: needs repair (/tmp/config)\n",
-            HerdrAgentKind::OpenCode,
-        ),
-        AgentIntegrationStatus::NeedsRepair
-    );
-    assert_eq!(
-        parse_agent_integration_status("older output", HerdrAgentKind::Codex),
-        AgentIntegrationStatus::Unknown
-    );
+fn integration_status_uses_socket_list_states_for_all_agents() {
+    crate::runtime().unwrap().block_on(async {
+        for (state, expected) in [
+            (
+                HerdrIntegrationState::Current,
+                AgentIntegrationStatus::Current,
+            ),
+            (
+                HerdrIntegrationState::NotInstalled,
+                AgentIntegrationStatus::NotInstalled,
+            ),
+            (
+                HerdrIntegrationState::Outdated,
+                AgentIntegrationStatus::Outdated,
+            ),
+        ] {
+            for kind in [HerdrAgentKind::Codex, HerdrAgentKind::OpenCode] {
+                let status = integration_status_with_request(kind, |request| async move {
+                    assert_eq!(request, HerdrControlRequest::IntegrationList);
+                    Ok(HerdrControlResult::IntegrationList {
+                        integrations: vec![integration_info(kind, state)],
+                    })
+                })
+                .await
+                .unwrap();
+                assert_eq!(status, expected);
+            }
+        }
+
+        let missing =
+            integration_status_with_request(HerdrAgentKind::Codex, |request| async move {
+                assert_eq!(request, HerdrControlRequest::IntegrationList);
+                Ok(HerdrControlResult::IntegrationList {
+                    integrations: vec![integration_info(
+                        HerdrAgentKind::OpenCode,
+                        HerdrIntegrationState::Current,
+                    )],
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(missing, AgentIntegrationStatus::Unknown);
+
+        let error = integration_status_with_request(HerdrAgentKind::Codex, |_| async {
+            Ok(HerdrControlResult::Ok)
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(error, HerdrControlError::UnsupportedResponse(_)));
+    });
+}
+
+#[test]
+fn integration_status_and_install_share_the_control_request_path() {
+    crate::runtime().unwrap().block_on(async {
+        let server_state = Arc::new(Mutex::new(HerdrIntegrationState::Outdated));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let control_request = |request: HerdrControlRequest| {
+            let server_state = server_state.clone();
+            let requests = requests.clone();
+            async move {
+                requests.lock().push(request.clone());
+                match request {
+                    HerdrControlRequest::IntegrationList => {
+                        Ok(HerdrControlResult::IntegrationList {
+                            integrations: vec![integration_info(
+                                HerdrAgentKind::Codex,
+                                *server_state.lock(),
+                            )],
+                        })
+                    }
+                    HerdrControlRequest::IntegrationInstall { kind } => {
+                        *server_state.lock() = HerdrIntegrationState::Current;
+                        Ok(HerdrControlResult::IntegrationInstalled {
+                            install: HerdrIntegrationInstallResult {
+                                kind,
+                                messages: vec!["installed".to_owned()],
+                            },
+                        })
+                    }
+                    _ => panic!("integration flow requested a non-control operation"),
+                }
+            }
+        };
+
+        assert_eq!(
+            integration_status_with_request(HerdrAgentKind::Codex, control_request)
+                .await
+                .unwrap(),
+            AgentIntegrationStatus::Outdated
+        );
+        install_integration_with_request(HerdrAgentKind::Codex, control_request)
+            .await
+            .unwrap();
+        assert_eq!(
+            integration_status_with_request(HerdrAgentKind::Codex, control_request)
+                .await
+                .unwrap(),
+            AgentIntegrationStatus::Current
+        );
+        assert_eq!(
+            *requests.lock(),
+            [
+                HerdrControlRequest::IntegrationList,
+                HerdrControlRequest::IntegrationInstall {
+                    kind: HerdrAgentKind::Codex,
+                },
+                HerdrControlRequest::IntegrationList,
+            ]
+        );
+    });
+}
+
+#[test]
+fn disconnected_integration_methods_return_control_transport_errors() {
+    crate::runtime().unwrap().block_on(async {
+        let runtime_config = config();
+        let inner = runtime_inner_with_state(
+            "integration-disconnected",
+            runtime_config.clone(),
+            RuntimeState::new(&runtime_config),
+        );
+        let runtime = HostRuntime { inner };
+        assert!(matches!(
+            runtime
+                .agent_integration_status(HerdrAgentKind::Codex)
+                .await,
+            Err(HerdrControlError::TransportDisconnected(_))
+        ));
+        assert!(matches!(
+            runtime
+                .install_agent_integration(HerdrAgentKind::Codex)
+                .await,
+            Err(HerdrControlError::TransportDisconnected(_))
+        ));
+    });
 }
 
 #[test]
@@ -504,6 +914,130 @@ fn new_tab_agent_launch_retries_busy_shell_without_recreating_tab() {
 }
 
 #[test]
+fn cancelled_reverse_control_launch_preserves_existing_session_across_reconnect()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::reverse_control::tests::{
+        bridge_port, config_token, port_closes, recovery_owner, recovery_pane, wire,
+    };
+    use crate::reverse_control::{agent_launch, new_session};
+    use serde_json::json;
+
+    crate::runtime()?.block_on(async {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("host.json");
+        let mut inner = connected_runtime_inner("reverse-control-launch-race");
+        Arc::get_mut(&mut inner)
+            .ok_or("runtime already shared")?
+            .reverse_control = recovery_owner(&path);
+        let owner = &inner.reverse_control;
+        let fixture = crate::ssh::ReverseForwardFixture::new(true, Duration::ZERO).await?;
+        let pane_a = recovery_pane();
+        let info_a = new_session(&inner.id, &pane_a)?;
+        let launch = HerdrTabLaunch::Agent {
+            kind: HerdrAgentKind::Codex,
+            args: Vec::new(),
+        };
+        let configured = owner
+            .prepare(
+                fixture.ssh.clone(),
+                info_a.clone(),
+                agent_launch(launch.clone())?,
+            )
+            .await?;
+        let token_a = config_token(&configured)?;
+        let port = bridge_port(owner)?;
+        let initialize = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18"}
+        });
+        assert_eq!(
+            wire(port, &info_a.session_id, &token_a, "POST", &initialize, "")
+                .await?
+                .status,
+            200
+        );
+        owner.reconcile(std::slice::from_ref(&pane_a));
+        let saved_a = std::fs::read(&path)?;
+        assert!(owner.connected_terminal(&pane_a.terminal_id));
+
+        let generation = inner.state.lock().generation;
+        let tab = lifecycle_snapshot().tabs[0].clone();
+        let mut pane_b = pane_a.clone();
+        pane_b.pane_id = "pane-b".to_owned();
+        pane_b.terminal_id = "terminal-pane-b".to_owned();
+        let info_b = new_session(&inner.id, &pane_b)?;
+        let session_b = info_b.session_id.clone();
+        let prepare = async {
+            let configured = owner
+                .prepare(
+                    fixture.ssh.clone(),
+                    info_b,
+                    agent_launch(launch).map_err(HerdrControlError::InvalidField)?,
+                )
+                .await
+                .map_err(HerdrControlError::TransportDisconnected)?;
+            assert_eq!(owner.list().len(), 2);
+            // Force the reconnect after registration, before the launch's
+            // generation check. Installing the replacement increments it.
+            assert!(
+                inner
+                    .state
+                    .lock()
+                    .begin_reconnect(Some(generation), "launch race")
+                    .is_some()
+            );
+            owner.suspend();
+            fixture.ssh.disconnect().await;
+            let mut state = inner.state.lock();
+            let epoch = state.epoch;
+            assert!(state.install_connection(epoch));
+            drop(state);
+            Ok(configured)
+        };
+        let result = launch_reverse_control_in_created_tab(
+            &inner,
+            generation,
+            tab.clone(),
+            pane_b.clone(),
+            session_b,
+            prepare,
+        )
+        .await;
+        assert_eq!(
+            result,
+            HerdrTabLaunchResult::LaunchFailed {
+                tab,
+                root_pane: pane_b,
+                stage: HerdrTabLaunchStage::AgentStart,
+                failure: HerdrControlError::RequestCancelled(
+                    "SSH changed during browser launch".to_owned(),
+                )
+                .into(),
+            }
+        );
+        let sessions = owner.list();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, info_a.session_id);
+        assert!(owner.needs_resume());
+        assert_eq!(std::fs::read(&path)?, saved_a);
+
+        port_closes(port).await?;
+        let replacement = crate::ssh::ReverseForwardFixture::new(true, Duration::ZERO).await?;
+        owner.resume(replacement.ssh.clone()).await?;
+        assert!(owner.connected_terminal(&pane_a.terminal_id));
+        let ping = json!({"jsonrpc": "2.0", "id": 2, "method": "ping"});
+        assert_eq!(
+            wire(port, &info_a.session_id, &token_a, "POST", &ping, "")
+                .await?
+                .status,
+            200
+        );
+        owner.shutdown();
+        Ok(())
+    })
+}
+
+#[test]
 fn new_tab_launch_does_not_replay_other_errors_or_command_input() {
     crate::runtime().unwrap().block_on(async {
         let snapshot = batch_test_snapshot();
@@ -744,7 +1278,152 @@ fn batch_test_snapshot() -> HerdrSessionSnapshot {
     }
 }
 
-fn agent_chat_snapshot(
+#[test]
+fn workspace_open_selects_known_panes_without_a_transport() {
+    let inner = connected_runtime_inner("workspace-open-offline");
+    {
+        let mut state = inner.state.lock();
+        let token = state.host_state.begin_sync(1);
+        state
+            .host_state
+            .complete_sync(token, batch_test_snapshot(), 1);
+        state.connection = HostConnectionState::Reconnecting;
+    }
+    let runtime = HostRuntime { inner };
+    let pane = crate::runtime()
+        .unwrap()
+        .block_on(runtime.open_workspace("workspace".to_owned()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(pane.pane_id, "pane-1");
+}
+
+#[test]
+fn workspace_pane_preference_uses_active_tab_then_focused_tab_then_first_tab() {
+    use crate::herdr_selection::preferred_workspace_pane;
+
+    let mut snapshot = batch_test_snapshot();
+    let mut active_tab = snapshot.tabs[0].clone();
+    active_tab.tab_id = "active-tab".to_owned();
+    active_tab.focused = false;
+    snapshot.tabs.push(active_tab);
+    let mut active_pane = snapshot.panes[0].clone();
+    active_pane.tab_id = "active-tab".to_owned();
+    active_pane.pane_id = "active-pane".to_owned();
+    snapshot.panes.push(active_pane);
+    snapshot.workspaces[0].active_tab_id = "active-tab".to_owned();
+    assert_eq!(
+        preferred_workspace_pane(&snapshot, "workspace")
+            .unwrap()
+            .pane_id,
+        "active-pane"
+    );
+
+    snapshot.workspaces[0].active_tab_id = "missing-tab".to_owned();
+    snapshot.panes[0].focused = false;
+    snapshot.panes[1].focused = true;
+    assert_eq!(
+        preferred_workspace_pane(&snapshot, "workspace")
+            .unwrap()
+            .pane_id,
+        "pane-2"
+    );
+
+    snapshot.tabs[0].focused = false;
+    snapshot.panes[1].focused = false;
+    assert_eq!(
+        preferred_workspace_pane(&snapshot, "workspace")
+            .unwrap()
+            .pane_id,
+        "pane-1"
+    );
+    assert!(preferred_workspace_pane(&snapshot, "missing-workspace").is_none());
+    snapshot.panes.retain(|pane| pane.tab_id == "active-tab");
+    assert!(preferred_workspace_pane(&snapshot, "workspace").is_none());
+}
+
+#[test]
+fn workspace_open_waits_for_focus_and_selects_the_refreshed_pane() {
+    let focus_completed = std::cell::Cell::new(false);
+    let inner = connected_runtime_inner("workspace-open-refresh");
+    let refreshed = {
+        let mut state = inner.state.lock();
+        let token = state.host_state.begin_sync(1);
+        state
+            .host_state
+            .complete_sync(token, batch_test_snapshot(), 1);
+        state.host_state.projection()
+    };
+    let pane = crate::runtime()
+        .unwrap()
+        .block_on(actions::focus_and_refresh_workspace(
+            "workspace".to_owned(),
+            |request| {
+                assert_eq!(
+                    request,
+                    HerdrControlRequest::WorkspaceFocus {
+                        workspace_id: "workspace".to_owned()
+                    }
+                );
+                async {
+                    tokio::task::yield_now().await;
+                    focus_completed.set(true);
+                    Ok(HerdrControlResult::Ok)
+                }
+            },
+            || async {
+                assert!(focus_completed.get());
+                refreshed
+            },
+        ))
+        .unwrap()
+        .unwrap();
+    assert_eq!(pane.pane_id, "pane-1");
+}
+
+#[test]
+fn workspace_open_does_not_refresh_after_focus_rejection() {
+    let error =
+        HerdrControlError::ProtocolError("not_found".to_owned(), "workspace missing".to_owned());
+    let result = crate::runtime()
+        .unwrap()
+        .block_on(actions::focus_and_refresh_workspace(
+            "missing-workspace".to_owned(),
+            |_| async { Err(error.clone()) },
+            || async { panic!("a rejected focus must not refresh") },
+        ));
+    assert_eq!(result, Err(error));
+}
+
+#[test]
+fn workspace_open_reports_no_pane_for_empty_or_failed_refreshes() {
+    let inner = connected_runtime_inner("workspace-open-empty");
+    let mut refreshed = {
+        let mut state = inner.state.lock();
+        let token = state.host_state.begin_sync(1);
+        state
+            .host_state
+            .complete_sync(token, batch_test_snapshot(), 1);
+        state.host_state.projection()
+    };
+    // A failed refresh can retain an earlier snapshot. Do not open its pane.
+    refreshed.sync_status = HostSyncStatus::Error;
+    let mut empty = inner.state.lock().host_state.projection();
+    empty.snapshot.as_mut().unwrap().panes.clear();
+    for projection in [refreshed, empty] {
+        let pane = crate::runtime()
+            .unwrap()
+            .block_on(actions::focus_and_refresh_workspace(
+                "workspace".to_owned(),
+                |_| async { Ok(HerdrControlResult::Ok) },
+                || async { projection },
+            ))
+            .unwrap();
+        assert!(pane.is_none());
+    }
+}
+
+pub(super) fn agent_chat_snapshot(
     agent: Option<(&str, &str)>,
     display_agent: Option<&str>,
 ) -> HerdrSessionSnapshot {
@@ -764,13 +1443,117 @@ fn agent_chat_snapshot(
 fn install_agent_chat_snapshot(inner: &Arc<RuntimeInner>, snapshot: HerdrSessionSnapshot) {
     {
         let mut state = inner.state.lock();
-        let token = state.host_state.begin_sync(1);
+        let generation = state.generation;
+        let token = state.host_state.begin_sync(generation);
         assert_eq!(
             state.host_state.complete_sync(token, snapshot, 1),
             ApplyResult::Applied
         );
     }
     emit_host_state(inner);
+}
+
+#[test]
+fn typed_agent_controls_restore_through_app_core_and_herd_without_a_host_revision_change()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::reverse_control::ReverseControlState;
+
+    for kind in [HerdrAgentKind::Codex, HerdrAgentKind::Claude] {
+        let name = kind.as_str();
+        let inner = connected_runtime_inner("typed-agent-controls");
+        let runtime = Arc::new(HostRuntime {
+            inner: inner.clone(),
+        });
+        let mut initial = agent_chat_snapshot(Some((name, "original")), Some(name));
+        initial.agents = lifecycle_snapshot().agents;
+        for agent in &mut initial.agents {
+            agent.agent = Some(name.to_owned());
+        }
+        install_agent_chat_snapshot(&inner, initial);
+        let core = crate::AppCore::new();
+        core.open_session(inner.id.clone(), "host".to_owned(), true);
+        let before = core.attach_runtime(inner.id.clone(), runtime.clone());
+        let control = &before.sessions[0].agent_controls[0];
+        assert_eq!(control.kind, kind);
+        assert_eq!(control.session_id.as_deref(), Some("original"));
+        assert_eq!(control.reverse_control_state, ReverseControlState::Off);
+        assert_eq!(core.view().revision, before.revision);
+
+        // AppCore has already inferred a default before asynchronous storage restore.
+        runtime.restore_agent_preferences(
+            serde_json::json!({"agents": [{
+                "terminalId": control.terminal_id,
+                "kind": name, "sessionId": "original", "reverseControl": true,
+                "args": ["--model", "test"]
+            }]})
+            .to_string(),
+        )?;
+        let restored = core.view();
+        assert!(restored.revision > before.revision);
+        assert_eq!(
+            restored.sessions[0].host_state,
+            before.sessions[0].host_state
+        );
+        let control = &restored.sessions[0].agent_controls[0];
+        assert!(control.reverse_control);
+        assert!(!control.connected);
+        assert_eq!(
+            control.reverse_control_state,
+            ReverseControlState::RestartRequired
+        );
+        let herd = core.herd_view(Vec::new(), None, None);
+        assert_eq!(herd.agents[0].control.as_ref(), Some(control));
+        assert_eq!(core.view().revision, restored.revision);
+
+        install_agent_chat_snapshot(
+            &inner,
+            agent_chat_snapshot(Some((name, "replacement")), Some(name)),
+        );
+        let replacement = core.view();
+        let control = &replacement.sessions[0].agent_controls[0];
+        assert_eq!(control.session_id.as_deref(), Some("replacement"));
+        assert!(!control.reverse_control);
+        assert_eq!(control.reverse_control_state, ReverseControlState::Off);
+
+        let detached = core.detach_runtime(inner.id.clone());
+        assert!(detached.sessions[0].agent_controls.is_empty());
+        assert!(core.herd_view(Vec::new(), None, None).agents.is_empty());
+    }
+    Ok(())
+}
+
+#[test]
+fn typed_agent_controls_retain_preferences_while_stale_and_prune_closed_terminals()
+-> Result<(), Box<dyn std::error::Error>> {
+    let inner = connected_runtime_inner("typed-agent-retention");
+    let runtime = HostRuntime {
+        inner: inner.clone(),
+    };
+    install_agent_chat_snapshot(
+        &inner,
+        agent_chat_snapshot(Some(("codex", "original")), Some("codex")),
+    );
+    assert_eq!(runtime.agent_control_views().len(), 1);
+    runtime.restore_agent_preferences(
+        serde_json::json!({"agents": [{
+            "terminalId": "temporarily-absent", "kind": "opencode", "reverseControl": true
+        }]})
+        .to_string(),
+    )?;
+    inner
+        .state
+        .lock()
+        .host_state
+        .mark_reconnecting("network lost".to_owned());
+    assert_eq!(runtime.agent_control_views().len(), 2);
+    install_agent_chat_snapshot(
+        &inner,
+        agent_chat_snapshot(Some(("codex", "original")), Some("codex")),
+    );
+    let controls = runtime.agent_control_views();
+    assert_eq!(controls.len(), 1);
+    assert_eq!(controls[0].terminal_id, "terminal-pane-1");
+    Ok(())
 }
 
 fn bound(result: AgentChatOpenResult) -> AgentChatBinding {
@@ -783,7 +1566,315 @@ fn bound(result: AgentChatOpenResult) -> AgentChatBinding {
 }
 
 #[test]
-fn agent_chat_resolution_uses_authoritative_codex_and_opencode_sessions() {
+fn workspace_creation_preserves_app_readiness_during_reconciliation() {
+    use crate::app_core::{AppConnectionStatus, AppCore};
+
+    let _guard = EVENT_SINK_TEST_LOCK.lock();
+    let inner = connected_runtime_inner("workspace-readiness");
+    let snapshot = batch_test_snapshot();
+    install_agent_chat_snapshot(&inner, snapshot.clone());
+    let core = AppCore::new();
+    core.open_session("session".to_owned(), "host".to_owned(), true);
+    core.attach_runtime(
+        "session".to_owned(),
+        Arc::new(HostRuntime {
+            inner: inner.clone(),
+        }),
+    );
+    core.open_pane_terminal("session".to_owned(), snapshot.panes[0].pane_id.clone());
+    let active_terminal = snapshot.panes[0].terminal_id.clone();
+    let assert_ready = || {
+        let view = core.view();
+        let session = &view.sessions[0];
+        assert_eq!(session.connection_status, AppConnectionStatus::Ready);
+        assert_eq!(
+            session.terminal_rail.active_terminal_id.as_deref(),
+            Some(active_terminal.as_str())
+        );
+        session.host_state.clone().unwrap()
+    };
+
+    let mut workspace = snapshot.workspaces[0].clone();
+    workspace.workspace_id = "created-workspace".to_owned();
+    workspace.active_tab_id = "created-tab".to_owned();
+    let mut tab = snapshot.tabs[0].clone();
+    tab.workspace_id.clone_from(&workspace.workspace_id);
+    tab.tab_id.clone_from(&workspace.active_tab_id);
+    let mut root_pane = snapshot.panes[0].clone();
+    root_pane.workspace_id.clone_from(&workspace.workspace_id);
+    root_pane.tab_id.clone_from(&tab.tab_id);
+    root_pane.pane_id = "created-pane".to_owned();
+    root_pane.terminal_id = "created-terminal".to_owned();
+    assert!(matches!(
+        inner.state.lock().host_state.apply_control_result(
+            1,
+            &HerdrControlRequest::WorkspaceCreate {
+                label: None,
+                cwd: None,
+            },
+            &HerdrControlResult::WorkspaceCreated {
+                workspace: workspace.clone(),
+                tab,
+                root_pane,
+            },
+        ),
+        ApplyResult::NeedsResync(_)
+    ));
+    core.select_workspace_view("session".to_owned(), workspace.workspace_id.clone());
+    let state = assert_ready();
+    assert_eq!(state.freshness, HostFreshness::Stale);
+    assert!(state.needs_resync);
+    let authoritative = state.snapshot.unwrap();
+    assert_eq!(
+        authoritative.workspaces.len(),
+        snapshot.workspaces.len() + 1
+    );
+    assert_eq!(
+        core.view().sessions[0].selection.workspace_id.as_deref(),
+        Some(workspace.workspace_id.as_str())
+    );
+
+    let (_, token) = begin_host_state_sync(&inner);
+    assert_eq!(assert_ready().sync_status, HostSyncStatus::Syncing);
+    assert_eq!(
+        inner
+            .state
+            .lock()
+            .host_state
+            .complete_sync(token, authoritative, 20),
+        ApplyResult::Applied
+    );
+    assert_eq!(assert_ready().freshness, HostFreshness::Fresh);
+
+    let (_, token) = begin_host_state_sync(&inner);
+    inner
+        .state
+        .lock()
+        .host_state
+        .fail_sync(token, "snapshot request failed".to_owned());
+    let state = assert_ready();
+    assert_eq!(state.sync_status, HostSyncStatus::Error);
+    assert!(state.needs_resync);
+}
+
+#[test]
+fn app_readiness_waits_for_each_connection_initial_sync() {
+    use crate::app_core::{AppConnectionStatus, AppCore};
+
+    let _guard = EVENT_SINK_TEST_LOCK.lock();
+    let inner = connected_runtime_inner("connection-readiness");
+    let core = AppCore::new();
+    core.open_session("session".to_owned(), "host".to_owned(), true);
+    core.attach_runtime(
+        "session".to_owned(),
+        Arc::new(HostRuntime {
+            inner: inner.clone(),
+        }),
+    );
+    let assert_status = |expected| {
+        assert_eq!(core.view().sessions[0].connection_status, expected);
+    };
+    assert_status(AppConnectionStatus::Connected);
+    install_agent_chat_snapshot(&inner, batch_test_snapshot());
+    assert_status(AppConnectionStatus::Ready);
+
+    let (epoch, _) = inner
+        .state
+        .lock()
+        .begin_reconnect(Some(1), "connection lost")
+        .unwrap();
+    assert_status(AppConnectionStatus::Reconnecting);
+    assert!(inner.state.lock().install_connection(epoch));
+    assert_status(AppConnectionStatus::Connected);
+    {
+        let mut state = inner.state.lock();
+        let token = state.host_state.begin_sync(2);
+        state
+            .host_state
+            .fail_sync(token, "initial snapshot failed".to_owned());
+    }
+    assert_status(AppConnectionStatus::Connected);
+    install_agent_chat_snapshot(&inner, batch_test_snapshot());
+    assert_status(AppConnectionStatus::Ready);
+    inner.state.lock().disconnect();
+    assert_status(AppConnectionStatus::Disconnected);
+}
+
+#[test]
+fn connected_host_without_herdr_remains_available_for_server_startup() {
+    use crate::app_core::{AppConnectionStatus, AppCore};
+
+    let inner = connected_runtime_inner("unavailable-herdr-readiness");
+    {
+        let mut state = inner.state.lock();
+        let token = state.host_state.begin_sync(1);
+        state
+            .host_state
+            .fail_sync(token, "Herdr is not running".to_owned());
+    }
+    let core = AppCore::new();
+    core.open_session("session".to_owned(), "host".to_owned(), true);
+    let view = core.attach_runtime("session".to_owned(), Arc::new(HostRuntime { inner }));
+    assert_eq!(
+        view.sessions[0].connection_status,
+        AppConnectionStatus::Ready
+    );
+    assert!(
+        view.sessions[0]
+            .host_state
+            .as_ref()
+            .unwrap()
+            .snapshot
+            .is_none()
+    );
+}
+
+#[test]
+fn terminal_scroll_read_is_scoped_and_never_disables_host_readiness() {
+    use crate::app_core::{AppConnectionStatus, AppCore};
+    use crate::herdr_api::HerdrPaneScrollInfo;
+
+    let _guard = EVENT_SINK_TEST_LOCK.lock();
+    crate::runtime().unwrap().block_on(async {
+        let inner = connected_runtime_inner("terminal-scroll-read");
+        let snapshot = batch_test_snapshot();
+        let terminal_id = snapshot.panes[0].terminal_id.clone();
+        let pane_id = snapshot.panes[0].pane_id.clone();
+        install_agent_chat_snapshot(&inner, snapshot.clone());
+        inner.state.lock().terminals.insert(
+            terminal_id.clone(),
+            TerminalRuntime {
+                state: HostTerminalState::Attached,
+                takeover: true,
+                columns: 80,
+                rows: 24,
+                cell_width_px: 8,
+                cell_height_px: 16,
+                operation_epoch: 1,
+                reconnect_attempt: 0,
+                retry_running: false,
+                bridge_id: None,
+            },
+        );
+        let core = AppCore::new();
+        core.open_session("session".to_owned(), "host".to_owned(), true);
+        core.attach_runtime(
+            "session".to_owned(),
+            Arc::new(HostRuntime {
+                inner: inner.clone(),
+            }),
+        );
+        let assert_ready = || {
+            assert_eq!(
+                core.view().sessions[0].connection_status,
+                AppConnectionStatus::Ready
+            );
+        };
+        let mut response = snapshot.panes[0].clone();
+        response.scroll = Some(HerdrPaneScrollInfo {
+            offset_from_bottom: 3.0,
+            max_offset_from_bottom: 100.0,
+            viewport_rows: 30.0,
+        });
+        terminal::refresh_terminal_scroll_using(inner.clone(), terminal_id.clone(), 1, |request| {
+            assert_eq!(request, HerdrControlRequest::PaneGet { pane_id });
+            assert_ready();
+            std::future::ready(Ok(HerdrControlResult::PaneInfo {
+                pane: response.clone(),
+            }))
+        })
+        .await
+        .unwrap();
+        assert_ready();
+        assert_eq!(
+            inner
+                .state
+                .lock()
+                .host_state
+                .projection()
+                .snapshot
+                .unwrap()
+                .panes[0]
+                .scroll,
+            response.scroll
+        );
+
+        let before = inner.state.lock().host_state.projection();
+        assert!(
+            terminal::refresh_terminal_scroll_using(
+                inner.clone(),
+                terminal_id.clone(),
+                1,
+                |_| async {
+                    Err(HerdrControlError::TransportDisconnected(
+                        "metadata read failed".to_owned(),
+                    ))
+                }
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(inner.state.lock().host_state.projection(), before);
+        assert_ready();
+
+        response.scroll.as_mut().unwrap().offset_from_bottom = 8.0;
+        terminal::refresh_terminal_scroll_using(inner.clone(), terminal_id.clone(), 1, |_| async {
+            inner
+                .state
+                .lock()
+                .terminals
+                .get_mut(&terminal_id)
+                .unwrap()
+                .operation_epoch = 2;
+            Ok(HerdrControlResult::PaneInfo { pane: response })
+        })
+        .await
+        .unwrap();
+        assert_eq!(inner.state.lock().host_state.projection(), before);
+        assert_ready();
+    });
+}
+
+#[test]
+fn inline_interaction_requires_a_fresh_blocked_pane_and_the_current_binding() {
+    let _guard = EVENT_SINK_TEST_LOCK.lock();
+    let inner = connected_runtime_inner("inline-interaction-identity");
+    let runtime = HostRuntime {
+        inner: inner.clone(),
+    };
+    let session = "11111111-1111-4111-8111-111111111111";
+    let mut snapshot = agent_chat_snapshot(Some(("codex", session)), None);
+    snapshot.panes[0].agent_status = HerdrAgentStatus::Blocked;
+    install_agent_chat_snapshot(&inner, snapshot.clone());
+    let binding = bound(runtime.open_agent_chat("terminal-pane-1".into()).unwrap());
+    let target =
+        || interaction::interaction_target(&inner, "terminal-pane-1", &binding.binding_token);
+    assert_eq!(target().unwrap().0, "pane-1");
+    assert!(
+        interaction::interaction_target(&inner, "terminal-pane-2", &binding.binding_token).is_err()
+    );
+    assert!(
+        interaction::interaction_target(&inner, "terminal-pane-1", "obsolete-binding").is_err()
+    );
+
+    snapshot.panes[0].agent_status = HerdrAgentStatus::Working;
+    install_agent_chat_snapshot(&inner, snapshot.clone());
+    assert!(target().is_err());
+    snapshot.panes[0].agent_status = HerdrAgentStatus::Blocked;
+    install_agent_chat_snapshot(&inner, snapshot.clone());
+    assert!(target().is_ok());
+    inner.state.lock().host_state.begin_sync(1);
+    assert!(target().is_err());
+    install_agent_chat_snapshot(&inner, snapshot.clone());
+    assert!(target().is_ok());
+    snapshot.panes[0].agent_session.as_mut().unwrap().value =
+        "22222222-2222-4222-8222-222222222222".into();
+    install_agent_chat_snapshot(&inner, snapshot);
+    assert!(target().is_err());
+}
+
+#[test]
+fn agent_chat_resolution_uses_authoritative_agent_sessions() {
     let _guard = EVENT_SINK_TEST_LOCK.lock();
     let codex = "11111111-1111-4111-8111-111111111111";
     let inner = connected_runtime_inner("agent-chat-resolution");
@@ -815,6 +1906,18 @@ fn agent_chat_resolution_uses_authoritative_codex_and_opencode_sessions() {
     assert_eq!(replacement.agent, AgentTranscriptKind::OpenCode);
     assert_eq!(replacement.session_id, "ses_abc123");
     assert_ne!(replacement.binding_token, binding.binding_token);
+    install_agent_chat_snapshot(&inner, agent_chat_snapshot(Some(("claude", codex)), None));
+    let claude = runtime
+        .current_agent_chat("terminal-pane-1".to_owned())
+        .unwrap();
+    assert_eq!(claude.agent, AgentTranscriptKind::Claude);
+    assert_eq!(claude.session_id, codex);
+    assert_eq!(claude.state.agent, AgentTranscriptKind::Claude);
+    assert_eq!(
+        claude.transcript_key,
+        format!("agent-chat-resolution\nclaude\n{codex}")
+    );
+    assert_ne!(claude.binding_token, replacement.binding_token);
     assert!(matches!(
         runtime
             .start_agent_chat(binding.binding_token, None)
@@ -917,6 +2020,146 @@ fn authoritative_snapshot_rebinds_session_and_detaches_on_normal_shell() {
             .unwrap(),
         AgentChatOpenResult::NoChat { .. }
     ));
+}
+
+#[test]
+fn chat_identity_read_detects_resume_without_events_or_submitted_input() {
+    let _guard = EVENT_SINK_TEST_LOCK.lock();
+    crate::runtime().unwrap().block_on(async {
+        let first = "11111111-1111-4111-8111-111111111111";
+        let second = "22222222-2222-4222-8222-222222222222";
+        let inner = connected_runtime_inner("chat-identity-resume");
+        let runtime = HostRuntime {
+            inner: inner.clone(),
+        };
+        let snapshot = agent_chat_snapshot(Some(("codex", first)), None);
+        let before_pane = snapshot.panes[0].clone();
+        let terminal_id = before_pane.terminal_id.clone();
+        install_agent_chat_snapshot(&inner, snapshot);
+        let original = bound(runtime.open_agent_chat(terminal_id.clone()).unwrap());
+        let mut response = before_pane.clone();
+        response.agent_session.as_mut().unwrap().value = second.into();
+        // The rest of a metadata response is deliberately not authoritative.
+        response.agent_status = HerdrAgentStatus::Blocked;
+        response.cwd = Some("/stale-cwd".into());
+        response.focused = !before_pane.focused;
+        let pane_id = before_pane.pane_id.clone();
+        let result = chat_identity::read_pane_identity_using(inner.clone(), &pane_id, |request| {
+            assert_eq!(
+                request,
+                HerdrControlRequest::PaneGet {
+                    pane_id: response.pane_id.clone()
+                }
+            );
+            std::future::ready(Ok(HerdrControlResult::PaneInfo {
+                pane: response.clone(),
+            }))
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            result,
+            HerdrControlResult::PaneInfo {
+                pane: response.clone()
+            }
+        );
+
+        let rebound = runtime.current_agent_chat(terminal_id.clone()).unwrap();
+        assert_eq!(rebound.session_id, second);
+        assert_ne!(rebound.binding_token, original.binding_token);
+        assert!(inner.agents.state(&original.transcript_key).is_none());
+        let before = inner.state.lock().host_state.projection();
+        let refreshed = &before.snapshot.as_ref().unwrap().panes[0];
+        assert_eq!(refreshed.agent_status, before_pane.agent_status);
+        assert_eq!(refreshed.cwd, before_pane.cwd);
+        assert_eq!(refreshed.scroll, before_pane.scroll);
+        assert_eq!(refreshed.focused, before_pane.focused);
+
+        chat_identity::read_pane_identity_using(inner.clone(), &pane_id, |_| async {
+            Ok(HerdrControlResult::PaneInfo { pane: response })
+        })
+        .await
+        .unwrap();
+        assert_eq!(inner.state.lock().host_state.projection(), before);
+        assert_eq!(
+            runtime
+                .current_agent_chat(terminal_id.clone())
+                .unwrap()
+                .binding_token,
+            rebound.binding_token
+        );
+
+        let failed = chat_identity::read_pane_identity_using(inner.clone(), &pane_id, |_| async {
+            Err(HerdrControlError::TransportDisconnected(
+                "metadata read failed".into(),
+            ))
+        })
+        .await;
+        assert!(failed.is_err());
+        assert_eq!(inner.state.lock().host_state.projection(), before);
+        assert_eq!(
+            inner.state.lock().connection,
+            HostConnectionState::Connected
+        );
+    });
+}
+
+#[test]
+fn late_chat_identity_read_cannot_restore_a_replaced_or_detached_session() {
+    let _guard = EVENT_SINK_TEST_LOCK.lock();
+    crate::runtime().unwrap().block_on(async {
+        let first = "11111111-1111-4111-8111-111111111111";
+        let second = "22222222-2222-4222-8222-222222222222";
+        let inner = connected_runtime_inner("chat-identity-stale");
+        let runtime = HostRuntime {
+            inner: inner.clone(),
+        };
+        let snapshot = agent_chat_snapshot(Some(("codex", first)), None);
+        let obsolete_response = snapshot.panes[0].clone();
+        let terminal_id = obsolete_response.terminal_id.clone();
+        let pane_id = obsolete_response.pane_id.clone();
+        install_agent_chat_snapshot(&inner, snapshot);
+        runtime.open_agent_chat(terminal_id.clone()).unwrap();
+        let replacement = agent_chat_snapshot(Some(("codex", second)), None);
+        chat_identity::read_pane_identity_using(inner.clone(), &pane_id, |_| async {
+            install_agent_chat_snapshot(&inner, replacement.clone());
+            Ok(HerdrControlResult::PaneInfo {
+                pane: obsolete_response.clone(),
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            runtime
+                .current_agent_chat(terminal_id.clone())
+                .unwrap()
+                .session_id,
+            second
+        );
+
+        let before = inner.state.lock().host_state.projection();
+        chat_identity::read_pane_identity_using(inner.clone(), &pane_id, |_| async {
+            inner.agents.close_terminal(&terminal_id);
+            Ok(HerdrControlResult::PaneInfo {
+                pane: obsolete_response.clone(),
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(inner.state.lock().host_state.projection(), before);
+        assert!(runtime.current_agent_chat(terminal_id.clone()).is_none());
+        // A caller can still read pane metadata after detachment, but the
+        // response must not rebind Chat or change the authoritative session.
+        chat_identity::read_pane_identity_using(inner.clone(), &pane_id, |_| async {
+            Ok(HerdrControlResult::PaneInfo {
+                pane: obsolete_response,
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(inner.state.lock().host_state.projection(), before);
+        assert!(runtime.current_agent_chat(terminal_id).is_none());
+    });
 }
 
 #[test]
@@ -1023,6 +2266,228 @@ fn lifecycle_snapshot() -> HerdrSessionSnapshot {
         agent_session: None,
     });
     snapshot
+}
+
+#[test]
+fn herd_follows_server_agent_filter_without_removing_host_state() {
+    let (inner, core) = agent_view_test_core();
+    inner.state.lock().agent_order = Some(vec!["pane-3".into(), "pane-2".into()]);
+    let herd = core.herd_view(Vec::new(), None, None);
+    assert_eq!(herd.agents.len(), 2);
+    assert_eq!(herd.hosts[0].agents.len(), 2);
+    assert_eq!(herd.hosts[0].agent_status, HerdrAgentStatus::Working);
+    assert_eq!(
+        core.view().sessions[0]
+            .host_state
+            .as_ref()
+            .unwrap()
+            .snapshot
+            .as_ref()
+            .unwrap()
+            .agents
+            .len(),
+        3
+    );
+    assert!(
+        !core
+            .open_pane_terminal("session".into(), "pane-1".into())
+            .sessions[0]
+            .terminal_rail
+            .terminals
+            .is_empty()
+    );
+}
+
+#[test]
+fn herd_follows_server_agent_order_instead_of_attention_priority() {
+    let (inner, core) = agent_view_test_core();
+    inner.state.lock().agent_order = Some(vec!["pane-3".into(), "pane-2".into(), "pane-1".into()]);
+    let herd = core.herd_view(Vec::new(), None, None);
+    assert_eq!(
+        herd.agents
+            .iter()
+            .map(|item| item.agent.pane_id.as_str())
+            .collect::<Vec<_>>(),
+        ["pane-3", "pane-2", "pane-1"]
+    );
+}
+
+#[test]
+fn herd_follows_empty_server_view_without_falling_back_to_all_agents() {
+    let (inner, core) = agent_view_test_core();
+    inner.state.lock().agent_order = Some(Vec::new());
+    let herd = core.herd_view(Vec::new(), None, None);
+    assert!(herd.agents.is_empty());
+    assert!(herd.hosts[0].agents.is_empty());
+    assert_eq!(herd.hosts[0].agent_status, HerdrAgentStatus::Idle);
+    inner.state.lock().agent_order = None;
+    assert_eq!(core.herd_view(Vec::new(), None, None).agents.len(), 3);
+}
+
+#[test]
+fn mixed_protocol_herd_groups_hosts_by_existing_rank_and_keeps_each_local_order() {
+    let core = mixed_herd_core(&[
+        ("modern-a", Some(&["pane-3", "pane-2"])),
+        ("legacy", None),
+        ("modern-b", Some(&["pane-3", "pane-1", "pane-2"])),
+    ]);
+    let herd = core.herd_view(Vec::new(), None, None);
+    assert_eq!(
+        herd.hosts
+            .iter()
+            .map(|host| host.id.as_str())
+            .collect::<Vec<_>>(),
+        ["legacy", "modern-b", "modern-a"]
+    );
+    assert_eq!(
+        herd_agent_keys(&herd),
+        [
+            ("legacy", "pane-1"),
+            ("legacy", "pane-2"),
+            ("legacy", "pane-3"),
+            ("modern-b", "pane-3"),
+            ("modern-b", "pane-1"),
+            ("modern-b", "pane-2"),
+            ("modern-a", "pane-3"),
+            ("modern-a", "pane-2"),
+        ]
+    );
+    for session in core.view().sessions {
+        let snapshot = session.host_state.unwrap().snapshot.unwrap();
+        assert_eq!(snapshot.agents.len(), 3);
+        assert_eq!(snapshot.panes.len(), 3);
+    }
+}
+
+#[test]
+fn mixed_protocol_herd_sorts_a_selected_legacy_host_by_attention() {
+    let core = mixed_herd_core(&[
+        ("legacy", None),
+        ("modern", Some(&["pane-3", "pane-1", "pane-2"])),
+    ]);
+    let herd = core.herd_view(Vec::new(), Some("legacy".into()), None);
+    assert_eq!(
+        herd_agent_keys(&herd),
+        [
+            ("legacy", "pane-1"),
+            ("legacy", "pane-2"),
+            ("legacy", "pane-3"),
+        ]
+    );
+}
+
+#[test]
+fn mixed_protocol_herd_keeps_host_groups_when_a_modern_view_is_empty() {
+    let core = mixed_herd_core(&[
+        ("legacy-a", None),
+        ("empty-modern", Some(&[])),
+        ("legacy-b", None),
+    ]);
+    let herd = core.herd_view(Vec::new(), None, None);
+    assert!(
+        herd.hosts
+            .iter()
+            .find(|host| host.id == "empty-modern")
+            .unwrap()
+            .agents
+            .is_empty()
+    );
+    assert_eq!(
+        herd_agent_keys(&herd),
+        [
+            ("legacy-a", "pane-1"),
+            ("legacy-a", "pane-2"),
+            ("legacy-a", "pane-3"),
+            ("legacy-b", "pane-1"),
+            ("legacy-b", "pane-2"),
+            ("legacy-b", "pane-3"),
+        ]
+    );
+}
+
+#[test]
+fn legacy_only_herd_retains_global_attention_sorting_across_hosts() {
+    let core = mixed_herd_core(&[("legacy-a", None), ("legacy-b", None)]);
+    let herd = core.herd_view(Vec::new(), None, None);
+    assert_eq!(
+        herd_agent_keys(&herd),
+        [
+            ("legacy-a", "pane-1"),
+            ("legacy-b", "pane-1"),
+            ("legacy-a", "pane-2"),
+            ("legacy-b", "pane-2"),
+            ("legacy-a", "pane-3"),
+            ("legacy-b", "pane-3"),
+        ]
+    );
+}
+
+fn mixed_herd_core(orders: &[(&str, Option<&[&str]>)]) -> Arc<crate::AppCore> {
+    let core = crate::AppCore::new();
+    for &(id, order) in orders {
+        let (inner, _) = agent_view_test_core();
+        let mut snapshot = inner.state.lock().host_state.projection().snapshot.unwrap();
+        // Deliberately disagree with attention sorting; all hosts reuse pane IDs.
+        snapshot.agents.reverse();
+        install_agent_chat_snapshot(&inner, snapshot);
+        {
+            let mut state = inner.state.lock();
+            state.protocol = Some(if order.is_some() { 22 } else { 21 });
+            state.agent_order =
+                order.map(|panes| panes.iter().map(|pane| (*pane).into()).collect());
+        }
+        core.open_session(id.into(), id.into(), true);
+        core.attach_runtime(id.into(), Arc::new(HostRuntime { inner }));
+    }
+    core
+}
+
+fn herd_agent_keys(herd: &crate::HerdView) -> Vec<(&str, &str)> {
+    herd.agents
+        .iter()
+        .map(|row| (row.host_id.as_str(), row.agent.pane_id.as_str()))
+        .collect()
+}
+
+pub(super) fn agent_view_test_core() -> (Arc<RuntimeInner>, Arc<crate::AppCore>) {
+    let inner = connected_runtime_inner(&format!(
+        "agent-view-{}",
+        NEXT_RUNTIME_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut snapshot = lifecycle_snapshot();
+    let template_pane = snapshot.panes[0].clone();
+    let template_agent = snapshot.agents[0].clone();
+    snapshot.panes.clear();
+    snapshot.agents.clear();
+    for (index, status) in [
+        HerdrAgentStatus::Blocked,
+        HerdrAgentStatus::Working,
+        HerdrAgentStatus::Idle,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut pane = template_pane.clone();
+        pane.pane_id = format!("pane-{}", index + 1);
+        pane.terminal_id = format!("terminal-pane-{}", index + 1);
+        pane.agent_status = status;
+        let mut agent = template_agent.clone();
+        agent.pane_id.clone_from(&pane.pane_id);
+        agent.terminal_id.clone_from(&pane.terminal_id);
+        agent.agent_status = status;
+        snapshot.panes.push(pane);
+        snapshot.agents.push(agent);
+    }
+    install_agent_chat_snapshot(&inner, snapshot);
+    let core = crate::AppCore::new();
+    core.open_session("session".into(), "host".into(), true);
+    core.attach_runtime(
+        "session".into(),
+        Arc::new(HostRuntime {
+            inner: inner.clone(),
+        }),
+    );
+    (inner, core)
 }
 
 #[test]
@@ -1488,6 +2953,38 @@ fn lifecycle_connect_install_disconnect_is_explicit() {
     state.disconnect();
     assert_eq!(state.connection, HostConnectionState::Disconnecting);
     assert!(state.explicit_disconnect);
+}
+
+#[test]
+fn lifecycle_epoch_is_retained_for_late_probe_subscribers() {
+    let _guard = EVENT_SINK_TEST_LOCK.lock();
+    crate::runtime().unwrap().block_on(async {
+        // A closed loopback port exercises initial_connect without requiring
+        // SSH or Herdr. No cancellation receiver exists during this transition.
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let mut runtime_config = config();
+        runtime_config.ssh.host = "127.0.0.1".into();
+        runtime_config.ssh.port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let state = RuntimeState::new(&runtime_config);
+        let inner = runtime_inner_with_state("late-probe-subscriber", runtime_config, state);
+        assert_eq!(inner.cancellation.receiver_count(), 0);
+        assert!(initial_connect(inner.clone()).await.is_err());
+        assert_eq!(
+            *inner.cancellation.subscribe().borrow(),
+            inner.state.lock().epoch
+        );
+        let runtime = HostRuntime {
+            inner: inner.clone(),
+        };
+        runtime.disconnect().await.unwrap();
+        assert_eq!(
+            *inner.cancellation.subscribe().borrow(),
+            inner.state.lock().epoch
+        );
+    });
 }
 
 #[test]
@@ -2551,9 +4048,18 @@ fn all_focus_requests_are_replayable_but_mutations_are_not() {
         text: "hello".to_owned()
     }));
     assert!(safe_control_replay(&HerdrControlRequest::SessionSnapshot));
+    assert!(safe_control_replay(&HerdrControlRequest::IntegrationList));
+    assert!(!safe_control_replay(
+        &HerdrControlRequest::IntegrationInstall {
+            kind: HerdrAgentKind::Codex,
+        }
+    ));
     assert!(safe_control_replay(&HerdrControlRequest::PaneRead {
         pane_id: "p".to_owned(),
         lines: 10
+    }));
+    assert!(safe_control_replay(&HerdrControlRequest::PaneReadVisible {
+        pane_id: "p".into()
     }));
     assert!(!safe_control_replay(&HerdrControlRequest::PaneSendText {
         pane_id: "p".to_owned(),

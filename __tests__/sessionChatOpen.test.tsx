@@ -1,12 +1,18 @@
 import type { ComponentProps } from 'react';
+import { Linking, Platform } from 'react-native';
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import { SessionScreen } from '../src/components/SessionScreen';
+import { TerminalComposerStore } from '../src/lib/terminalComposerStore';
 import { agentChatCache } from '../src/services/agentChatCache';
+import { readCachedAgentTranscript } from 'react-native-whip-ssh';
 import { agentTranscriptService } from '../src/services/NativeTranscriptService';
 import { listenToChat } from '../src/services/chatSpeech';
 import type { ChatAgent } from '../src/lib/agentChatSession';
 import { AgentChatPresentationPhase } from '../src/lib/agentChatPresentation';
 import { TerminalResidencyEndReason } from '../src/lib/terminalResidency';
+import { terminalControlBarInset } from '../src/lib/floatingChrome';
+import { browserRegistry, connectedBrowserRuntimes } from '../src/browser/registry';
+import { supportsBrowserControl } from '../src/browser/native';
 import type { HerdrSnapshot, PaneInfo } from '../src/types';
 import type {
   NativeAgentChatBinding,
@@ -46,6 +52,21 @@ jest.mock(
   () => new Proxy({}, { get: (_target, name) => String(name) }),
 );
 jest.mock('react-native-webview', () => 'WebView');
+jest.mock('../src/browser/BrowserTunnelingSetting', () => ({
+  BrowserTunnelingSetting: 'BrowserTunnelingSetting',
+}));
+jest.mock('../src/browser/native', () => ({
+  supportsBrowserControl: jest.fn(() => false),
+  supportsBrowserProxy: () => true,
+  configureBrowserProxy: jest.fn(async () => undefined),
+}));
+const mockTunneledHosts = new Set<string>();
+jest.mock('../src/browser/library', () => ({
+  browserLibrary: {
+    load: jest.fn(async () => undefined),
+    tunneling: (hostId: string) => mockTunneledHosts.has(hostId),
+  },
+}));
 jest.mock('react-native-safe-area-context', () => ({
   useSafeAreaInsets: () => ({ top: 0, bottom: 0, left: 0, right: 0 }),
 }));
@@ -79,7 +100,7 @@ jest.mock('../src/components/TerminalScreen', () => {
           onBufferModeChange: noop, onVisualScrollState: noop, onProtocolStateChange: noop,
           onTitleChange: noop, onFontSizeChange: noop, onStatus: noop, onError: noop,
         }),
-        props.renderViewportOverlay?.({ top: 0, bottom: 0 }, 0),
+        props.renderViewportOverlay?.({ top: 0, bottom: 0 }, 0, { open: false, onClose: noop }),
       );
     },
     TerminalBackground: 'TerminalBackground',
@@ -112,7 +133,10 @@ jest.mock('../src/components/ui/input', () => ({ Input: 'Input' }));
 jest.mock('../src/components/ui/switch', () => ({ Switch: 'Switch' }));
 jest.mock('../src/components/ui/text', () => ({ Text: 'Text' }));
 jest.mock('../src/services/volumeKeys', () => ({
-  addTerminalVolumeKeyListener: () => ({ remove: jest.fn() }),
+  addTerminalVolumeKeyListener: (listener: (key: 'up' | 'down') => void) => {
+    mockVolumeKeyListeners.add(listener);
+    return { remove: () => mockVolumeKeyListeners.delete(listener) };
+  },
 }));
 jest.mock('../src/theme', () => ({
   useTheme: () => ({ colors: {} }),
@@ -121,8 +145,11 @@ jest.mock('../src/theme', () => ({
   statusColor: () => '',
 }));
 
-type Props = ComponentProps<typeof SessionScreen>;
+type Props = ComponentProps<typeof SessionScreen> & {
+  client: NonNullable<ComponentProps<typeof SessionScreen>['client']>;
+};
 const mockChatFrames: Array<{ visible: boolean; chat: boolean }> = [];
+const mockVolumeKeyListeners = new Set<(key: 'up' | 'down') => void>();
 const mockAppStateListeners = new Set<(state: string) => void>();
 function setup(agent: ChatAgent) {
   const bindings = new Map<string, NativeAgentChatBinding>();
@@ -159,6 +186,14 @@ function setup(agent: ChatAgent) {
     tabs: [{ workspace_id: 'workspace-1', tab_id: 'tab-1', focused: true }],
   } as unknown as HerdrSnapshot;
   const native = {
+    runtimeId: 'runtime-1',
+    requestHerdrApi: jest.fn(async () => ({})),
+    reverseControlSessions: () => [],
+    reverseControlReply: jest.fn(),
+    startBrowserProxy: jest.fn(async () => 9001),
+    stopBrowserProxy: jest.fn(async () => undefined),
+    startWebPreview: jest.fn(),
+    stopPreview: jest.fn(),
     hostState: jest.fn(() => ({
       syncStatus: 'synced',
       freshness: 'fresh',
@@ -173,6 +208,7 @@ function setup(agent: ChatAgent) {
         return { type: 'bound', binding };
       },
     ),
+    agentChatBindingIsCurrent: jest.fn(() => false),
     currentAgentChat: jest.fn(
       (terminalId: string, handler?: (event: NativeAgentTranscriptUpdate) => void): NativeAgentChatBinding | undefined => {
         if (handler) handlers.set(terminalId, handler);
@@ -196,6 +232,7 @@ function setup(agent: ChatAgent) {
   };
   const client = {
     native,
+    activeNative: native,
     terminal: { closeTerminalBridge: jest.fn(), detachTerminal: jest.fn(), isTerminalBridgeRetained: jest.fn(() => false) },
     snapshot: jest.fn(async () => snapshot),
   } as unknown as Props['client'];
@@ -207,6 +244,7 @@ function setup(agent: ChatAgent) {
     reconnectAttempt: 0,
   };
   const props: Props = {
+    hostId: 'saved-host',
     hostSessionId: 'host-1',
     visible: true,
     ttsEnabled: false,
@@ -229,15 +267,16 @@ function setup(agent: ChatAgent) {
     onRefresh: jest.fn(async () => {}),
     onOpenPane: jest.fn(),
     onActivateTerminal: jest.fn(),
+    onOpenSshShell: jest.fn(),
+    onSelectSshShell: jest.fn(),
+    onRenameSshShell: jest.fn(),
     onCloseTerminal: jest.fn(),
     onTerminalStatus: jest.fn(),
     onTerminalFontSizeChange: jest.fn(),
     onOpenFiles: jest.fn(),
-    getComposerDraft: () => '',
-    onComposerDraftChange: jest.fn(),
+    composerStore: new TerminalComposerStore(),
     onTerminalControlUse: jest.fn(),
     onTerminalHistoryEntry: jest.fn(),
-    onTerminalOpenLinksInAppChange: jest.fn(),
     onInteraction: jest.fn(),
     onExit: jest.fn(),
   };
@@ -266,13 +305,258 @@ const navigationPhases = [
 ];
 
 beforeEach(() => {
+  Platform.OS = 'android';
   mockChatFrames.length = 0;
+  mockVolumeKeyListeners.clear();
+  mockTunneledHosts.clear();
+  jest.mocked(supportsBrowserControl).mockReturnValue(false);
   jest.mocked(listenToChat).mockClear();
+  jest.mocked(Linking.openURL).mockReset().mockResolvedValue(undefined);
   jest.spyOn(console, 'info').mockImplementation(() => {});
   jest.spyOn(agentChatCache, 'loadNative').mockResolvedValue(null);
 });
-afterEach(() => {
-  act(() => renderer?.unmount());
+
+test('interacting with a completed agent acknowledges it through Herdr once per pending request', async () => {
+  const host = setup('codex');
+  host.pane.agent_status = 'done';
+  let finishFocus!: (value: object) => void;
+  host.native.requestHerdrApi.mockImplementationOnce(() => new Promise(resolve => {
+    finishFocus = resolve;
+  }));
+  await act(async () => { renderer = create(<SessionScreen {...host.props} />); });
+  expect(host.native.requestHerdrApi).not.toHaveBeenCalled();
+
+  const terminal = ui('TerminalScreen');
+  let touchSurface = terminal.parent;
+  while (touchSurface && !touchSurface.props.onTouchStart) touchSurface = touchSurface.parent;
+  expect(touchSurface).not.toBeNull();
+  act(() => {
+    touchSurface!.props.onTouchStart();
+    terminal.props.onInteraction(host.props.terminalTargets[0]);
+    terminal.props.onInteraction(host.props.terminalTargets[0]);
+  });
+  expect(host.native.requestHerdrApi).toHaveBeenCalledTimes(1);
+  expect(host.native.requestHerdrApi).toHaveBeenCalledWith({
+    method: 'pane.focus', params: { pane_id: host.pane.pane_id },
+  });
+  // The UI waits for authoritative state; touching does not rewrite a cached status.
+  expect(host.pane.agent_status).toBe('done');
+  await act(async () => { finishFocus({}); });
+
+  host.pane.agent_status = 'idle';
+  act(() => { terminal.props.onInteraction(host.props.terminalTargets[0]); });
+  expect(host.native.requestHerdrApi).toHaveBeenCalledTimes(1);
+  host.pane.agent_status = 'done';
+  await act(async () => { terminal.props.onInteraction(host.props.terminalTargets[0]); });
+  expect(host.native.requestHerdrApi).toHaveBeenCalledTimes(2);
+});
+
+test.each(['working', 'blocked', 'idle'] as const)('interaction preserves an agent’s %s status', async status => {
+  const host = setup('codex');
+  host.pane.agent_status = status;
+  await act(async () => { renderer = create(<SessionScreen {...host.props} />); });
+  act(() => { ui('TerminalScreen').props.onInteraction(host.props.terminalTargets[0]); });
+  expect(host.native.requestHerdrApi).not.toHaveBeenCalled();
+  expect(host.pane.agent_status).toBe(status);
+});
+
+test.each(['hidden', 'background', 'offline', 'stale', 'different-terminal'] as const)(
+  'does not acknowledge completion from an ineligible %s interaction',
+  async reason => {
+    const host = setup('codex');
+    host.pane.agent_status = 'done';
+    if (reason === 'hidden') host.props.visible = false;
+    if (reason === 'offline') Object.assign(host.client, { activeNative: null });
+    if (reason === 'stale') host.native.hostState.mockReturnValue({
+      syncStatus: 'synced', freshness: 'stale', snapshot: host.props.snapshot,
+    });
+    const target = host.props.terminalTargets[0];
+    if (reason === 'different-terminal') target.session = {
+      ...target.session, terminalId: 'replaced-terminal',
+    };
+    await act(async () => { renderer = create(<SessionScreen {...host.props} />); });
+    if (reason === 'background') {
+      act(() => { for (const listener of mockAppStateListeners) listener('background'); });
+    }
+    act(() => { ui('TerminalScreen').props.onInteraction(target); });
+    expect(host.native.requestHerdrApi).not.toHaveBeenCalled();
+  },
+);
+
+test('session rail follows measured terminal controls and keyboard visibility', async () => {
+  const host = setup('codex');
+  await act(async () => { renderer = create(<SessionScreen {...host.props} />); });
+  const back = renderer.root.findByProps({ accessibilityLabel: 'session.backToHerd' });
+  const rail = back.parent!;
+  const railContainer = rail.parent!;
+  const measuredBottom = terminalControlBarInset(34) + 8;
+
+  expect(railContainer.props.style.bottom).toBe(terminalControlBarInset(0));
+  for (const { keyboardInset, visible } of [
+    { keyboardInset: 300, visible: false },
+    { keyboardInset: 0, visible: true },
+  ]) {
+    act(() => {
+      ui('TerminalScreen').props.onSessionChromeLayoutChange({
+        bottom: measuredBottom + keyboardInset, visible,
+      });
+    });
+    expect(railContainer.props.style.bottom).toBe(measuredBottom + keyboardInset);
+    expect(rail.props.pointerEvents).toBe(visible ? 'auto' : 'none');
+    expect(rail.props.style?.display).toBe(visible ? undefined : 'none');
+  }
+});
+
+test('offline terminal shows cached chat in the usual Chat viewport', async () => {
+  const host = setup('codex');
+  const blob = new Uint8Array([1, 2, 3]).buffer;
+  jest.spyOn(agentChatCache, 'listNative').mockResolvedValue([{
+    namespace: 'host-1',
+    key: 'cached-key',
+    agent: 'codex',
+    sessionId: host.pane.agent_session!.value,
+    updatedAt: 1,
+    cacheBytes: 3,
+  }]);
+  jest.mocked(agentChatCache.loadNative).mockResolvedValue(blob);
+  jest.mocked(readCachedAgentTranscript).mockReturnValue({
+    sessionId: host.pane.agent_session!.value,
+    agent: 'codex',
+    revision: 1,
+    status: 'stale',
+    messages: [],
+    turns: [],
+  });
+  act(() => {
+    renderer = create(<SessionScreen
+      {...host.props}
+      client={null}
+      terminalTargets={[]}
+      terminalState={{
+        activeTerminalId: host.pane.terminal_id,
+        sessions: [{
+          ...host.props.terminalState.sessions[0],
+          status: 'disconnected',
+        }],
+      }}
+    />);
+  });
+  await act(async () => {
+    await control().onPress();
+  });
+  expect(agentChatCache.loadNative).toHaveBeenCalledWith('cached-key');
+  expect(ui('TerminalScreen').props.chatViewEnabled).toBe(true);
+  expect(ui('AgentChatView').props.state.transcript.sessionId)
+    .toBe(host.pane.agent_session!.value);
+  expect(host.native.openAgentChat).not.toHaveBeenCalled();
+  await act(async () => {
+    ui('AgentChatView').props.onOpenWebLink('https://example.com/docs');
+  });
+  expect(renderer.root.find(node => String(node.type) === 'WebView' && node.props.source?.uri === 'https://example.com/docs')).toBeDefined();
+  expect(Linking.openURL).not.toHaveBeenCalled();
+});
+
+test('volume key tab navigation uses the current action after settings change', async () => {
+  const host = setup('codex');
+  const nextPane = {
+    ...host.pane,
+    pane_id: 'pane-2',
+    terminal_id: 'terminal-2',
+    tab_id: 'tab-2',
+    focused: false,
+  };
+  const snapshot = {
+    ...host.props.snapshot,
+    panes: [host.pane, nextPane],
+    tabs: [
+      ...host.props.snapshot.tabs,
+      { workspace_id: 'workspace-1', tab_id: 'tab-2', focused: false },
+    ],
+  } as HerdrSnapshot;
+  host.props.snapshot = snapshot;
+  host.setSnapshot(snapshot);
+  Object.assign(host.native, { requestHerdrApi: jest.fn(async () => ({})) });
+
+  act(() => { renderer = create(<SessionScreen {...host.props} />); });
+  act(() => renderer.update(<SessionScreen {...host.props} terminalPreferences={{
+    ...host.props.terminalPreferences,
+    volumeDownAction: 'terminal-tab',
+  }} />));
+  await act(async () => { for (const listener of mockVolumeKeyListeners) listener('down'); });
+
+  expect(host.props.onActivateTerminal).toHaveBeenCalledWith(nextPane);
+});
+
+test('plain SSH tabs use the shared create, switch, rename, close and volume controls', async () => {
+  const host = setup('codex');
+  const shells = ['Build', 'Logs'].map((title, index) => ({
+    terminalId: `__whip_ssh_shell__:${index + 1}`,
+    paneId: `__whip_ssh_shell__:${index + 1}`,
+    title,
+    kind: 'ssh' as const,
+    status: 'connected' as const,
+    reconnectAttempt: 0,
+  }));
+  host.props.terminalState = { sessions: shells, activeTerminalId: shells[0].terminalId };
+  host.props.terminalTargets = shells.map(session => ({
+    key: session.terminalId, hostSessionId: host.props.hostSessionId, client: host.client, session,
+  }));
+  host.props.snapshot = {
+    ...host.props.snapshot, server: { ...host.props.snapshot.server, running: false },
+    panes: [], tabs: [], workspaces: [], agents: [],
+  };
+  host.setSnapshot(host.props.snapshot);
+  host.props.terminalPreferences = { ...host.props.terminalPreferences, volumeDownAction: 'terminal-tab' };
+  act(() => { renderer = create(<SessionScreen {...host.props} />); });
+  const tabButtons = (label: string) => renderer.root.findAll(node =>
+    String(node.type) === 'Button' && node.props.accessibilityLabel === label);
+  expect(tabButtons('session.openTab')).toHaveLength(2);
+  expect(host.props.onActivateTerminal).not.toHaveBeenCalled();
+  act(() => { tabButtons('session.openTab')[1].props.onPress(); });
+  expect(host.props.onSelectSshShell).toHaveBeenLastCalledWith(shells[1].terminalId);
+  act(() => { for (const listener of mockVolumeKeyListeners) listener('down'); });
+  expect(host.props.onSelectSshShell).toHaveBeenLastCalledWith(shells[1].terminalId);
+
+  act(() => { tabButtons('session.openTab')[1].props.onLongPress(); });
+  expect(ui('EditorSheet').props.title).toBe('session.renameTab');
+  expect(ui('Input').props.value).toBe('Logs');
+  act(() => { ui('Input').props.onChangeText('Server logs'); });
+  await act(async () => { await ui('EditorSheet').props.onSave(); });
+  expect(host.props.onRenameSshShell).toHaveBeenCalledWith(shells[1].terminalId, 'Server logs');
+
+  act(() => { tabButtons('session.newTab')[0].props.onPress(); });
+  expect(ui('EditorSheet').props.title).toBe('session.newTab');
+  expect(ui('Input').props.placeholder).toBe('terminal.sshShell');
+  act(() => { ui('Input').props.onChangeText('Deploy'); });
+  await act(async () => { await ui('EditorSheet').props.onSave(); });
+  expect(host.props.onOpenSshShell).toHaveBeenCalledWith('Deploy');
+  act(() => { tabButtons('session.closeTab')[0].props.onPress(); });
+  expect(host.props.onCloseTerminal).toHaveBeenCalledWith(shells[0].terminalId);
+  expect(host.native.requestHerdrApi).not.toHaveBeenCalled();
+});
+
+test('an active SSH tab remains selected when a focused Herdr workspace appears', () => {
+  const host = setup('codex');
+  const shell = {
+    terminalId: '__whip_ssh_shell__:1', paneId: '__whip_ssh_shell__:1',
+    title: 'Build', kind: 'ssh' as const, status: 'connected' as const, reconnectAttempt: 0,
+  };
+  host.props.terminalState = { sessions: [shell], activeTerminalId: shell.terminalId };
+  host.props.terminalTargets = [{
+    key: shell.terminalId, hostSessionId: host.props.hostSessionId, client: host.client, session: shell,
+  }];
+  act(() => { renderer = create(<SessionScreen {...host.props} />); });
+  expect(host.props.onActivateTerminal).not.toHaveBeenCalled();
+  expect(renderer.root.findAll(node => String(node.type) === 'Button' &&
+    node.props.accessibilityLabel === 'session.openTab')).toHaveLength(1);
+  expect(ui('TerminalScreen').props.activeTarget.session.terminalId).toBe(shell.terminalId);
+});
+afterEach(async () => {
+  await act(async () => {
+    renderer?.unmount();
+    await browserRegistry.closeHost('runtime-1');
+  });
+  browserRegistry.registerRuntimes([]);
   agentTranscriptService.reset();
   jest.restoreAllMocks();
 });
@@ -329,6 +613,196 @@ function revealChat() {
   act(() => { viewport.props.onInitialViewportReady(); });
   expect(ui('TerminalScreen').props.chatViewEnabled).toBe(true);
 }
+
+test('Codex identity reads follow visible chat entry and activity without repeating on transcript updates', async () => {
+  const host = setup('codex');
+  const binding = await openReadyChat(host, 'codex');
+  const identityRequest = {
+    method: 'pane.get', params: { pane_id: host.pane.pane_id },
+  };
+  expect(host.native.requestHerdrApi).toHaveBeenCalledTimes(1);
+  expect(host.native.requestHerdrApi).toHaveBeenLastCalledWith(identityRequest);
+  revealChat();
+  act(() => {
+    binding.state = { ...binding.state, revision: 2 };
+    host.handlers.get(binding.terminalId)?.({
+      key: binding.transcriptKey, runtimeIncarnation: binding.runtimeIncarnation,
+      revision: 2, deltas: [{ type: 'reset', state: binding.state }],
+    });
+    renderer.update(<SessionScreen {...host.props} />);
+  });
+  expect(host.native.requestHerdrApi).toHaveBeenCalledTimes(1);
+
+  await act(async () => {
+    host.pane.agent_status = 'working';
+    renderer.update(<SessionScreen {...host.props} snapshot={{ ...host.props.snapshot }} />);
+  });
+  expect(host.native.requestHerdrApi).toHaveBeenCalledTimes(2);
+  expect(host.native.requestHerdrApi).toHaveBeenLastCalledWith(identityRequest);
+
+  // A warm Chat is retained after closing, but does not read identity while hidden.
+  act(() => { control().onPress(); });
+  await act(async () => {
+    host.pane.agent_status = 'idle';
+    renderer.update(<SessionScreen {...host.props} />);
+  });
+  expect(host.native.requestHerdrApi).toHaveBeenCalledTimes(2);
+  await act(async () => { control().onPress(); });
+  expect(host.native.requestHerdrApi).toHaveBeenCalledTimes(3);
+  expect(host.native.openAgentChat).toHaveBeenCalledTimes(1);
+});
+
+test.each(['hidden', 'background'] as const)('Codex identity refreshes once when %s Chat returns', async reason => {
+  const host = setup('codex');
+  await openReadyChat(host, 'codex');
+  revealChat();
+  host.native.requestHerdrApi.mockClear();
+  act(() => {
+    if (reason === 'hidden') renderer.update(<SessionScreen {...host.props} visible={false} />);
+    else for (const listener of mockAppStateListeners) listener('background');
+  });
+  await act(async () => {
+    host.pane.agent_status = 'working';
+    renderer.update(<SessionScreen {...host.props} visible={reason !== 'hidden'} />);
+  });
+  expect(host.native.requestHerdrApi).not.toHaveBeenCalled();
+  await act(async () => {
+    if (reason === 'hidden') renderer.update(<SessionScreen {...host.props} />);
+    else for (const listener of mockAppStateListeners) listener('active');
+  });
+  expect(host.native.requestHerdrApi).toHaveBeenCalledTimes(1);
+  expect(host.native.requestHerdrApi).toHaveBeenCalledWith({
+    method: 'pane.get', params: { pane_id: host.pane.pane_id },
+  });
+  expect(host.native.openAgentChat).toHaveBeenCalledTimes(1);
+});
+
+test('other chat agents do not make Codex identity reads', async () => {
+  const host = setup('opencode');
+  await openReadyChat(host, 'opencode');
+  revealChat();
+  await act(async () => {
+    host.pane.agent_status = 'working';
+    renderer.update(<SessionScreen {...host.props} />);
+  });
+  expect(host.native.requestHerdrApi).not.toHaveBeenCalled();
+});
+
+test('Codex identity refresh skips a detached host runtime', async () => {
+  const host = setup('codex');
+  await openReadyChat(host, 'codex');
+  revealChat();
+  host.native.requestHerdrApi.mockClear();
+  Object.assign(host.client, { activeNative: null });
+  await act(async () => {
+    host.pane.agent_status = 'working';
+    renderer.update(<SessionScreen {...host.props} />);
+  });
+  expect(host.native.requestHerdrApi).not.toHaveBeenCalled();
+});
+
+test('chat web links open in app without a global browser preference', async () => {
+  const host = setup('codex');
+  await openReadyChat(host, 'codex');
+  revealChat();
+  const url = 'https://example.com/docs';
+  await act(async () => { ui('AgentChatView').props.onOpenWebLink(url); });
+  const browsers = renderer.root.findAll(node => String(node.type) === 'WebView' && node.props.source?.uri === url);
+  expect(browsers).toHaveLength(1);
+  expect(browsers[0].parent?.parent?.parent?.props.visible).toBe(true);
+  expect(Linking.openURL).not.toHaveBeenCalled();
+});
+
+test.each([true, false])('chat links use the host browser with tunneling=%s', async tunneling => {
+  const host = setup('codex');
+  const url = 'http://localhost:5173/docs';
+  if (tunneling) mockTunneledHosts.add('saved-host');
+  browserRegistry.registerRuntimes(connectedBrowserRuntimes([
+    { id: 'host-1', hostId: 'saved-host', connectionStatus: 'ready' },
+  ], () => host.native));
+  const identity = { runtimeId: host.native.runtimeId, sessionId: 'manual-host-1-' + host.pane.terminal_id, paneId: host.pane.pane_id, terminalId: host.pane.terminal_id };
+  const entry = browserRegistry.ensure(identity, host.native, false);
+  const navigate = jest.spyOn(entry.controller, 'action').mockResolvedValue({});
+  jest.mocked(supportsBrowserControl).mockReturnValue(true);
+  await openReadyChat(host, 'codex');
+  revealChat();
+  await act(async () => { ui('AgentChatView').props.onOpenWebLink(url); });
+  expect(navigate).toHaveBeenCalledWith('new_tab', { url });
+  expect(browserRegistry.visibleId).toBe(identity.sessionId);
+  expect(ui('BrowserTunnelingSetting').props.runtimeId).toBe(host.native.runtimeId);
+  expect(mockTunneledHosts.has('saved-host')).toBe(tunneling);
+  expect(host.native.startWebPreview).not.toHaveBeenCalled();
+  expect(Linking.openURL).not.toHaveBeenCalled();
+});
+
+test.each(['terminal', 'terminal links'])('%s opens a new tab or focuses the matching tab', async source => {
+  const host = setup('codex');
+  const url = 'https://example.com/docs?view=terminal#setup';
+  const identity = { runtimeId: host.native.runtimeId, sessionId: 'manual-host-1-' + host.pane.terminal_id, paneId: host.pane.pane_id, terminalId: host.pane.terminal_id };
+  const entry = browserRegistry.ensure(identity, host.native, false);
+  const original = entry.controller.tab();
+  entry.controller.navigation(original.id, { url: 'https://example.com/current', title: 'Current page', canGoBack: true, canGoForward: false });
+  const action = jest.spyOn(entry.controller, 'action').mockResolvedValue({});
+  jest.mocked(supportsBrowserControl).mockReturnValue(true);
+  await act(async () => { renderer = create(<SessionScreen {...host.props} />); });
+
+  const openLink = async () => {
+    if (source === 'terminal') {
+      await act(async () => { ui('TerminalScreen').props.onOpenLink(url); });
+      return;
+    }
+    act(() => { ui('TerminalScreen').props.onRequestLinks(); });
+    act(() => { ui('TerminalScreen').props.onLinksScanned([url]); });
+    const link = renderer.root.find(node => String(node.type) === 'Button' && node.findAll(child => String(child.type) === 'Text' && child.props.children === url).length > 0);
+    await act(async () => { link.props.onPress(); });
+  };
+
+  await openLink();
+  expect(action).toHaveBeenCalledTimes(1);
+  expect(action).toHaveBeenCalledWith('new_tab', { url });
+
+  act(() => {
+    const tab = entry.controller.newTab();
+    entry.controller.navigation(tab.id, { url, title: 'Docs', canGoBack: true, canGoForward: false });
+    entry.controller.select(original.id);
+    browserRegistry.hide();
+  });
+  await openLink();
+
+  expect(entry.controller.selectedTabId).toBe(entry.controller.tabs[1].id);
+  expect(browserRegistry.visibleId).toBe(identity.sessionId);
+  expect(entry.controller.tabs).toHaveLength(2);
+  expect(original).toMatchObject({ url: 'https://example.com/current', title: 'Current page', canGoBack: true });
+  expect(action).toHaveBeenCalledTimes(1);
+});
+
+test('legacy browser opens localhost directly when host tunneling is disabled', async () => {
+  const host = setup('codex');
+  const url = 'http://localhost:5173/docs';
+  await openReadyChat(host, 'codex');
+  revealChat();
+  await act(async () => { ui('AgentChatView').props.onOpenWebLink(url); });
+  expect(renderer.root.find(node => String(node.type) === 'WebView' && node.props.source?.uri === url)).toBeDefined();
+  expect(host.native.startWebPreview).not.toHaveBeenCalled();
+  expect(Linking.openURL).not.toHaveBeenCalled();
+});
+
+test('legacy browser cannot silently bypass an enabled host tunnel', async () => {
+  const host = setup('codex');
+  mockTunneledHosts.add('saved-host');
+  browserRegistry.registerRuntimes(connectedBrowserRuntimes([
+    { id: 'host-1', hostId: 'saved-host', connectionStatus: 'ready' },
+  ], () => host.native));
+  await openReadyChat(host, 'codex');
+  revealChat();
+  const url = 'https://example.com/docs';
+  await act(async () => {
+    ui('AgentChatView').props.onOpenWebLink(url);
+  });
+  expect(renderer.root.findAll(node => String(node.type) === 'WebView' && node.props.source?.uri === url)).toHaveLength(0);
+  expect(Linking.openURL).not.toHaveBeenCalled();
+  expect(host.native.startWebPreview).not.toHaveBeenCalled();
+});
 
 function addCachePressure(host: ReturnType<typeof setup>) {
   const first = host.props.terminalState.sessions[0];
@@ -565,6 +1039,7 @@ describe.each(['codex', 'opencode'] as const)('%s SessionScreen', agent => {
     expect(ui('TerminalScreen').props.chatViewEnabled).toBe(false);
     expect(control()).toMatchObject({ active: false, loading: false, disabled: false });
     expect(viewport.parent?.props).toMatchObject({
+      collapsable: false,
       pointerEvents: 'none', accessibilityElementsHidden: true,
       importantForAccessibility: 'no-hide-descendants', style: { opacity: 0 },
     });
@@ -587,6 +1062,9 @@ describe.each(['codex', 'opencode'] as const)('%s SessionScreen', agent => {
     expect(control().loading).toBe(true);
     revealChat();
     expect(ui('TerminalScreen').props.chatViewEnabled).toBe(true);
+    expect(viewport.parent?.props).toMatchObject({
+      collapsable: false, pointerEvents: 'auto', style: { opacity: 1 },
+    });
     expect(control().loading).toBe(false);
     expect(host.native.detachAgentChat).not.toHaveBeenCalled();
     expect(host.native.openAgentChat).toHaveBeenCalledTimes(1);
@@ -728,7 +1206,8 @@ describe.each(['codex', 'opencode'] as const)('%s SessionScreen', agent => {
     expect(listenToChat).toHaveBeenCalledTimes(1);
   });
 
-  test('the shared TTS setting starts and stops reading the selected chat', async () => {
+  test.each(['android', 'ios'] as const)('the shared TTS setting starts and stops reading the selected chat on %s', async platform => {
+    Platform.OS = platform;
     const host = setup(agent);
     await openReadyChat(host, agent);
     revealChat();
@@ -877,7 +1356,7 @@ describe.each(['codex', 'opencode'] as const)('%s SessionScreen', agent => {
     const binding = await openReadyChat(host, agent);
     revealChat();
     const archive = { namespace: 'host-1', key: binding.transcriptKey, blob: new Uint8Array([9, 8]).buffer };
-    const save = jest.spyOn(agentChatCache, 'saveNative').mockResolvedValue();
+    const save = jest.spyOn(agentChatCache, 'saveNative').mockResolvedValue(true);
     host.native.detachAgentChat.mockReturnValue(archive);
     const visits = addCachePressure(host);
     host.injected.length = 0;

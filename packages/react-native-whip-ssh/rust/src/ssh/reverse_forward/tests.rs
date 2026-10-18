@@ -1,0 +1,610 @@
+use super::*;
+use crate::ssh::{AgentState, ConnectionLifecycle, RusshHandler, SshSession};
+use std::error::Error;
+use std::future::{Future, ready};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+use russh::server;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+
+#[derive(Default)]
+struct ServerState {
+    listeners: RwLock<HashMap<u16, watch::Sender<bool>>>,
+    handle: RwLock<Option<server::Handle>>,
+    allocated: AtomicUsize,
+    cancelled: AtomicUsize,
+    home: RwLock<String>,
+    home_lookups: AtomicUsize,
+    fail_home: AtomicBool,
+    sftp_requests: AtomicUsize,
+    sftp_bytes_read: AtomicUsize,
+    sftp_started: tokio::sync::Notify,
+    sftp_gate: RwLock<Option<Arc<Semaphore>>>,
+    fail_sftp: AtomicBool,
+}
+
+/// A real SSH server on loopback, with actual remote TCP listeners. Tests use
+/// the production forwarded-channel handler and owned forward implementation.
+pub(crate) struct Fixture {
+    pub(crate) ssh: Arc<SshSession>,
+    state: Arc<ServerState>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        self.task.abort();
+        for cancel in self
+            .state
+            .listeners
+            .write()
+            .drain()
+            .map(|(_, cancel)| cancel)
+        {
+            cancel.send_replace(true);
+        }
+        let ssh = self.ssh.clone();
+        if let Ok(runtime) = crate::runtime() {
+            runtime.spawn(async move { ssh.disconnect().await });
+        }
+    }
+}
+
+impl Fixture {
+    pub(crate) async fn new(allow: bool, delay: Duration) -> Result<Self, Box<dyn Error>> {
+        let mut rng =
+            russh::keys::ssh_key::rand_core::UnwrapErr(russh::keys::ssh_key::getrandom::SysRng);
+        let key = russh::keys::PrivateKey::random(&mut rng, russh::keys::Algorithm::Ed25519)?;
+        let public_key = key.public_key().clone();
+        let config = Arc::new(server::Config {
+            keys: vec![key],
+            auth_rejection_time: Duration::ZERO,
+            ..Default::default()
+        });
+        let listener = TcpListener::bind((BIND_ADDRESS, 0)).await?;
+        let address = listener.local_addr()?;
+        let state = Arc::new(ServerState {
+            home: RwLock::new("/home/test".to_owned()),
+            ..ServerState::default()
+        });
+        let server_state = state.clone();
+        let task = tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let handler = ForwardServer {
+                state: server_state,
+                allow,
+                delay,
+                channels: HashMap::new(),
+            };
+            if let Ok(session) = server::run_stream(config, stream, handler).await {
+                let _ = session.await;
+            }
+        });
+        let lifecycle = Arc::new(ConnectionLifecycle::default());
+        let agent = Arc::new(AgentState::default());
+        let reverse_forwards = Arc::new(Routes::default());
+        let client = RusshHandler {
+            host: BIND_ADDRESS.to_owned(),
+            port: address.port(),
+            agent: agent.clone(),
+            lifecycle: lifecycle.clone(),
+            reverse_forwards: reverse_forwards.clone(),
+            fixture_key: Some(public_key),
+        };
+        let mut handle =
+            client::connect(Arc::new(client::Config::default()), address, client).await?;
+        assert!(handle.authenticate_none("test").await?.success());
+        let ssh = Arc::new(SshSession {
+            inner: Arc::new(Session {
+                handle,
+                agent,
+                lifecycle,
+                reverse_forwards,
+                remote_home: tokio::sync::Mutex::new(None),
+            }),
+            resource_key: format!("reverse-forward-test-{}", address.port()),
+        });
+        Ok(Self { ssh, state, task })
+    }
+
+    pub(crate) fn local_port(&self, remote_port: u16) -> Option<u16> {
+        self.ssh
+            .inner
+            .reverse_forwards
+            .read()
+            .get(&remote_port)
+            .map(|route| route.target.port())
+    }
+
+    pub(crate) fn home_lookups(&self) -> usize {
+        self.state.home_lookups.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_home(&self, home: &str) {
+        *self.state.home.write() = home.to_owned();
+    }
+
+    pub(crate) fn fail_next_home(&self) {
+        self.state.fail_home.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn pause_sftp(&self) -> Arc<Semaphore> {
+        let gate = Arc::new(Semaphore::new(0));
+        *self.state.sftp_gate.write() = Some(gate.clone());
+        gate
+    }
+
+    pub(crate) async fn sftp_started(&self) {
+        self.state.sftp_started.notified().await;
+    }
+
+    pub(crate) fn sftp_requests(&self) -> usize {
+        self.state.sftp_requests.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn sftp_bytes_read(&self) -> usize {
+        self.state.sftp_bytes_read.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn fail_next_sftp(&self) {
+        self.state.fail_sftp.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn shared_ssh(&self) -> Arc<SshSession> {
+        Arc::new(SshSession {
+            inner: self.ssh.inner.clone(),
+            resource_key: self.ssh.resource_key.clone(),
+        })
+    }
+}
+
+struct ForwardServer {
+    state: Arc<ServerState>,
+    allow: bool,
+    delay: Duration,
+    channels: HashMap<russh::ChannelId, russh::Channel<server::Msg>>,
+}
+impl Drop for ForwardServer {
+    fn drop(&mut self) {
+        for cancel in self
+            .state
+            .listeners
+            .write()
+            .drain()
+            .map(|(_, cancel)| cancel)
+        {
+            cancel.send_replace(true);
+        }
+    }
+}
+impl server::Handler for ForwardServer {
+    type Error = russh::Error;
+
+    async fn channel_open_session(
+        &mut self,
+        channel: russh::Channel<server::Msg>,
+        reply: server::ChannelOpenHandle,
+        _session: &mut server::Session,
+    ) -> Result<(), Self::Error> {
+        self.channels.insert(channel.id(), channel);
+        reply.accept().await;
+        Ok(())
+    }
+
+    fn subsystem_request(
+        &mut self,
+        channel_id: russh::ChannelId,
+        name: &str,
+        session: &mut server::Session,
+    ) -> impl Future<Output = Result<(), Self::Error>> {
+        assert_eq!(name, "sftp");
+        let channel = self.channels.remove(&channel_id).unwrap();
+        if let Err(error) = session.channel_success(channel_id) {
+            return ready(Err(error));
+        }
+        let handler = SftpServer(self.state.clone());
+        tokio::spawn(async move {
+            russh_sftp::server::run(channel.into_stream(), handler).await;
+        });
+        ready(Ok(()))
+    }
+
+    async fn exec_request(
+        &mut self,
+        channel: russh::ChannelId,
+        command: &[u8],
+        session: &mut server::Session,
+    ) -> Result<(), Self::Error> {
+        assert_eq!(command, crate::ssh::REMOTE_HOME_COMMAND.as_bytes());
+        self.channels.remove(&channel);
+        self.state.home_lookups.fetch_add(1, Ordering::Relaxed);
+        session.channel_success(channel)?;
+        tokio::time::sleep(self.delay).await;
+        let failed = self.state.fail_home.swap(false, Ordering::Relaxed);
+        if !failed {
+            session.data(channel, self.state.home.read().as_bytes().to_vec())?;
+        }
+        session.exit_status_request(channel, u32::from(failed))?;
+        session.eof(channel)?;
+        session.close(channel)?;
+        Ok(())
+    }
+
+    async fn channel_open_direct_tcpip(
+        &mut self,
+        channel: russh::Channel<server::Msg>,
+        host: &str,
+        port: u32,
+        _originator: &str,
+        _originator_port: u32,
+        reply: server::ChannelOpenHandle,
+        _session: &mut server::Session,
+    ) -> Result<(), Self::Error> {
+        if !self.allow {
+            return Ok(());
+        }
+        let Ok(port) = u16::try_from(port) else {
+            return Ok(());
+        };
+        let Ok(mut target) = TcpStream::connect((host, port)).await else {
+            return Ok(());
+        };
+        reply.accept().await;
+        tokio::spawn(async move {
+            let mut stream = channel.into_stream();
+            let _ = tokio::io::copy_bidirectional(&mut stream, &mut target).await;
+        });
+        Ok(())
+    }
+
+    fn auth_none(
+        &mut self,
+        _user: &str,
+    ) -> impl Future<Output = Result<server::Auth, Self::Error>> {
+        ready(Ok(server::Auth::Accept))
+    }
+
+    async fn tcpip_forward(
+        &mut self,
+        address: &str,
+        port: &mut u32,
+        session: &mut server::Session,
+    ) -> Result<bool, Self::Error> {
+        if !self.allow || address != BIND_ADDRESS {
+            return Ok(false);
+        }
+        let Ok(requested) = u16::try_from(*port) else {
+            return Ok(false);
+        };
+        let Ok(listener) = TcpListener::bind((BIND_ADDRESS, requested)).await else {
+            return Ok(false);
+        };
+        let allocated = listener.local_addr()?.port();
+        *port = u32::from(allocated);
+        let (stop, mut stopped) = watch::channel(false);
+        self.state.listeners.write().insert(allocated, stop);
+        self.state.allocated.fetch_add(1, Ordering::Relaxed);
+        let handle = session.handle();
+        *self.state.handle.write() = Some(handle.clone());
+        tokio::spawn(async move {
+            loop {
+                let connection = tokio::select! {
+                    result = listener.accept() => result,
+                    _ = stopped.changed() => break,
+                };
+                let Ok((mut source, peer)) = connection else {
+                    break;
+                };
+                let handle = handle.clone();
+                tokio::spawn(async move {
+                    let Ok(channel) = handle
+                        .channel_open_forwarded_tcpip(
+                            BIND_ADDRESS,
+                            u32::from(allocated),
+                            peer.ip().to_string(),
+                            u32::from(peer.port()),
+                        )
+                        .await
+                    else {
+                        return;
+                    };
+                    let mut target = channel.into_stream();
+                    let _ = tokio::io::copy_bidirectional(&mut source, &mut target).await;
+                });
+            }
+        });
+        tokio::time::sleep(self.delay).await;
+        Ok(true)
+    }
+
+    fn cancel_tcpip_forward(
+        &mut self,
+        address: &str,
+        port: u32,
+        _session: &mut server::Session,
+    ) -> impl Future<Output = Result<bool, Self::Error>> {
+        if address != BIND_ADDRESS {
+            return ready(Ok(false));
+        }
+        let Some(cancel) = u16::try_from(port)
+            .ok()
+            .and_then(|port| self.state.listeners.write().remove(&port))
+        else {
+            return ready(Ok(false));
+        };
+        cancel.send_replace(true);
+        self.state.cancelled.fetch_add(1, Ordering::Relaxed);
+        ready(Ok(true))
+    }
+}
+
+struct SftpServer(Arc<ServerState>);
+
+impl russh_sftp::server::Handler for SftpServer {
+    type Error = russh_sftp::protocol::StatusCode;
+
+    fn unimplemented(&self) -> Self::Error {
+        russh_sftp::protocol::StatusCode::OpUnsupported
+    }
+
+    async fn init(
+        &mut self,
+        _version: u32,
+        _extensions: HashMap<String, String>,
+    ) -> Result<russh_sftp::protocol::Version, Self::Error> {
+        self.0.sftp_requests.fetch_add(1, Ordering::Relaxed);
+        self.0.sftp_started.notify_one();
+        let gate = self.0.sftp_gate.read().clone();
+        if let Some(gate) = gate {
+            gate.acquire().await.unwrap().forget();
+        }
+        if self.0.fail_sftp.swap(false, Ordering::Relaxed) {
+            return Err(russh_sftp::protocol::StatusCode::Failure);
+        }
+        Ok(russh_sftp::protocol::Version::new())
+    }
+
+    async fn stat(
+        &mut self,
+        id: u32,
+        path: String,
+    ) -> Result<russh_sftp::protocol::Attrs, Self::Error> {
+        let metadata = tokio::fs::metadata(path)
+            .await
+            .map_err(|_| russh_sftp::protocol::StatusCode::NoSuchFile)?;
+        Ok(russh_sftp::protocol::Attrs {
+            id,
+            attrs: (&metadata).into(),
+        })
+    }
+
+    async fn open(
+        &mut self,
+        id: u32,
+        filename: String,
+        _pflags: russh_sftp::protocol::OpenFlags,
+        _attrs: russh_sftp::protocol::FileAttributes,
+    ) -> Result<russh_sftp::protocol::Handle, Self::Error> {
+        tokio::fs::File::open(&filename)
+            .await
+            .map_err(|_| russh_sftp::protocol::StatusCode::NoSuchFile)?;
+        Ok(russh_sftp::protocol::Handle {
+            id,
+            handle: filename,
+        })
+    }
+
+    async fn fstat(
+        &mut self,
+        id: u32,
+        handle: String,
+    ) -> Result<russh_sftp::protocol::Attrs, Self::Error> {
+        self.stat(id, handle).await
+    }
+
+    async fn read(
+        &mut self,
+        id: u32,
+        handle: String,
+        offset: u64,
+        len: u32,
+    ) -> Result<russh_sftp::protocol::Data, Self::Error> {
+        let mut file = tokio::fs::File::open(handle)
+            .await
+            .map_err(|_| russh_sftp::protocol::StatusCode::NoSuchFile)?;
+        file.seek(std::io::SeekFrom::Start(offset))
+            .await
+            .map_err(|_| russh_sftp::protocol::StatusCode::Failure)?;
+        let mut bytes = Vec::new();
+        file.take(u64::from(len))
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(|_| russh_sftp::protocol::StatusCode::Failure)?;
+        if bytes.is_empty() {
+            return Err(russh_sftp::protocol::StatusCode::Eof);
+        }
+        self.0
+            .sftp_bytes_read
+            .fetch_add(bytes.len(), Ordering::Relaxed);
+        Ok(russh_sftp::protocol::Data { id, data: bytes })
+    }
+
+    fn close(
+        &mut self,
+        id: u32,
+        _handle: String,
+    ) -> impl Future<Output = Result<russh_sftp::protocol::Status, Self::Error>> {
+        ready(Ok(russh_sftp::protocol::Status {
+            id,
+            status_code: russh_sftp::protocol::StatusCode::Ok,
+            error_message: String::new(),
+            language_tag: String::new(),
+        }))
+    }
+}
+
+async fn wait_until(check: impl Fn() -> bool) -> Result<(), Box<dyn Error>> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !check() {
+        if std::time::Instant::now() >= deadline {
+            return Err("SSH cleanup timed out".into());
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    Ok(())
+}
+
+#[test]
+fn reverse_forward_moves_bytes_over_ssh_and_closes_active_streams_on_drop()
+-> Result<(), Box<dyn Error>> {
+    crate::runtime()?.block_on(async {
+        let fixture = Fixture::new(true, Duration::ZERO).await?;
+        let target = TcpListener::bind((BIND_ADDRESS, 0)).await?;
+        let owned = fixture
+            .ssh
+            .open_remote_forward(target.local_addr()?.port())
+            .await?;
+        let remote_port = owned.port;
+        let mut remote = TcpStream::connect((BIND_ADDRESS, remote_port)).await?;
+        remote.write_all(b"hello").await?;
+        let (mut local, _) =
+            tokio::time::timeout(Duration::from_secs(2), target.accept()).await??;
+        let mut message = [0; 5];
+        local.read_exact(&mut message).await?;
+        assert_eq!(&message, b"hello");
+        local.write_all(b"world").await?;
+        remote.read_exact(&mut message).await?;
+        assert_eq!(&message, b"world");
+        drop(owned);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), remote.read(&mut message)).await??,
+            0
+        );
+        wait_until(|| fixture.state.listeners.read().is_empty()).await?;
+        assert!(fixture.ssh.inner.reverse_forwards.read().is_empty());
+        assert!(
+            TcpStream::connect((BIND_ADDRESS, remote_port))
+                .await
+                .is_err()
+        );
+        Ok(())
+    })
+}
+
+#[test]
+fn unexpected_server_channels_cannot_reach_arbitrary_local_ports_or_other_hosts()
+-> Result<(), Box<dyn Error>> {
+    crate::runtime()?.block_on(async {
+        let fixture = Fixture::new(true, Duration::ZERO).await?;
+        let target = TcpListener::bind((BIND_ADDRESS, 0)).await?;
+        let owned = fixture
+            .ssh
+            .open_remote_forward(target.local_addr()?.port())
+            .await?;
+        let handle = fixture
+            .state
+            .handle
+            .read()
+            .clone()
+            .ok_or("missing server handle")?;
+        for (address, port, origin) in [
+            ("0.0.0.0", u32::from(owned.port), BIND_ADDRESS),
+            (BIND_ADDRESS, u32::from(owned.port) + 1, BIND_ADDRESS),
+            (BIND_ADDRESS, u32::from(owned.port), "203.0.113.9"),
+        ] {
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_secs(2),
+                    handle.channel_open_forwarded_tcpip(address, port, origin, 1234),
+                )
+                .await?
+                .is_err()
+            );
+        }
+        let other = Fixture::new(true, Duration::ZERO).await?;
+        let other_owned = other
+            .ssh
+            .open_remote_forward(target.local_addr()?.port())
+            .await?;
+        let other_handle = other
+            .state
+            .handle
+            .read()
+            .clone()
+            .ok_or("missing second server handle")?;
+        assert_ne!(owned.port, other_owned.port);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                other_handle.channel_open_forwarded_tcpip(
+                    BIND_ADDRESS,
+                    u32::from(owned.port),
+                    BIND_ADDRESS,
+                    1234
+                ),
+            )
+            .await?
+            .is_err()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), target.accept())
+                .await
+                .is_err()
+        );
+        Ok(())
+    })
+}
+
+#[test]
+fn cancelled_forward_startup_releases_a_late_remote_allocation() -> Result<(), Box<dyn Error>> {
+    crate::runtime()?.block_on(async {
+        let fixture = Fixture::new(true, Duration::from_millis(150)).await?;
+        let target = TcpListener::bind((BIND_ADDRESS, 0)).await?;
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(25),
+                fixture.ssh.open_remote_forward(target.local_addr()?.port()),
+            )
+            .await
+            .is_err()
+        );
+        wait_until(|| fixture.state.cancelled.load(Ordering::Relaxed) == 1).await?;
+        assert_eq!(fixture.state.allocated.load(Ordering::Relaxed), 1);
+        assert!(fixture.state.listeners.read().is_empty());
+        assert!(fixture.ssh.inner.reverse_forwards.read().is_empty());
+        Ok(())
+    })
+}
+
+#[test]
+fn host_disconnect_closes_forwarded_connections_and_rejects_new_routes()
+-> Result<(), Box<dyn Error>> {
+    crate::runtime()?.block_on(async {
+        let fixture = Fixture::new(true, Duration::ZERO).await?;
+        let target = TcpListener::bind((BIND_ADDRESS, 0)).await?;
+        let owned = fixture
+            .ssh
+            .open_remote_forward(target.local_addr()?.port())
+            .await?;
+        let mut remote = TcpStream::connect((BIND_ADDRESS, owned.port)).await?;
+        let (_local, _) = tokio::time::timeout(Duration::from_secs(2), target.accept()).await??;
+        fixture.ssh.disconnect().await;
+        let mut buffer = [0];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), remote.read(&mut buffer)).await??,
+            0
+        );
+        assert!(
+            fixture
+                .ssh
+                .open_remote_forward(target.local_addr()?.port())
+                .await
+                .is_err()
+        );
+        assert!(fixture.ssh.inner.reverse_forwards.read().is_empty());
+        Ok(())
+    })
+}

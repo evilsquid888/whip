@@ -1,8 +1,9 @@
-import type { RuntimePreviewInfo, RuntimeRemoteFileEntry } from 'react-native-whip-ssh';
+import type { RuntimePreviewInfo, RuntimeRemoteDirectoryListing, RuntimeRemoteFileEntry } from 'react-native-whip-ssh';
+import { formatGitDiffSelection } from 'react-native-whip-ssh';
 import * as WebBrowser from 'expo-web-browser';
 import { ArrowDown, ArrowUp, Check, ChevronDown, ChevronLeft, ChevronRight, Download, ExternalLink, FileCode2, FileMusic, FileText, FileVideo, Folder, FolderOpen, GitCompareArrows, Image as ImageIcon, Pencil, RefreshCw, SlidersHorizontal, Trash2, Upload, X } from 'lucide-react-native';
 import { useCallback, useEffect, useEffectEvent, useMemo, useRef, useState, type ReactNode } from 'react';
-import { ActivityIndicator, Alert, AppState, FlatList, Modal, PanResponder, Pressable, ScrollView, View } from 'react-native';
+import { ActivityIndicator, Alert, AppState, FlatList, Modal, PanResponder, Pressable, View } from 'react-native';
 import Animated, { cancelAnimation, useAnimatedStyle, useSharedValue, withSpring } from 'react-native-reanimated';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useTranslation } from 'react-i18next';
@@ -15,7 +16,9 @@ import type { HerdrClient } from '@/src/services/HerdrClient';
 import { cacheRemoteFile, copyCachedRemoteFileToPickedDirectory, pickLocalFileForUpload, saveCachedRemoteText, type CachedRemoteFile } from '@/src/services/remoteFileTransfer';
 import { bestEffortCleanup, reportBackgroundFailure } from '../services/backgroundOperations';
 import { useRemoteFileViewPreferences } from '@/src/hooks/useRemoteFileViewPreferences';
+import { useGitReviewRefresh } from '@/src/hooks/useGitReviewRefresh';
 import { loadRemoteGitCollapsedPaths, loadRemoteGitMode, saveRemoteGitCollapsedPaths, saveRemoteGitMode } from '@/src/services/remoteGitPreferences';
+import { gitReviewKey, loadGitReviewState, rememberGitReviewState, type GitReviewState } from '@/src/services/gitReviewState';
 import { colorWithAlpha, useTheme, type ThemeColors } from '@/src/theme';
 import { hapticPress } from './app-ui';
 import { CodeEditor, CodePreview } from './CodePreview';
@@ -25,7 +28,9 @@ import { MarkdownPreview } from './MarkdownPreview';
 import { MermaidPreview } from './MermaidPreview';
 import { RemoteGitDiffPreview } from './RemoteGitDiffPreview';
 import { RemoteAudioPreview } from './RemoteAudioPreview';
+import { RemoteFileContextSheet } from './RemoteFileContextSheet';
 import { RemoteTextPreview } from './RemoteTextPreview';
+import { PagedRemoteTextPreview } from './PagedRemoteTextPreview';
 import { RemoteVideoPreview } from './RemoteVideoPreview';
 import { SvgPreview } from './SvgPreview';
 import { ZoomableImagePreview } from './ZoomableImagePreview';
@@ -35,8 +40,48 @@ import { Switch } from './ui/switch';
 import { Text } from './ui/text';
 
 const REMOTE_PREVIEW_CLOSE_CONTEXT = 'remote-preview-close';
+const GIT_STATUS_NAVIGATION_TTL_MS = 30_000;
+
+function remoteConnectionRequest(client: HerdrClient) {
+  const native = client.native;
+  const generation = native.status().generation;
+  return {
+    native,
+    generation,
+    isCurrent: () => {
+      if (client.activeNative !== native) return false;
+      const status = native.status();
+      return status.generation === generation && status.state === 'connected';
+    },
+  };
+}
+
+interface GitNavigationContext {
+  connection: ReturnType<typeof remoteConnectionRequest>;
+  hostId: string;
+  repository: RemoteGitRepository;
+  enabled: boolean;
+  modeSave: Promise<void> | null;
+  collapsedPathsLoaded: boolean;
+  collapsedPathsLoad: Promise<string[]> | null;
+}
+
+function createGitContext(connection: GitNavigationContext['connection'], hostId: string, repository: RemoteGitRepository, enabled: boolean): GitNavigationContext {
+  return { connection, hostId, repository, enabled, modeSave: null, collapsedPathsLoaded: false, collapsedPathsLoad: null };
+}
+
+function matchesGitContext(context: GitNavigationContext | null, connection: GitNavigationContext['connection'], hostId: string, root: string): context is GitNavigationContext {
+  return context?.hostId === hostId && context.repository.root === root
+    && context.connection.native === connection.native && context.connection.generation === connection.generation;
+}
+
+function isInsideRepository(path: string, root: string): boolean {
+  return path === root || path.startsWith(root === '/' ? root : `${root}/`);
+}
 
 interface Props {
+  agentWorking?: boolean;
+  onAskAgent?: (text: string) => boolean;
   visible: boolean;
   client: HerdrClient;
   hostId: string;
@@ -48,6 +93,7 @@ interface Props {
 }
 
 interface FilePreview {
+  reviewState?: GitReviewState;
   entry: RuntimeRemoteFileEntry;
   path: string;
   kind: RemotePreviewKind;
@@ -65,15 +111,20 @@ interface FilePreview {
 }
 
 const remoteFileSortFields: RemoteFileSortField[] = ['name', 'modified', 'size'];
-const remoteGitListContentStyle = {
+const remoteFileListContentStyle = {
   paddingHorizontal: 12,
   paddingVertical: 4,
+} as const;
+const remoteDirectoryListOptions = {
+  initialNumToRender: 16,
+  maxToRenderPerBatch: 16,
+  windowSize: 5,
 } as const;
 const remoteGitTreeIndentStyles = Array.from({ length: 16 }, (_, depth) => ({
   paddingLeft: 8 + depth * 16,
 }));
 
-export function RemoteFileManager({ visible, client, hostId, initialPath, initialFilePath, initialLine, onPathChange, onClose }: Props) {
+export function RemoteFileManager({ visible, client, hostId, initialPath, initialFilePath, initialLine, onPathChange, onClose, onAskAgent, agentWorking = false }: Props) {
   const { colors } = useTheme();
   const { t } = useTranslation();
   const safeAreaInsets = useSafeAreaInsets();
@@ -94,17 +145,31 @@ export function RemoteFileManager({ visible, client, hostId, initialPath, initia
   const [discardAction, setDiscardAction] = useState<(() => void) | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [preview, setPreview] = useState<FilePreview | null>(null);
+  const [contextEntry, setContextEntry] = useState<RuntimeRemoteFileEntry | null>(null);
+  const longPressedPath = useRef<string | null>(null);
   const [sortMenuVisible, setSortMenuVisible] = useState(false);
   const [gitRepository, setGitRepository] = useState<RemoteGitRepository | null>(null);
   const [gitMode, setGitMode] = useState(false);
   const [gitStatus, setGitStatus] = useState<RemoteGitStatusEntry[]>([]);
   const [gitCollapsedPaths, setGitCollapsedPaths] = useState<Set<string>>(new Set());
+  const gitCollapsedPathsRef = useRef(gitCollapsedPaths);
   const [gitBusy, setGitBusy] = useState(false);
   const [gitError, setGitError] = useState<string | null>(null);
+  const [reviewRefreshVersion, setReviewRefreshVersion] = useState(0);
   const previewRef = useRef<FilePreview | null>(null);
   const pathRef = useRef('');
   const requestRef = useRef(0);
   const gitRequestRef = useRef(0);
+  const gitPendingRef = useRef<number | null>(null);
+  const gitContextRef = useRef<GitNavigationContext | null>(null);
+  const gitStatusSnapshotRef = useRef<{
+    native: HerdrClient['native']; generation: ReturnType<HerdrClient['native']['status']>['generation']; root: string;
+    changes: RemoteGitStatusEntry[]; updatedAt: number;
+  } | null>(null);
+  const gitStatusLoadRef = useRef<{
+    connection: ReturnType<typeof remoteConnectionRequest>; root: string;
+    promise: Promise<RemoteGitStatusEntry[]>;
+  } | null>(null);
   const pdfBrowserRequestRef = useRef<number | null>(null);
   const pdfBrowserLeftAppRef = useRef(false);
   const onPathChangeRef = useRef(onPathChange);
@@ -113,6 +178,8 @@ export function RemoteFileManager({ visible, client, hostId, initialPath, initia
   const sortedEntries = useMemo(() => sortRemoteEntries(visibleEntries, sortField, sortDirection), [sortDirection, sortField, visibleEntries]);
   const visibleGitStatus = useMemo(() => (showHiddenFiles ? gitStatus : gitStatus.filter(status => !isRemoteHiddenPath(status.path))), [gitStatus, showHiddenFiles]);
   const gitTreeRows = useMemo(() => buildRemoteGitTreeRows(visibleGitStatus, gitCollapsedPaths), [gitCollapsedPaths, visibleGitStatus]);
+  const gitReviewFiles = useMemo(() => buildRemoteGitTreeRows(visibleGitStatus, new Set()).flatMap(row => row.kind === 'file' ? [row.status] : []), [visibleGitStatus]);
+  const gitReviewIndex = preview?.gitStatus ? gitReviewFiles.findIndex(status => status.path === preview.gitStatus?.path) : -1;
 
   const replacePreview = useCallback(
     (next: FilePreview | null) => {
@@ -130,51 +197,176 @@ export function RemoteFileManager({ visible, client, hostId, initialPath, initia
     [client],
   );
 
+  const replaceGitCollapsedPaths = useCallback((next: Set<string>) => {
+    gitCollapsedPathsRef.current = next;
+    setGitCollapsedPaths(next);
+  }, []);
+
+  const clearGitContext = useCallback(() => {
+    gitContextRef.current = null;
+    setGitRepository(null);
+    setGitMode(false);
+    setGitStatus([]);
+    replaceGitCollapsedPaths(new Set());
+    setGitBusy(false);
+    setGitError(null);
+  }, [replaceGitCollapsedPaths]);
+
+  const restoreGitCollapsedPaths = useCallback(async (context: GitNavigationContext, isCurrent: () => boolean) => {
+    if (context.collapsedPathsLoaded) return;
+    const pending = context.collapsedPathsLoad ?? loadRemoteGitCollapsedPaths(context.hostId, context.repository.root);
+    context.collapsedPathsLoad = pending;
+    try {
+      const paths = await pending;
+      if (!isCurrent() || context.collapsedPathsLoaded) return;
+      replaceGitCollapsedPaths(new Set(paths));
+      context.collapsedPathsLoaded = true;
+    } finally {
+      if (context.collapsedPathsLoad === pending) context.collapsedPathsLoad = null;
+    }
+  }, [replaceGitCollapsedPaths]);
+
+  const rememberGitStatus = useCallback((connection: ReturnType<typeof remoteConnectionRequest>, root: string, changes: RemoteGitStatusEntry[]) => {
+    gitStatusSnapshotRef.current = { native: connection.native, generation: connection.generation, root, changes, updatedAt: Date.now() };
+  }, []);
+
+  const loadGitStatus = useCallback(async (connection: ReturnType<typeof remoteConnectionRequest>, root: string) => {
+    const pending = gitStatusLoadRef.current;
+    if (pending?.connection.native === connection.native && pending.connection.generation === connection.generation && pending.root === root) {
+      return pending.promise;
+    }
+    const request = { connection, root, promise: connection.native.gitStatus(root) };
+    gitStatusLoadRef.current = request;
+    try {
+      const changes = await request.promise;
+      if (connection.isCurrent() && matchesGitContext(gitContextRef.current, connection, hostId, root)) {
+        rememberGitStatus(connection, root, changes);
+      }
+      return changes;
+    } finally {
+      if (gitStatusLoadRef.current === request) gitStatusLoadRef.current = null;
+    }
+  }, [hostId, rememberGitStatus]);
+
   const loadDirectory = useCallback(
-    async (requestedPath: string) => {
+    async (requestedPath: string, useCache = true) => {
       const request = ++requestRef.current;
-      gitRequestRef.current += 1;
+      const gitRequest = ++gitRequestRef.current;
+      gitPendingRef.current = gitRequest;
       setBusy(true);
       setError(null);
-      setGitBusy(false);
-      setGitError(null);
-      setGitRepository(null);
-      setGitMode(false);
-      setGitStatus([]);
-      setGitCollapsedPaths(new Set());
+      const knownContext = gitContextRef.current;
+      const retainedContext = knownContext?.hostId === hostId
+        && knownContext.connection.native === client.activeNative
+        && knownContext.connection.isCurrent()
+        && isInsideRepository(requestedPath, knownContext.repository.root)
+        ? knownContext : null;
+      if (!retainedContext) clearGitContext();
       replacePreview(null);
-      try {
-        const listing = await client.native.listDirectory(requestedPath);
-        if (request !== requestRef.current) return;
-        let repository: RemoteGitRepository | null = null;
-        let persistedGitMode = false;
-        let changes: RemoteGitStatusEntry[] = [];
-        let collapsedPaths: string[] = [];
-        try {
-          repository = await client.native.discoverGitRepository(listing.path);
-          if (repository) {
-            [persistedGitMode, collapsedPaths] = await Promise.all([loadRemoteGitMode(hostId, repository.root), loadRemoteGitCollapsedPaths(hostId, repository.root)]);
-            if (persistedGitMode) changes = await client.native.gitStatus(repository.root);
-          }
-        } catch (reason) {
-          if (persistedGitMode) setGitError(String(reason));
-        }
-        if (request !== requestRef.current) return;
+      let connectionIsCurrent = () => true;
+      let cachedPath: string | null = null;
+      const showListing = (listing: RuntimeRemoteDirectoryListing) => {
         pathRef.current = listing.path;
         setPath(listing.path);
         setEntries(listing.entries);
-        setGitRepository(repository);
-        setGitMode(Boolean(repository && persistedGitMode));
-        setGitStatus(changes);
-        setGitCollapsedPaths(new Set(collapsedPaths));
-        onPathChangeRef.current(listing.path);
+        setBusy(false);
+        if (cachedPath !== listing.path) onPathChangeRef.current(listing.path);
+      };
+      try {
+        const connection = remoteConnectionRequest(client);
+        const { native } = connection;
+        connectionIsCurrent = connection.isCurrent;
+        const cached = useCache ? native.cachedDirectory(requestedPath) : null;
+        if (cached && connectionIsCurrent()) {
+          showListing(cached);
+          cachedPath = cached.path;
+        }
+        const listing = await native.listDirectory(requestedPath);
+        if (request !== requestRef.current || !connectionIsCurrent()) {
+          if (gitRequest === gitRequestRef.current) gitPendingRef.current = null;
+          return;
+        }
+        showListing(listing);
+        // Git has its own request lifetime: opening a file may change requestRef
+        // without changing the directory whose Git preferences we are restoring.
+        const gitIsCurrent = () => gitRequest === gitRequestRef.current && connectionIsCurrent();
+        if (!gitIsCurrent()) return;
+        // Listings include hidden entries, so a nested .git file or directory
+        // invalidates the inherited root without rediscovering ordinary children.
+        const nestedRepository = retainedContext && listing.path !== retainedContext.repository.root
+          && listing.entries.some(entry => entry.name === '.git');
+        const reuseRepository = retainedContext && useCache && !nestedRepository
+          && isInsideRepository(listing.path, retainedContext.repository.root);
+        if (!reuseRepository) setGitBusy(true);
+        const restoreGit = async () => {
+          let persistedGitMode = false;
+          try {
+            const repository = reuseRepository ? retainedContext.repository : await native.discoverGitRepository(listing.path);
+            if (!gitIsCurrent()) return;
+            if (!repository) {
+              if (gitContextRef.current) clearGitContext();
+              return;
+            }
+            let context = retainedContext?.repository.root === repository.root ? retainedContext : null;
+            if (!context) {
+              if (gitContextRef.current) clearGitContext();
+              setGitRepository(repository);
+              const enabled = await loadRemoteGitMode(hostId, repository.root);
+              if (!gitIsCurrent()) return;
+              context = createGitContext(connection, hostId, repository, enabled);
+              gitContextRef.current = context;
+            } else {
+              context.repository = repository;
+              setGitRepository(repository);
+            }
+            if (context.modeSave) {
+              await context.modeSave;
+              if (!gitIsCurrent()) return;
+            }
+            persistedGitMode = context.enabled;
+            if (!context.enabled) {
+              setGitMode(false);
+            } else {
+              const snapshot = gitStatusSnapshotRef.current;
+              const cachedStatus = snapshot?.native === native && snapshot.generation === connection.generation
+                && snapshot.root === repository.root && Date.now() - snapshot.updatedAt < GIT_STATUS_NAVIGATION_TTL_MS;
+              if (!cachedStatus || !context.collapsedPathsLoaded) {
+                setGitBusy(true);
+                setGitError(null);
+              }
+              const [changes] = await Promise.all([
+                cachedStatus ? snapshot.changes : loadGitStatus(connection, repository.root),
+                restoreGitCollapsedPaths(context, gitIsCurrent),
+              ]);
+              if (!gitIsCurrent()) return;
+              setGitStatus(changes);
+              setGitMode(true);
+            }
+          } catch (reason) {
+            if (gitIsCurrent() && persistedGitMode) {
+              setGitMode(true);
+              setGitError(String(reason));
+            }
+          } finally {
+            if (gitRequest === gitRequestRef.current) gitPendingRef.current = null;
+            if (gitIsCurrent()) setGitBusy(false);
+          }
+        };
+        void restoreGit();
       } catch (reason) {
-        if (request === requestRef.current) setError(String(reason));
+        if (gitRequest === gitRequestRef.current) {
+          gitPendingRef.current = null;
+          setGitBusy(false);
+        }
+        if (request === requestRef.current && connectionIsCurrent()) {
+          if (cachedPath !== null) reportBackgroundFailure(Promise.reject(reason instanceof Error ? reason : new Error(String(reason))), 'remote-directory-refresh');
+          else setError(String(reason));
+        }
       } finally {
-        if (request === requestRef.current) setBusy(false);
+        if (request === requestRef.current && connectionIsCurrent()) setBusy(false);
       }
     },
-    [client, hostId, replacePreview],
+    [clearGitContext, client, hostId, loadGitStatus, replacePreview, restoreGitCollapsedPaths],
   );
 
   useEffect(() => {
@@ -186,6 +378,10 @@ export function RemoteFileManager({ visible, client, hostId, initialPath, initia
       gitRequestRef.current += 1;
       replacePreview(null);
     }
+    return () => {
+      requestRef.current += 1;
+      gitRequestRef.current += 1;
+    };
   }, [initialFilePath, initialPath, loadDirectory, replacePreview, visible]);
 
   useEffect(
@@ -240,56 +436,112 @@ export function RemoteFileManager({ visible, client, hostId, initialPath, initia
   };
 
   const refreshGitChanges = async (repository = gitRepository) => {
-    if (!repository) return;
+    if (!visible || !repository || (!gitMode && !previewRef.current?.gitStatus) || gitPendingRef.current === gitRequestRef.current || !client.activeNative) return;
     const request = ++gitRequestRef.current;
+    const connection = remoteConnectionRequest(client);
+    const { native } = connection;
+    const isCurrent = () => request === gitRequestRef.current && connection.isCurrent();
+    gitPendingRef.current = request;
     setGitBusy(true);
     setGitError(null);
+    gitStatusSnapshotRef.current = null;
     try {
-      const changes = await client.native.gitStatus(repository.root);
-      if (request === gitRequestRef.current) setGitStatus(changes);
+      const currentRepository = await native.discoverGitRepository(repository.root);
+      if (!isCurrent()) return;
+      if (!currentRepository) throw new Error(t('files.gitDiffEmpty'));
+      let context = gitContextRef.current;
+      if (!matchesGitContext(context, connection, hostId, currentRepository.root)) {
+        context = createGitContext(connection, hostId, currentRepository, true);
+        gitContextRef.current = context;
+      }
+      const [changes] = await Promise.all([
+        loadGitStatus(connection, currentRepository.root),
+        restoreGitCollapsedPaths(context, isCurrent),
+      ]);
+      if (isCurrent()) {
+        setGitRepository(currentRepository);
+        setGitStatus(changes);
+        const current = previewRef.current;
+        if (current?.gitStatus) {
+          const status = changes.find(item => item.path === current.gitStatus!.path);
+          replacePreview({ ...current, gitStatus: status ?? current.gitStatus,
+            gitDiff: status ? current.gitDiff : { kind: 'empty', rows: [], additions: 0, deletions: 0, hunkRows: [], truncated: false, revision: 'clean' } });
+          if (status) setReviewRefreshVersion(value => value + 1);
+        }
+      }
     } catch (reason) {
-      if (request === gitRequestRef.current) setGitError(String(reason));
+      if (isCurrent()) setGitError(String(reason));
     } finally {
-      if (request === gitRequestRef.current) setGitBusy(false);
+      if (request === gitRequestRef.current) gitPendingRef.current = null;
+      if (isCurrent()) setGitBusy(false);
     }
   };
 
+  useGitReviewRefresh(Boolean(visible && gitRepository && (gitMode || preview?.gitStatus)), agentWorking, () => { void refreshGitChanges(); });
+
   const toggleGitMode = async () => {
-    if (!gitRepository || gitBusy) return;
+    if (!gitRepository || gitPendingRef.current === gitRequestRef.current || !client.activeNative) return;
     const next = !gitMode;
     const request = ++gitRequestRef.current;
+    const connection = remoteConnectionRequest(client);
+    const isCurrent = () => request === gitRequestRef.current && connection.isCurrent();
+    gitPendingRef.current = request;
     setGitBusy(true);
     setGitError(null);
     try {
-      await saveRemoteGitMode(hostId, gitRepository.root, next);
-      if (request !== gitRequestRef.current) return;
+      // Validate the nearest root when entering Git mode, including direct
+      // navigation into a nested repository whose parent was not visited.
+      const repository = next ? await connection.native.discoverGitRepository(pathRef.current) : gitRepository;
+      if (!isCurrent()) return;
+      if (!repository) throw new Error(t('files.gitDiffEmpty'));
+      let context = gitContextRef.current;
+      if (!matchesGitContext(context, connection, hostId, repository.root)) {
+        context = createGitContext(connection, hostId, repository, gitMode);
+        gitContextRef.current = context;
+      }
+      setGitRepository(repository);
+      const savingContext = context;
+      const save = saveRemoteGitMode(hostId, repository.root, next).then(() => {
+        savingContext.enabled = next;
+      });
+      context.modeSave = save;
+      try {
+        await save;
+      } finally {
+        if (context.modeSave === save) context.modeSave = null;
+      }
+      if (!isCurrent()) return;
       setGitMode(next);
       if (next) {
-        const changes = await client.native.gitStatus(gitRepository.root);
-        if (request === gitRequestRef.current) setGitStatus(changes);
+        const [changes] = await Promise.all([
+          loadGitStatus(connection, repository.root),
+          restoreGitCollapsedPaths(context, isCurrent),
+        ]);
+        if (isCurrent()) {
+          setGitStatus(changes);
+        }
       } else {
+        gitStatusSnapshotRef.current = null;
         setGitStatus([]);
       }
     } catch (reason) {
-      if (request === gitRequestRef.current) setGitError(String(reason));
+      if (isCurrent()) setGitError(String(reason));
     } finally {
-      if (request === gitRequestRef.current) setGitBusy(false);
+      if (request === gitRequestRef.current) gitPendingRef.current = null;
+      if (isCurrent()) setGitBusy(false);
     }
   };
 
   const toggleGitDirectory = (directoryPath: string) => {
     if (!gitRepository) return;
-    const repository = gitRepository;
-    setGitCollapsedPaths(current => {
-      const next = new Set(current);
-      if (next.has(directoryPath)) next.delete(directoryPath);
-      else next.add(directoryPath);
-      reportBackgroundFailure(
-        saveRemoteGitCollapsedPaths(hostId, repository.root, [...next]),
-        'remote-git-collapse-persist',
-      );
-      return next;
-    });
+    const next = new Set(gitCollapsedPathsRef.current);
+    if (next.has(directoryPath)) next.delete(directoryPath);
+    else next.add(directoryPath);
+    replaceGitCollapsedPaths(next);
+    reportBackgroundFailure(
+      saveRemoteGitCollapsedPaths(hostId, gitRepository.root, [...next]),
+      'remote-git-collapse-persist',
+    );
   };
 
   const updateShowHiddenFiles = (show: boolean) => {
@@ -318,8 +570,10 @@ export function RemoteFileManager({ visible, client, hostId, initialPath, initia
     };
     replacePreview(loadingPreview);
     try {
-      const gitDiff = await client.native.gitDiff(gitRepository, status);
-      if (request === requestRef.current) replacePreview({ ...loadingPreview, gitDiff });
+      const reviewState = await loadGitReviewState(gitReviewKey(hostId, gitRepository.root, status.path));
+      if (request !== requestRef.current) return;
+      const gitDiff = await client.native.gitDiff(gitRepository, status, reviewState.context, reviewState.expansions);
+      if (request === requestRef.current) replacePreview({ ...loadingPreview, gitDiff, reviewState });
     } catch (reason) {
       if (request === requestRef.current) {
         replacePreview({ ...loadingPreview, error: String(reason) });
@@ -327,7 +581,26 @@ export function RemoteFileManager({ visible, client, hostId, initialPath, initia
     }
   };
 
-  const openEntry = async (entry: RuntimeRemoteFileEntry, targetLine?: number) => {
+  const openEntry = async (selectedEntry: RuntimeRemoteFileEntry, targetLine?: number) => {
+    const request = ++requestRef.current;
+    let entry = selectedEntry;
+    if (entry.kind === 'symlink') {
+      setBusy(true);
+      setError(null);
+      let connectionIsCurrent = () => true;
+      const isCurrent = () => request === requestRef.current && connectionIsCurrent();
+      try {
+        const connection = remoteConnectionRequest(client);
+        connectionIsCurrent = connection.isCurrent;
+        entry = await connection.native.statRemotePath(entry.path);
+        if (!isCurrent()) return;
+      } catch (reason) {
+        if (isCurrent()) setError(String(reason));
+        return;
+      } finally {
+        if (isCurrent()) setBusy(false);
+      }
+    }
     const name = remoteEntryName(entry);
     const entryPath = entry.path;
     if (entry.kind === 'directory') {
@@ -336,7 +609,6 @@ export function RemoteFileManager({ visible, client, hostId, initialPath, initia
     }
 
     const kind = remotePreviewKind(name, entry.size);
-    const request = ++requestRef.current;
     const loadingPreview: FilePreview = {
       entry,
       path: entryPath,
@@ -354,7 +626,7 @@ export function RemoteFileManager({ visible, client, hostId, initialPath, initia
       initialLine: targetLine,
     };
     replacePreview(loadingPreview);
-    if (kind === 'unsupported') return;
+    if (kind === 'unsupported' || kind === 'paged-text') return;
 
     let cached: CachedRemoteFile | null = null;
     let htmlPreview: RuntimePreviewInfo | null = null;
@@ -364,7 +636,7 @@ export function RemoteFileManager({ visible, client, hostId, initialPath, initia
       if (isSftpStreamPreview(kind)) {
         filePreview = await client.native.startRemoteFilePreview(entryPath);
       } else {
-        cached = await cacheRemoteFile(client, entryPath);
+        cached = await cacheRemoteFile(client, entryPath, { utf8: kind === 'text' });
         content = isTextPreview(kind) ? await cached.file.text() : null;
       }
       if (request !== requestRef.current) {
@@ -432,10 +704,14 @@ export function RemoteFileManager({ visible, client, hostId, initialPath, initia
     };
   }, [initialFilePath, initialLine, visible]);
 
+  useEffect(() => { setContextEntry(null); }, [visible, initialPath, client]);
+
   const dismissNow = () => {
+    if (actionBusy) return;
     requestRef.current += 1;
     gitRequestRef.current += 1;
     setSortMenuVisible(false);
+    setContextEntry(null);
     replacePreview(null);
     onClose();
   };
@@ -526,10 +802,13 @@ export function RemoteFileManager({ visible, client, hostId, initialPath, initia
   const deleteEntry = async (entry: RuntimeRemoteFileEntry, directoryPath: string) => {
     const name = remoteEntryName(entry);
     const entryPath = entry.path;
+    const request = requestRef.current;
     setDeletingPath(entryPath);
     try {
       await client.native.removeRemotePath(entryPath, entry.kind === 'directory');
       if (pathRef.current === directoryPath) {
+        // A background listing started before deletion must not restore the row.
+        if (request === requestRef.current) requestRef.current += 1;
         setEntries(current => current.filter(candidate => remoteEntryName(candidate) !== name));
       }
     } catch (reason) {
@@ -543,7 +822,7 @@ export function RemoteFileManager({ visible, client, hostId, initialPath, initia
     setDeleteTarget({ entry, directoryPath: path });
   };
 
-  const previewLoading = preview && !preview.error && (preview.gitStatus ? !preview.gitDiff : preview.kind !== 'unsupported' && (isSftpStreamPreview(preview.kind) ? !preview.filePreview : !preview.cached));
+  const previewLoading = preview && !preview.error && (preview.gitStatus ? !preview.gitDiff : preview.kind !== 'unsupported' && preview.kind !== 'paged-text' && (isSftpStreamPreview(preview.kind) ? !preview.filePreview : !preview.cached));
   const canEdit = preview && !preview.gitStatus && isTextPreview(preview.kind) && Boolean(preview.cached) && preview.content !== null;
   const previewProgressIdentity = preview ? {
     hostId,
@@ -553,7 +832,7 @@ export function RemoteFileManager({ visible, client, hostId, initialPath, initia
   } : null;
 
   return (
-    <Modal animationType="slide" onRequestClose={() => (sortMenuVisible ? setSortMenuVisible(false) : confirmDiscard(preview ? closePreviewNow : dismissNow))} statusBarTranslucent visible={visible}>
+    <Modal animationType="slide" onRequestClose={() => (actionBusy ? undefined : contextEntry ? setContextEntry(null) : sortMenuVisible ? setSortMenuVisible(false) : confirmDiscard(preview ? closePreviewNow : dismissNow))} statusBarTranslucent visible={visible}>
       <View
         className="flex-1 bg-background"
         style={{
@@ -561,6 +840,7 @@ export function RemoteFileManager({ visible, client, hostId, initialPath, initia
           paddingBottom: safeAreaInsets.bottom,
         }}
       >
+        <View className="flex-1" accessibilityElementsHidden={contextEntry !== null} importantForAccessibility={contextEntry ? 'no-hide-descendants' : 'auto'}>
         {preview ? (
           <>
             <View className="h-14 flex-row items-center border-b border-border bg-background">
@@ -610,6 +890,19 @@ export function RemoteFileManager({ visible, client, hostId, initialPath, initia
                 <X size={19} color={colors.text} />
               </Button>
             </View>
+            {preview.gitStatus && gitReviewIndex >= 0 ? (
+              <View className="h-12 flex-row items-center border-b border-border px-2">
+                <Button accessibilityLabel={t('files.gitPreviousFile')} className="size-11 rounded-full px-0" disabled={gitReviewIndex === 0} variant="ghost" onPress={hapticPress(() => openGitChange(gitReviewFiles[gitReviewIndex - 1]))}>
+                  <ChevronLeft size={19} color={colors.text} />
+                </Button>
+                <Text className="flex-1 text-center text-[12px] text-muted-foreground">
+                  {t('files.gitFilePosition', { current: gitReviewIndex + 1, total: gitReviewFiles.length })}
+                </Text>
+                <Button accessibilityLabel={t('files.gitNextFile')} className="size-11 rounded-full px-0" disabled={gitReviewIndex === gitReviewFiles.length - 1} variant="ghost" onPress={hapticPress(() => openGitChange(gitReviewFiles[gitReviewIndex + 1]))}>
+                  <ChevronRight size={19} color={colors.text} />
+                </Button>
+              </View>
+            ) : null}
             {preview.editing ? (
               <CodeEditor editable={!actionBusy} filename={remoteEntryName(preview.entry)} onChangeText={draft => updatePreview({ draft })} progressIdentity={previewProgressIdentity!} value={preview.draft} />
             ) : preview.error ? (
@@ -622,8 +915,26 @@ export function RemoteFileManager({ visible, client, hostId, initialPath, initia
               <FileLoadingState label={t('files.opening')} />
             ) : preview.gitStatus && preview.gitDiff ? (
               <RemoteGitDiffPreview
+                key={preview.path}
                 diff={preview.gitDiff}
                 filename={preview.gitStatus.path}
+                reviewState={preview.reviewState}
+                onReviewStateChange={state => rememberGitReviewState(gitReviewKey(hostId, gitRepository!.root, preview.gitStatus!.path), state)}
+                refreshVersion={reviewRefreshVersion}
+                refreshError={gitError}
+                refreshing={gitBusy}
+                onRefresh={() => { void refreshGitChanges(); }}
+                onLoadContext={(context, expansions) => client.native.gitDiff(gitRepository!, preview.gitStatus!, context, expansions)}
+                onAskAgent={onAskAgent ? rows => {
+                  const selection = formatGitDiffSelection(preview.path, rows);
+                  if (!selection) {
+                    Alert.alert(t('files.gitSelectionTooLarge'), t('files.gitSelectionTooLargeCopy'));
+                    return;
+                  }
+                  if (!onAskAgent(`${t('files.gitAskPrompt')}\n\n${selection}`)) {
+                    Alert.alert(t('files.gitAgentUnavailable'));
+                  }
+                } : undefined}
                 onOpenFile={
                   isRemoteGitEntryDeleted(preview.gitStatus)
                     ? null
@@ -646,6 +957,8 @@ export function RemoteFileManager({ visible, client, hostId, initialPath, initia
                   })}
                 </Text>
               </View>
+            ) : preview.kind === 'paged-text' ? (
+              <PagedRemoteTextPreview key={preview.path} client={client} initialLine={preview.initialLine} progressIdentity={previewProgressIdentity!} />
             ) : preview.kind === 'image' && preview.cached ? (
               <View className="flex-1 bg-terminal-canvas p-3">
                 <ZoomableImagePreview accessibilityLabel={remoteEntryName(preview.entry)} uri={preview.cached.uri} />
@@ -711,6 +1024,10 @@ export function RemoteFileManager({ visible, client, hostId, initialPath, initia
                 <Button accessibilityLabel={t('files.gitMode')} accessibilityRole="switch" accessibilityState={{ checked: gitMode }} className="h-12 w-12 rounded-none px-0" disabled={busy || actionBusy || gitBusy} variant={gitMode ? 'secondary' : 'ghost'} onPress={hapticPress(toggleGitMode)}>
                   {gitBusy ? <ActivityIndicator size="small" color={colors.primary} /> : <GitCompareArrows size={18} color={gitMode ? colors.primary : colors.text} />}
                 </Button>
+              ) : gitBusy ? (
+                <View className="h-12 w-12 items-center justify-center" accessibilityLabel={t('files.gitLoading')}>
+                  <ActivityIndicator size="small" color={colors.primary} />
+                </View>
               ) : null}
               <Button accessibilityLabel={t('files.options')} className="h-12 w-12 rounded-none px-0" disabled={busy || actionBusy} variant="ghost" onPress={hapticPress(() => setSortMenuVisible(true))}>
                 <SlidersHorizontal size={18} color={colors.text} />
@@ -718,7 +1035,7 @@ export function RemoteFileManager({ visible, client, hostId, initialPath, initia
               <Button accessibilityLabel={t('files.upload')} className="h-12 w-12 rounded-none px-0" disabled={busy || actionBusy || !path} variant="ghost" onPress={hapticPress(uploadFile)}>
                 {actionBusy ? <ActivityIndicator size="small" color={colors.primary} /> : <Upload size={18} color={colors.text} />}
               </Button>
-              <Button accessibilityLabel={t('files.refresh')} className="h-12 w-12 rounded-none px-0" disabled={busy || actionBusy || gitBusy} variant="ghost" onPress={hapticPress(() => (gitMode ? refreshGitChanges() : loadDirectory(path || initialPath)))}>
+              <Button accessibilityLabel={t('files.refresh')} className="h-12 w-12 rounded-none px-0" disabled={busy || actionBusy || gitBusy} variant="ghost" onPress={hapticPress(() => (gitMode ? refreshGitChanges() : loadDirectory(path || initialPath, false)))}>
                 <RefreshCw size={18} color={colors.text} />
               </Button>
             </View>
@@ -740,7 +1057,7 @@ export function RemoteFileManager({ visible, client, hostId, initialPath, initia
               />
             ) : gitMode && gitTreeRows.length ? (
               <FlatList
-                contentContainerStyle={remoteGitListContentStyle}
+                contentContainerStyle={remoteFileListContentStyle}
                 data={gitTreeRows}
                 initialNumToRender={30}
                 keyExtractor={row => row.key}
@@ -817,20 +1134,36 @@ export function RemoteFileManager({ visible, client, hostId, initialPath, initia
                 <Text className="mt-2 text-center text-[12px] leading-[18px] text-muted-foreground">{t('files.gitCleanCopy')}</Text>
               </View>
             ) : sortedEntries.length ? (
-              <ScrollView className="flex-1" contentContainerClassName="px-3 py-1">
-                {sortedEntries.map(entry => {
+              <FlatList
+                key={`directory:${path}`}
+                className="flex-1"
+                contentContainerStyle={remoteFileListContentStyle}
+                data={sortedEntries}
+                extraData={{ deletingPath, actionBusy, contextEntry }}
+                keyExtractor={entry => entry.path}
+                {...remoteDirectoryListOptions}
+                renderItem={({ item: entry }) => {
                   const name = remoteEntryName(entry);
                   const directory = entry.kind === 'directory';
                   const kind = remotePreviewKind(name, entry.size);
                   return (
-                    <SwipeableRemoteFileRow key={entry.path} deleting={deletingPath === entry.path} disabled={Boolean(deletingPath)} name={name} onDelete={() => confirmDeleteEntry(entry)}>
+                    <SwipeableRemoteFileRow key={entry.path} deleting={deletingPath === entry.path} disabled={Boolean(deletingPath) || actionBusy || contextEntry !== null} name={name} onDelete={() => confirmDeleteEntry(entry)}>
                       {({ actionsOpen, closeActions }) => (
                         <Button
                           accessibilityLabel={t(directory ? 'files.openDirectory' : 'files.openFile', { name })}
                           className="h-auto min-h-[62px] justify-start gap-3 rounded-none bg-background px-2 py-2"
-                          disabled={Boolean(deletingPath)}
+                          disabled={Boolean(deletingPath) || actionBusy || contextEntry !== null}
                           variant="ghost"
+                          delayLongPress={450}
+                          onPressIn={() => { longPressedPath.current = null; }}
+                          onLongPress={hapticPress(() => {
+                            longPressedPath.current = entry.path;
+                            closeActions();
+                            if (!client.activeNative) { Alert.alert(t('common.notConnected')); return; }
+                            setContextEntry(entry);
+                          })}
                           onPress={hapticPress(() => {
+                            if (longPressedPath.current === entry.path) return;
                             if (actionsOpen) closeActions();
                             else reportBackgroundFailure(openEntry(entry), 'remote-entry-open');
                           })}
@@ -864,8 +1197,8 @@ export function RemoteFileManager({ visible, client, hostId, initialPath, initia
                       )}
                     </SwipeableRemoteFileRow>
                   );
-                })}
-              </ScrollView>
+                }}
+              />
             ) : entries.length && !showHiddenFiles ? (
               <HiddenOnlyState onShow={() => updateShowHiddenFiles(true)} />
             ) : (
@@ -926,6 +1259,10 @@ export function RemoteFileManager({ visible, client, hostId, initialPath, initia
               ) : null}
             </View>
           </View>
+        ) : null}
+        </View>
+        {contextEntry ? (
+          <RemoteFileContextSheet key={contextEntry.path} entry={contextEntry} client={client} onClose={() => setContextEntry(null)} onBusyChange={setActionBusy} onChanged={() => loadDirectory(pathRef.current, false)} />
         ) : null}
       </View>
       <ConfirmationPopup
@@ -1012,6 +1349,8 @@ function SwipeableRemoteFileRow({ children, deleting, disabled, name, onDelete }
   const { t } = useTranslation();
   const translateX = useSharedValue(0);
   const openRef = useRef(false);
+  const disabledRef = useRef(disabled);
+  disabledRef.current = disabled;
   const [actionsOpen, setActionsOpen] = useState(false);
   const animatedStyle = useAnimatedStyle(() => ({
     transform: [{ translateX: translateX.value }],
@@ -1030,7 +1369,7 @@ function SwipeableRemoteFileRow({ children, deleting, disabled, name, onDelete }
 
   const panResponder = useRef(
     PanResponder.create({
-      onMoveShouldSetPanResponderCapture: (_event, gesture) => shouldClaimRemoteFileSwipe(gesture.dx, gesture.dy, openRef.current),
+      onMoveShouldSetPanResponderCapture: (_event, gesture) => !disabledRef.current && shouldClaimRemoteFileSwipe(gesture.dx, gesture.dy, openRef.current),
       onPanResponderGrant: () => cancelAnimation(translateX),
       onPanResponderMove: (_event, gesture) => {
         translateX.value = remoteFileSwipeOffset(gesture.dx, openRef.current);

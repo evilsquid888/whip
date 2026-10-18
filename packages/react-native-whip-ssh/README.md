@@ -21,6 +21,27 @@ Terminal and graphics payloads cross the Whip UniFFI/JSI boundary as binary
 data-carrying enums. Terminal bytes are never JSON, base64, or UTF-8 decoded in
 the adapter.
 
+Herd follows the connected server's filtered agent ordering on generation-1
+endpoints. Rust observes `shell.snapshot.v1` with `surface_active: false` and
+projects its ordered pane IDs over the complete JSON host state. It does not
+render a management terminal or duplicate Herdr's view query language. View
+updates use the existing host-state revision; hidden agents remain available to
+terminal and notification APIs. The optional observer starts and retries
+independently of the primary event stream, with bounded recovery canceled when
+events stop or the connection is replaced.
+
+When any host has a server projection, including an empty view, aggregate agent
+rows stay grouped in the existing host ranking (connected first, then visible
+agent attention). Server-backed groups preserve server order; other groups use
+local attention priority. Without any server projection, the existing global
+attention ordering remains unchanged.
+
+Fresh host-state records include an opaque `offlineCacheBlob` serialized by
+Rust. JavaScript debounces and stores it unchanged in AsyncStorage;
+`AppCore.restoreCachedHost` validates and normalizes the stored blob into stale
+offline metadata. Rust owns the versioned cache schema and also reads legacy
+JavaScript snapshot records.
+
 WP4 pairing remains a logically separate QR-pinned bootstrap module but shares
 the Whip crate, executor, native module, and platform library.
 

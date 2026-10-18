@@ -5,6 +5,7 @@ import { Platform, StyleSheet, View } from 'react-native';
 import { useTranslation } from 'react-i18next';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
+import { BOTTOM_NAVIGATION_BASE_HEIGHT, BOTTOM_NAVIGATION_BOTTOM_OFFSET } from '@/src/lib/floatingChrome';
 import { colorWithAlpha, useTheme, type ThemeColors } from '@/src/theme';
 import type { AppTab } from '@/src/types';
 import { hapticPress, HerdrMark } from './app-ui';
@@ -33,21 +34,21 @@ export function BottomNavigation({ activeTab, blurTarget, onSelect }: Props) {
   const { colors, isDark } = useTheme();
   const { t } = useTranslation();
   const { bottom } = useSafeAreaInsets();
-  // Four Android BlurViews recaptured the full screen whenever its tab changed,
+  // Android BlurViews recaptured the full screen whenever its tab changed,
   // compounding the release transition stall. Keep native blur on iOS only.
   const renderNativeBlur = Platform.OS !== 'android';
   return (
     <View
       pointerEvents="box-none"
       className="absolute inset-x-0 z-30 flex-row items-center justify-around bg-transparent px-4"
-      style={{ bottom: 16, height: 120 + bottom, paddingBottom: bottom }}>
+      style={{ bottom: BOTTOM_NAVIGATION_BOTTOM_OFFSET, height: BOTTOM_NAVIGATION_BASE_HEIGHT + bottom, paddingBottom: bottom }}>
       {items.map(item => {
         const active = item.tab === activeTab;
         return (
-          <View className="h-[68px] w-[68px] items-center justify-center" key={item.tab}>
+          <View className="h-[60px] flex-1 items-center justify-center" key={item.tab}>
             <View
               pointerEvents="none"
-              className="absolute h-[68px] w-[68px] rounded-full"
+              className="absolute h-[60px] w-[60px] rounded-full"
               style={floatingBloomStyle(active, colors)}
             />
             {renderNativeBlur ? (
@@ -74,11 +75,11 @@ export function BottomNavigation({ activeTab, blurTarget, onSelect }: Props) {
               accessibilityLabel={t(item.labelKey)}
               accessibilityRole="tab"
               accessibilityState={{ selected: active }}
-              className="h-16 w-16 rounded-full bg-transparent p-0 dark:bg-transparent"
+              className="h-[60px] w-[60px] rounded-full bg-transparent p-0 dark:bg-transparent"
               size="content"
               variant="link"
               onPress={hapticPress(() => onSelect(item.tab))}>
-              <View className={active ? 'items-center justify-center opacity-100' : 'items-center justify-center opacity-60'}>
+              <View className="items-center justify-center">
                 {'herdrMark' in item
                   ? <HerdrMark size={29} />
                   : <Icon as={item.icon} size={29} color={active ? colors.text : colors.textSecondary} strokeWidth={active ? 2.75 : 2} />}

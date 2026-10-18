@@ -1,6 +1,11 @@
 use super::*;
 
 impl SshSession {
+    pub(crate) async fn open_browser_proxy(&self) -> Result<u16, SshFailure> {
+        browser_proxy::open(self.resource_key.clone(), self.inner.clone())
+            .await
+            .map_err(Into::into)
+    }
     pub(crate) fn is_alive(&self) -> bool {
         self.inner.is_alive()
     }
@@ -40,8 +45,7 @@ impl SshSession {
     }
 
     pub(crate) async fn remote_home(&self) -> Result<String, SshFailure> {
-        let output = execute_on(&self.inner, REMOTE_HOME_COMMAND).await?;
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        self.inner.remote_home().await.map_err(Into::into)
     }
 
     pub(crate) async fn latency_ms(&self) -> Result<f64, SshFailure> {
@@ -67,9 +71,25 @@ impl SshSession {
         close_local_forward_for_key(&self.resource_key, local_port);
     }
 
+    pub(crate) async fn open_remote_forward(
+        &self,
+        local_port: u16,
+    ) -> Result<RemoteForward, SshFailure> {
+        self.open_remote_forward_at(local_port, 0).await
+    }
+
+    pub(crate) async fn open_remote_forward_at(
+        &self,
+        local_port: u16,
+        remote_port: u16,
+    ) -> Result<RemoteForward, SshFailure> {
+        reverse_forward::open(self.inner.clone(), local_port, remote_port)
+            .await
+            .map_err(Into::into)
+    }
+
     async fn ensure_sftp(&self) -> Result<Arc<SftpSession>, SshFailure> {
-        connect_sftp_on(&self.resource_key, &self.inner).await?;
-        sftp_for_key(&self.resource_key).map_err(Into::into)
+        connect_sftp_on(&self.inner).await.map_err(Into::into)
     }
 
     pub(crate) async fn sftp_list(&self, path: &str) -> Result<Vec<SftpEntry>, SshFailure> {
@@ -79,6 +99,7 @@ impl SshSession {
 
     pub(crate) async fn sftp_stat(&self, path: &str) -> Result<SftpMetadata, SshFailure> {
         let sftp = self.ensure_sftp().await?;
+        // STAT follows symlinks; directory listings retain the link's own kind.
         let metadata = sftp.metadata(path).await.map_err(TransportError::from)?;
         Ok(SftpMetadata::from(metadata))
     }
@@ -112,9 +133,68 @@ impl SshSession {
         Ok(bytes)
     }
 
+    pub(crate) async fn sftp_read_range(
+        &self,
+        path: &str,
+        offset: u64,
+        length: u64,
+    ) -> Result<(SftpMetadata, Vec<u8>), SshFailure> {
+        let sftp = self.ensure_sftp().await?;
+        let mut file = sftp.open(path).await.map_err(TransportError::from)?;
+        let metadata = file.metadata().await.map_err(TransportError::from)?;
+        file.seek(SeekFrom::Start(offset))
+            .await
+            .map_err(TransportError::from)?;
+        let capacity = usize::try_from(length).map_err(|_| {
+            TransportError::InvalidRequest("SFTP read range is too large".to_owned())
+        })?;
+        let mut bytes = Vec::with_capacity(capacity);
+        file.take(length)
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(TransportError::from)?;
+        Ok((SftpMetadata::from(metadata), bytes))
+    }
+
     pub(crate) async fn sftp_rename(&self, from: &str, to: &str) -> Result<(), SshFailure> {
         let sftp = self.ensure_sftp().await?;
-        sftp.rename(from, to).await.map_err(TransportError::from)?;
+        let invalid = |message: String| SshFailure::from(TransportError::InvalidRequest(message));
+        if from == to {
+            return Ok(());
+        }
+        let source = sftp
+            .symlink_metadata(from)
+            .await
+            .map_err(TransportError::from)?;
+        if source.file_type().is_dir() {
+            let source_path = sftp
+                .canonicalize(from)
+                .await
+                .map_err(TransportError::from)?;
+            let parent = crate::remote_ops::remote_parent(to).map_err(invalid)?;
+            let parent = sftp
+                .canonicalize(parent)
+                .await
+                .map_err(TransportError::from)?;
+            crate::remote_ops::validate_remote_move(&source_path, &parent).map_err(invalid)?;
+        }
+        match sftp.symlink_metadata(to).await {
+            Ok(_) => {
+                return Err(invalid(
+                    "Destination already exists. Choose another name or directory.".to_owned(),
+                ));
+            }
+            Err(russh_sftp::client::error::Error::Status(status))
+                if status.status_code == russh_sftp::protocol::StatusCode::NoSuchFile => {}
+            Err(error) => return Err(TransportError::from(error).into()),
+        }
+        // Standard SFTP RENAME rejects an existing destination, including a race
+        // after LSTAT. Never use the overwrite-capable POSIX rename extension.
+        sftp.rename(from, to).await.map_err(|error| {
+            invalid(format!(
+                "Server rejected rename/move (cross-filesystem moves may be unsupported): {error}"
+            ))
+        })?;
         Ok(())
     }
 
@@ -163,6 +243,41 @@ impl SshSession {
         progress: Arc<dyn Fn(u64, Option<u64>) + Send + Sync>,
     ) -> Result<String, SshFailure> {
         let sftp = self.ensure_sftp().await?;
+        let mut metadata = sftp
+            .symlink_metadata(remote_path)
+            .await
+            .map_err(TransportError::from)?;
+        // Explicitly opening a file link remains supported by previews. Tree
+        // traversal never follows links; a selected link to a directory is refused.
+        if metadata.file_type().is_symlink() {
+            metadata = sftp
+                .metadata(remote_path)
+                .await
+                .map_err(TransportError::from)?;
+            if !metadata.file_type().is_file() {
+                return Err(TransportError::InvalidRequest(
+                    "Cannot recursively download a directory symlink".to_owned(),
+                )
+                .into());
+            }
+        }
+        if metadata.file_type().is_dir() {
+            return directory_download::download(
+                sftp,
+                remote_path,
+                destination_path,
+                cancel,
+                progress,
+            )
+            .await
+            .map_err(Into::into);
+        }
+        if !metadata.file_type().is_file() {
+            return Err(TransportError::InvalidRequest(
+                "Cannot download a symlink or special file".to_owned(),
+            )
+            .into());
+        }
         sftp_transfer_file_on(
             sftp,
             destination_path.to_owned(),
@@ -351,6 +466,7 @@ impl SshSession {
     }
 
     pub(crate) async fn disconnect(&self) {
+        reverse_forward::close_routes(&self.inner.reverse_forwards);
         self.inner
             .lifecycle
             .mark_disconnected("SSH session closed by application");
@@ -360,5 +476,30 @@ impl SshSession {
             .handle
             .disconnect(russh::Disconnect::ByApplication, "", "en")
             .await;
+    }
+}
+
+impl Session {
+    pub(super) async fn remote_home(&self) -> Result<String, TransportError> {
+        self.ensure_alive()?;
+        // Serialize initialization across all wrappers of this connection.
+        // Cancellation or transport failure leaves the cache empty for retries.
+        let mut cached = self.remote_home.lock().await;
+        self.ensure_alive()?;
+        if let Some(home) = cached.as_ref() {
+            return Ok(home.clone());
+        }
+        let output = execute_on(self, REMOTE_HOME_COMMAND).await?;
+        self.ensure_alive()?;
+        let home = String::from_utf8_lossy(&output.stdout).into_owned();
+        if output.exit_status == Some(0)
+            && crate::remote_ops::normalize_absolute(home.trim()).is_ok()
+        {
+            *cached = Some(home.clone());
+        }
+        drop(cached);
+        // Keep returning the command's original output. Path callers perform
+        // their existing validation and report their existing path errors.
+        Ok(home)
     }
 }

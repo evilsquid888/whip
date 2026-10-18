@@ -7,6 +7,18 @@ jest.mock('../packages/react-native-whip-ssh/src/generated-entry', () => ({
   herdrTerminalScroll: jest.fn(),
   herdrControlRequest: jest.fn().mockResolvedValue({ tag: 'Ok' }),
   createHostRuntime: jest.fn(),
+  AppCore: jest.fn(),
+  AppConnectionStatus: { Connecting: 0, Connected: 1, Ready: 2, Reconnecting: 3, Disconnected: 4, Error: 5 },
+  ReverseControlState: { Off: 0, RestartRequired: 1, Recovering: 2, Connected: 3 },
+  GitDiffContext: { Compact: 0, Expanded: 1, Full: 2 },
+  GitDiffRowKind: {
+    Header: 0,
+    Hunk: 1,
+    Context: 2,
+    Addition: 3,
+    Deletion: 4,
+    Meta: 5,
+  },
   AgentIntegrationStatus: {
     NotInstalled: 0,
     Current: 1,
@@ -14,7 +26,7 @@ jest.mock('../packages/react-native-whip-ssh/src/generated-entry', () => ({
     NeedsRepair: 3,
     Unknown: 4,
   },
-  AgentTranscriptKind: { Codex: 0, OpenCode: 1 },
+  AgentTranscriptKind: { Claude: 0, Codex: 1, OpenCode: 2 },
   AgentChatOpenResult_Tags: { Bound: 'Bound', NoChat: 'NoChat' },
   AgentChatStartResult_Tags: {
     Started: 'Started',
@@ -91,6 +103,7 @@ jest.mock('../packages/react-native-whip-ssh/src/generated-entry', () => ({
   },
   RuntimeDiagnosticOutcome: { Succeeded: 0, Failed: 1, Started: 2 },
   HerdrControlRequest: {
+    PaneGet: { new: jest.fn(inner => ({ tag: 'PaneGet', inner })) },
     WorkspaceFocus: {
       new: jest.fn(inner => ({ tag: 'WorkspaceFocus', inner })),
     },
@@ -213,7 +226,11 @@ jest.mock('../packages/react-native-whip-ssh/src/generated-entry', () => ({
   startHerdrTerminalBridge: jest.fn().mockResolvedValue(undefined),
 }));
 
-import { createHostRuntime } from '../packages/react-native-whip-ssh/src';
+import { createHostRuntime, NativeAppCore, HerdrAgentKind, ReverseControlState } from '../packages/react-native-whip-ssh/src';
+import {
+  AgentTurnStatus,
+  type AgentTranscriptTurn,
+} from '../packages/react-native-whip-ssh/src/generated-entry';
 
 const mockGenerated = jest.requireMock(
   '../packages/react-native-whip-ssh/src/generated-entry',
@@ -226,6 +243,75 @@ const mockAgentEventSink =
 describe('native HostRuntime adapter', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+  });
+
+  it.each(['agentIntegrationStatus', 'installAgentIntegration'] as const)(
+    '%s preserves the host integration error message and code',
+    async operation => {
+      const rustRuntime = {
+        runtimeId: () => 'integration-error-runtime',
+        runtimeIncarnation: () => 1n,
+        [operation]: jest.fn().mockRejectedValue(Object.assign(
+          new Error('HerdrControlError.ProtocolError'),
+          {
+            tag: 'ProtocolError',
+            inner: Object.freeze([
+              'integration_install_failed',
+              'Could not update OpenCode config: permission denied',
+            ]),
+          },
+        )),
+      };
+      mockGenerated.createHostRuntime.mockReturnValueOnce(rustRuntime);
+      const runtime = createHostRuntime({
+        runtimeId: 'integration-error-runtime',
+        ssh: { host: 'host.test', port: 22, username: 'me', authMode: 'password', secret: 'secret' },
+        jumpHosts: [], sessionName: 'main', herdrCommand: 'herdr',
+      });
+      try {
+        await expect(runtime[operation]('opencode')).rejects.toMatchObject({
+          name: 'HerdrControlError',
+          code: 'integration_install_failed',
+          message: 'Could not update OpenCode config: permission denied',
+        });
+        expect(rustRuntime[operation]).toHaveBeenCalledWith(HerdrAgentKind.OpenCode);
+      } finally {
+        runtime.detach();
+      }
+    },
+  );
+
+  it('gets one pane and its scroll metadata without refreshing host state', async () => {
+    const rustRuntime = {
+      runtimeId: () => 'pane-get-runtime',
+      runtimeIncarnation: () => 1n,
+      controlRequest: jest.fn().mockResolvedValue({
+        tag: 'PaneInfo',
+        inner: { pane: {
+          paneId: 'p1', terminalId: 'term1', workspaceId: 'w1', tabId: 't1',
+          focused: true, agentStatus: mockGenerated.HerdrAgentStatus.Working, revision: 1,
+          scroll: { offsetFromBottom: 3, maxOffsetFromBottom: 100, viewportRows: 30 },
+        } },
+      }),
+      refreshState: jest.fn(),
+    };
+    mockGenerated.createHostRuntime.mockReturnValueOnce(rustRuntime);
+    const runtime = createHostRuntime({
+      runtimeId: 'pane-get-runtime',
+      ssh: { host: 'host.test', port: 22, username: 'me', authMode: 'password', secret: 'secret' },
+      jumpHosts: [], sessionName: 'main', herdrCommand: 'herdr',
+    });
+    try {
+      await expect(runtime.requestHerdrApi({ method: 'pane.get', params: { pane_id: 'p1' } })).resolves.toMatchObject({
+        type: 'pane_info', pane: {
+          pane_id: 'p1', scroll: { offset_from_bottom: 3, max_offset_from_bottom: 100, viewport_rows: 30 },
+        },
+      });
+      expect(rustRuntime.controlRequest).toHaveBeenCalledWith({ tag: 'PaneGet', inner: { paneId: 'p1' } });
+      expect(rustRuntime.refreshState).not.toHaveBeenCalled();
+    } finally {
+      runtime.detach();
+    }
   });
 
   it('preserves the native reason when runtime creation rejects a duplicate host', () => {
@@ -781,10 +867,10 @@ describe('native HostRuntime adapter', () => {
     });
   });
 
-  it('projects typed native transcript snapshots and callbacks without JSON', () => {
+  it.each([[1, 'codex'], [2, 'opencode'], [0, 'claude']] as const)('projects native %s (%s) snapshots and callbacks without JSON', (nativeAgent, agent) => {
     const nativeState = {
       sessionId: 'session-1',
-      agent: 0,
+      agent: nativeAgent,
       revision: 4n,
       status: 1,
       messages: [
@@ -834,9 +920,10 @@ describe('native HostRuntime adapter', () => {
         {
           id: 'turn:1',
           assistantMessageIds: ['assistant:1'],
-          status: 0,
+          messageIds: ['assistant:1'],
+          status: AgentTurnStatus.Idle,
           diffs: [],
-        },
+        } satisfies AgentTranscriptTurn,
       ],
     };
     const rustRuntime = {
@@ -851,20 +938,21 @@ describe('native HostRuntime adapter', () => {
             bindingGeneration: 1n,
             terminalId: 'terminal-1',
             paneId: 'pane-1',
-            agent: 0,
+            agent: nativeAgent,
             sessionId: 'session-1',
             transcriptKey: 'codex:session-1',
             state: nativeState,
           },
         },
       })),
+      agentChatBindingIsCurrent: jest.fn(() => true),
       currentAgentChat: jest.fn(() => ({
         runtimeIncarnation: 7n,
         bindingToken: 'binding-1',
         bindingGeneration: 1n,
         terminalId: 'terminal-1',
         paneId: 'pane-1',
-        agent: 0,
+        agent: nativeAgent,
         sessionId: 'session-1',
         transcriptKey: 'codex:session-1',
         state: nativeState,
@@ -899,12 +987,25 @@ describe('native HostRuntime adapter', () => {
     const started = runtime.startAgentChat(result.binding.bindingToken);
 
     expect(current?.bindingToken).toBe('binding-1');
+    expect(runtime.agentChatBindingIsCurrent('terminal-1', 'binding-1', 1)).toBe(true);
+    expect(rustRuntime.agentChatBindingIsCurrent).toHaveBeenCalledWith('terminal-1', 'binding-1', 1n);
+    expect(current?.agent).toBe(agent);
+    expect(result.binding.agent).toBe(agent);
+    expect(result.binding.state.agent).toBe(agent);
 
     expect(result.binding.state).toEqual(
       expect.objectContaining({
         sessionId: 'session-1',
         revision: 4,
         status: 'live',
+        turns: [
+          expect.objectContaining({
+            id: 'turn:1',
+            assistantMessageIds: ['assistant:1'],
+            messageIds: ['assistant:1'],
+            status: 'idle',
+          }),
+        ],
         messages: [
           expect.objectContaining({
             id: 'assistant:1',
@@ -1001,7 +1102,7 @@ describe('native HostRuntime adapter', () => {
   it('routes transcript events by native runtime incarnation', async () => {
     const nativeState = {
       sessionId: 'session-1',
-      agent: 0,
+      agent: mockGenerated.AgentTranscriptKind.Codex,
       revision: 1n,
       status: 1,
       messages: [],
@@ -1020,7 +1121,7 @@ describe('native HostRuntime adapter', () => {
             bindingGeneration: 1n,
             terminalId: 'terminal-1',
             paneId: 'pane-1',
-            agent: 0,
+            agent: mockGenerated.AgentTranscriptKind.Codex,
             sessionId: 'session-1',
             transcriptKey: 'codex:session-1',
             state: nativeState,
@@ -1082,4 +1183,37 @@ describe('native HostRuntime adapter', () => {
     expect(oldHandler).toHaveBeenCalledTimes(1);
     expect(replacementHandler).toHaveBeenCalledTimes(1);
   });
+});
+
+
+test('AppCore and Herd retain typed native agent controls in their projections', () => {
+  const control = {
+    terminalId: 'terminal-1', kind: HerdrAgentKind.Codex, sessionId: 'conversation',
+    reverseControl: true, connected: false,
+    reverseControlState: ReverseControlState.Recovering,
+  };
+  const nativeCore = {
+    view: jest.fn(() => ({
+      revision: 5n, activeSessionId: 'host',
+      sessions: [{
+        id: 'host', hostId: 'profile', connectionStatus: mockGenerated.AppConnectionStatus.Ready,
+        reconnectAttempt: 0, selection: {}, agentControls: [control],
+        terminalRail: { resumeBlob: '', terminals: [] },
+      }],
+    })),
+    herdView: jest.fn(() => ({
+      revision: 5n, hosts: [], agents: [{
+        hostId: 'host', hostLabel: 'Host', workspaceLabel: 'Workspace', tabLabel: 'Tab', primaryLabel: 'Tab',
+        agent: {
+          terminalId: 'terminal-1', paneId: 'pane-1', workspaceId: 'workspace-1', tabId: 'tab-1',
+          agent: 'codex', agentStatus: mockGenerated.HerdrAgentStatus.Idle, revision: 1, focused: false,
+        },
+        control,
+      }],
+    })),
+  };
+  mockGenerated.AppCore.mockImplementation(() => nativeCore);
+  const core = new NativeAppCore();
+  expect(core.view().sessions[0].agentControls[0]).toBe(control);
+  expect(core.herdView([]).agents[0].control).toBe(control);
 });

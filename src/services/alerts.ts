@@ -6,9 +6,9 @@ import type { AgentInfo } from '../types';
 import type { AgentNotificationTarget } from '../lib/notificationNavigation';
 import { agentNotificationTitle } from '../lib/agentStatusEvents';
 import type { AgentAlertLevel } from './devicePreferences';
-import { armPersistentAgentAlert, dismissPersistentAgentAlert } from './backgroundMonitoring';
+import { armPersistentAgentAlert, dismissPersistentAgentAlert, watchSpeechShake } from './backgroundMonitoring';
 import i18n from '../i18n';
-import { isChatSpeechActive, isChatSpeechTarget } from './chatSpeechFocus';
+import { isChatSpeechActive } from './chatSpeechFocus';
 import {
   operationalErrorDetails,
   recordOperationalDiagnostic,
@@ -106,7 +106,6 @@ export async function alertAgent(
   delivery: AgentAlertDelivery = 'persistent',
   persistentAlertTimeoutMs: number = DEFAULT_PERSISTENT_ALERT_TIMEOUT_MS,
 ): Promise<void> {
-  if (isChatSpeechTarget(target.hostId, target.paneId)) return;
   const dismissalGeneration = alertDismissalGeneration;
   const paneTargetKey = agentAlertTargetKey(target.hostId, target.paneId);
   const tabTargetKey = agentAlertTargetKey(target.hostId, agent.tab_id);
@@ -114,8 +113,7 @@ export async function alertAgent(
   const paneDismissalGeneration = paneDismissalGenerations.get(paneTargetKey) ?? 0;
   const tabDismissalGeneration = tabDismissalGenerations.get(tabTargetKey) ?? 0;
   const wasDismissed = () => (
-    isChatSpeechTarget(target.hostId, target.paneId)
-    || dismissalGeneration !== alertDismissalGeneration
+    dismissalGeneration !== alertDismissalGeneration
     || paneDismissalGeneration !== (paneDismissalGenerations.get(paneTargetKey) ?? 0)
     || tabDismissalGeneration !== (tabDismissalGenerations.get(tabTargetKey) ?? 0)
   );
@@ -274,13 +272,20 @@ async function speakBeforeAlert(title: string): Promise<void> {
   await new Promise<void>(resolve => {
     let completed = false;
     let timeout: ReturnType<typeof setTimeout> | null = null;
+    let stopShakeWatching = () => {};
     const finish = () => {
       if (completed) return;
       completed = true;
       if (timeout) clearTimeout(timeout);
+      stopShakeWatching();
       resolve();
     };
 
+    stopShakeWatching = watchSpeechShake(() => {
+      // Dismiss the pending alert too, so stopping its announcement does not
+      // immediately replace speech with a ringing notification.
+      void dismissAgentAlerts().then(finish, finish);
+    });
     timeout = setTimeout(() => {
       stopSpeech('speech-timeout').then(finish, finish);
     }, SPEECH_TIMEOUT_MS);

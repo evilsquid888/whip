@@ -3,14 +3,15 @@ import './global.css';
 import { useEffect, useRef, useState } from 'react';
 import { useFonts } from 'expo-font';
 import { PortalHost } from '@rn-primitives/portal';
-import { View } from 'react-native';
+import { NativeModules, Platform, View } from 'react-native';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { useTranslation } from 'react-i18next';
 
 import { AppShell } from './src/components/AppShell';
 import { ReducedMotionProvider, WhipMark } from './src/components/app-ui';
-import { guiFontFamilies } from './src/lib/guiFonts';
+import { chatCjkFontFamily, guiFontFamilies } from './src/lib/guiFonts';
 import { bundledAsset } from './src/lib/bundledAsset';
+import { chatCjkFontAsset } from './src/services/chatFontAsset';
 import { terminalFontFamily } from './src/lib/terminalFonts';
 import { reportBackgroundFailure } from './src/services/backgroundOperations';
 import { useAgentNotifications } from './src/hooks/useAgentNotifications';
@@ -21,6 +22,7 @@ import { useDevicePreferences } from './src/hooks/useDevicePreferences';
 import { useHostManagement } from './src/hooks/useHostManagement';
 import { useLiveHostTelemetry } from './src/hooks/useLiveHostTelemetry';
 import { useRemoteFilesController } from './src/hooks/useRemoteFilesController';
+import { useReverseControlHosts } from './src/hooks/useReverseControlHosts';
 import {
   useSessionRuntimeManager,
   type SessionRuntimeController,
@@ -28,9 +30,11 @@ import {
 import { useStartupStorage } from './src/hooks/useStartupStorage';
 import { useTerminalHistory } from './src/hooks/useTerminalHistory';
 import { useTerminalSessions } from './src/hooks/useTerminalSessions';
+import { getBillingRolloutPolicy } from './src/billing/rollout';
 import { useWhipEntitlements } from './src/billing/useWhipEntitlements';
 
 const guiFontAssets = {
+  [chatCjkFontFamily]: chatCjkFontAsset,
   [guiFontFamilies.regular]: bundledAsset(require('./assets/gui-fonts/Inter-Regular.ttf')),
   [guiFontFamilies.medium]: bundledAsset(require('./assets/gui-fonts/Inter-Medium.ttf')),
   [guiFontFamilies.semiBold]: bundledAsset(require('./assets/gui-fonts/Inter-SemiBold.ttf')),
@@ -40,17 +44,31 @@ const guiFontAssets = {
   [terminalFontFamily]: bundledAsset(require('./assets/terminal-fonts/JetBrainsMono-Regular.ttf')),
 };
 
+function hideLaunchScreen() {
+  if (Platform.OS === 'ios') {
+    (NativeModules.WhipLaunchScreen as { hide(): void } | undefined)?.hide();
+  }
+}
+
 function App() {
   const [guiFontsLoaded, guiFontError] = useFonts(guiFontAssets);
-  if (!guiFontsLoaded && !guiFontError) return null;
 
   return (
     <SafeAreaProvider>
       <ReducedMotionProvider>
-        <AppContent />
+        {guiFontsLoaded || guiFontError ? <AppContent /> : <AppLoadingScreen />}
         <PortalHost />
       </ReducedMotionProvider>
     </SafeAreaProvider>
+  );
+}
+
+function AppLoadingScreen() {
+  const { t } = useTranslation();
+  return (
+    <View className="flex-1 items-center justify-center bg-background">
+      <WhipMark accessibilityLabel={t('app.loading')} size={64} />
+    </View>
   );
 }
 
@@ -60,10 +78,10 @@ function AppContent() {
   const startupStorage = useStartupStorage();
   const preferences = useDevicePreferences(startupStorage);
   const preferencesLoaded = preferences.hydration.status !== 'loading';
-  const membershipSimulationEnabled =
-    preferencesLoaded &&
-    preferences.value.developerOptionsEnabled;
-  const entitlements = useWhipEntitlements(membershipSimulationEnabled);
+  const { billingEnabled } = getBillingRolloutPolicy(
+    preferences.value.developerOptionsEnabled,
+  );
+  const entitlements = useWhipEntitlements(preferencesLoaded && billingEnabled);
   const terminals = useTerminalSessions();
   const telemetry = useLiveHostTelemetry();
   const notifications = useAgentNotifications();
@@ -128,10 +146,12 @@ function AppContent() {
     telemetry,
   });
   sessionsRef.current = sessions;
+  useReverseControlHosts(hosts, sessions, preferences, security);
 
   const remoteFiles = useRemoteFilesController({
     getSessions: sessions.getState,
     getClient: sessions.getClient,
+    openTerminal: sessions.openPaneTerminal,
   });
   const { request: remoteFilesRequest, close: closeRemoteFiles } = remoteFiles;
   useEffect(() => {
@@ -146,27 +166,25 @@ function AppContent() {
     }
   }, [closeRemoteFiles, remoteFilesRequest, sessions.state.sessions]);
 
-  if (!appReady) {
-    return (
-      <View className="flex-1 items-center justify-center bg-background">
-        <WhipMark accessibilityLabel={t('app.loading')} size={64} />
-      </View>
-    );
+  if (!appReady || navigation.mountedTabs.size === 0) {
+    return <AppLoadingScreen />;
   }
 
   return (
-    <AppShell
-      preferences={preferences}
-      entitlements={entitlements}
-      hosts={hosts}
-      sessions={sessions}
-      navigation={navigation}
-      remoteFiles={remoteFiles}
-      security={security}
-      terminals={terminals}
-      telemetry={telemetry}
-      history={history}
-    />
+    <View className="flex-1" onLayout={hideLaunchScreen}>
+      <AppShell
+        preferences={preferences}
+        entitlements={entitlements}
+        hosts={hosts}
+        sessions={sessions}
+        navigation={navigation}
+        remoteFiles={remoteFiles}
+        security={security}
+        terminals={terminals}
+        telemetry={telemetry}
+        history={history}
+      />
+    </View>
   );
 }
 

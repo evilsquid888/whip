@@ -3,7 +3,7 @@ import {
   LiquidGlassView,
 } from '@callstack/liquid-glass';
 import { BlurView } from 'expo-blur';
-import { createContext, useContext, type ReactNode, type RefObject } from 'react';
+import { createContext, useContext, useMemo, type ReactNode, type RefObject } from 'react';
 import { Platform, StyleSheet, View } from 'react-native';
 
 import { cn } from '@/src/lib/utils';
@@ -18,7 +18,8 @@ interface GlassContextValue {
 const GlassContext = createContext<GlassContextValue | null>(null);
 
 export function GlassProvider({ blurTarget, enabled, children }: GlassContextValue & { children: ReactNode }) {
-  return <GlassContext.Provider value={{ blurTarget, enabled }}>{children}</GlassContext.Provider>;
+  const value = useMemo(() => ({ blurTarget, enabled }), [blurTarget, enabled]);
+  return <GlassContext.Provider value={value}>{children}</GlassContext.Provider>;
 }
 
 export function useAppGlassEnabled(): boolean {
@@ -81,16 +82,18 @@ export function GlassSurface({
   className,
   intensity,
   style,
+  fallbackClassName,
   ...props
-}: React.ComponentProps<typeof View> & { intensity?: number }) {
+}: React.ComponentProps<typeof View> & { intensity?: number; fallbackClassName?: string }) {
   const glass = useContext(GlassContext);
   const { colors } = useTheme();
+  const enabled = glass?.enabled === true;
   return (
     <View
-      className={cn('relative overflow-hidden', className)}
-      style={[glass?.enabled === true ? undefined : { borderColor: colors.divider }, style]}
+      className={cn('relative overflow-hidden', className, !enabled && fallbackClassName)}
+      style={[enabled ? undefined : { borderColor: colors.divider }, style]}
       {...props}>
-      <GlassBackdrop intensity={intensity} shapeClassName={className} />
+      {(enabled || fallbackClassName === undefined) && <GlassBackdrop intensity={intensity} shapeClassName={className} />}
       {children}
     </View>
   );

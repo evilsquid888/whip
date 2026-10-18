@@ -7,166 +7,23 @@ use serde_json::{Map, Value};
 
 use crate::codex::rollout_reducer::CodexProjectionChanges;
 use crate::codex::rollout_wire::{
-    CodexHistoryMode, Event as CodexEvent, ResponseItem as CodexResponseItem, TurnItem,
-    decode_turn_item, interactive_response_notice,
+    CodexHistoryMode, Event as CodexEvent, ResponseItem as CodexResponseItem, TurnContext,
+    TurnItem, decode_turn_item, interactive_response_notice, question_reply_text,
 };
 use crate::codex::{CodexRolloutReducer, RolloutRecord, decode_rollout_record};
 
-use super::history_gate::InitialHistoryGate;
+use super::history_gate::{
+    InitialHistoryGate, advance_revision, next_status_update, status_update,
+};
+use super::jsonl::*;
+use super::metadata::{CodexUsageTracker, tool_duration, tool_input_json};
 use super::model::*;
 #[cfg(test)]
 use super::opencode::OpenCodeSessionCore;
 use super::projection::*;
 
 const UNSUPPORTED_HISTORY_MODE: &str = "Unsupported Codex SessionMeta.history_mode";
-const CODEX_CACHE_SCHEMA_VERSION: u32 = 3;
-
-pub const MAX_TRANSCRIPT_LINE_BYTES: usize = 4 * 1024 * 1024;
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CodexSourceIdentity {
-    pub requested_session_id: String,
-    pub rollout_path: String,
-    pub file_id: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FramedLine {
-    pub raw_line: String,
-    pub end_offset: u64,
-    pub parsed: Result<Value, String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum TranscriptParseError {
-    #[error("transcript record exceeded {MAX_TRANSCRIPT_LINE_BYTES} bytes")]
-    LineTooLarge,
-    #[error("transcript contained invalid UTF-8")]
-    InvalidUtf8,
-}
-
-/// Incremental byte-oriented JSONL framer. Its committed cursor never includes
-/// an incomplete or malformed physical line.
-#[derive(Clone, Debug, Default)]
-pub struct TranscriptJsonlFramer {
-    buffer: Vec<u8>,
-    received_offset: u64,
-    committable_offset: u64,
-    discarding_oversized_line: bool,
-}
-
-impl TranscriptJsonlFramer {
-    pub fn with_offset(offset: u64) -> Self {
-        Self {
-            buffer: Vec::new(),
-            received_offset: offset,
-            committable_offset: offset,
-            discarding_oversized_line: false,
-        }
-    }
-
-    pub fn received_offset(&self) -> u64 {
-        self.received_offset
-    }
-
-    pub fn committable_offset(&self) -> u64 {
-        self.committable_offset
-    }
-
-    pub fn partial_len(&self) -> usize {
-        self.buffer.len()
-    }
-
-    pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<FramedLine>, TranscriptParseError> {
-        self.received_offset = self
-            .received_offset
-            .saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
-        let mut lines = Vec::new();
-        let chunk = if self.discarding_oversized_line {
-            let Some(relative) = chunk.iter().position(|byte| *byte == b'\n') else {
-                return Ok(lines);
-            };
-            let consumed = relative + 1;
-            let end_offset = self
-                .received_offset
-                .saturating_sub(u64::try_from(chunk.len() - consumed).unwrap_or(0));
-            lines.push(FramedLine {
-                raw_line: String::new(),
-                end_offset,
-                parsed: Err(TranscriptParseError::LineTooLarge.to_string()),
-            });
-            self.discarding_oversized_line = false;
-            &chunk[consumed..]
-        } else {
-            chunk
-        };
-        self.buffer.extend_from_slice(chunk);
-        if self.buffer.len() > MAX_TRANSCRIPT_LINE_BYTES && !self.buffer.contains(&b'\n') {
-            self.buffer.clear();
-            self.discarding_oversized_line = true;
-            return Ok(lines);
-        }
-        let mut consumed = 0usize;
-        while let Some(relative) = self.buffer[consumed..]
-            .iter()
-            .position(|byte| *byte == b'\n')
-        {
-            let end = consumed + relative + 1;
-            if end - consumed > MAX_TRANSCRIPT_LINE_BYTES {
-                let end_offset = self
-                    .received_offset
-                    .saturating_sub(u64::try_from(self.buffer.len() - end).unwrap_or(0));
-                lines.push(FramedLine {
-                    raw_line: String::new(),
-                    end_offset,
-                    parsed: Err(TranscriptParseError::LineTooLarge.to_string()),
-                });
-                consumed = end;
-                continue;
-            }
-            let physical = &self.buffer[consumed..end];
-            let mut content = &physical[..physical.len() - 1];
-            if content.last() == Some(&b'\r') {
-                content = &content[..content.len() - 1];
-            }
-            let end_offset = self
-                .received_offset
-                .saturating_sub(u64::try_from(self.buffer.len() - end).unwrap_or(0));
-            let (raw_line, parsed) = match std::str::from_utf8(content) {
-                Ok(raw_line) if content.is_empty() => (raw_line.to_owned(), Ok(Value::Null)),
-                Ok(raw_line) => (
-                    raw_line.to_owned(),
-                    serde_json::from_slice(content).map_err(|error| error.to_string()),
-                ),
-                Err(_) => (
-                    String::new(),
-                    Err(TranscriptParseError::InvalidUtf8.to_string()),
-                ),
-            };
-            if parsed.is_ok() {
-                self.committable_offset = end_offset;
-            }
-            lines.push(FramedLine {
-                raw_line,
-                end_offset,
-                parsed,
-            });
-            consumed = end;
-        }
-        if consumed > 0 {
-            self.buffer.drain(..consumed);
-        }
-        if self.buffer.len() > MAX_TRANSCRIPT_LINE_BYTES {
-            self.buffer.clear();
-            self.discarding_oversized_line = true;
-        }
-        Ok(lines)
-    }
-
-    pub fn reset(&mut self, offset: u64) {
-        *self = Self::with_offset(offset);
-    }
-}
+const CODEX_CACHE_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Clone, Debug)]
 struct ToolLocation {
@@ -184,6 +41,9 @@ struct PendingTool {
 
 #[derive(Clone, Debug)]
 pub struct CodexTranscriptAdapter {
+    model: Option<String>,
+    provider: Option<String>,
+    usage_tracker: CodexUsageTracker,
     session_id: String,
     directory: Option<String>,
     messages: Vec<AgentTranscriptMessage>,
@@ -203,6 +63,9 @@ impl CodexTranscriptAdapter {
     pub fn new(session_id: impl Into<String>) -> Self {
         let session_id = session_id.into();
         Self {
+            model: None,
+            provider: None,
+            usage_tracker: CodexUsageTracker::default(),
             session_id,
             directory: None,
             messages: Vec::new(),
@@ -251,6 +114,7 @@ impl CodexTranscriptAdapter {
         };
         let handled = match &decoded {
             RolloutRecord::SessionMeta(payload) if selecting_mode => {
+                self.provider.clone_from(&payload.model_provider);
                 if let Some(id) = payload.id.as_ref().filter(|id| !id.is_empty()) {
                     self.session_id.clone_from(id);
                 }
@@ -260,9 +124,7 @@ impl CodexTranscriptAdapter {
                 true
             }
             RolloutRecord::TurnContext(context) => {
-                if let Some(cwd) = context.cwd.as_ref().filter(|cwd| !cwd.is_empty()) {
-                    self.directory = Some(cwd.clone());
-                }
+                self.accept_context(context, legacy);
                 true
             }
             RolloutRecord::Event(CodexEvent::ItemCompleted(completed)) => {
@@ -285,6 +147,14 @@ impl CodexTranscriptAdapter {
             }
             RolloutRecord::Event(CodexEvent::Legacy(payload)) if legacy => {
                 if let Some(payload) = payload.as_object() {
+                    if payload.get("type").and_then(Value::as_str) == Some("token_count") {
+                        let changed = self.accept_usage(payload, at);
+                        return CodexAdapterUpdate {
+                            handled: changed,
+                            reset: changed,
+                            deltas: Vec::new(),
+                        };
+                    }
                     self.accept_event(payload, at);
                 }
                 true
@@ -301,13 +171,14 @@ impl CodexTranscriptAdapter {
                 }
                 true
             }
-            RolloutRecord::Event(CodexEvent::TurnComplete(_)) => {
+            RolloutRecord::Event(CodexEvent::TurnComplete(completed)) => {
                 if legacy {
-                    if let Some(id) = self.active_assistant_message_id.clone()
-                        && let Some(message) = self.message_mut(&id)
-                    {
-                        message.completed_at_ms = at;
-                    }
+                    let id = self.assistant_message_id(at);
+                    self.complete_message(
+                        &id,
+                        completed.error.as_ref().map(|error| error.message.clone()),
+                        at,
+                    );
                     self.begin_turn();
                 }
                 true
@@ -318,8 +189,21 @@ impl CodexTranscriptAdapter {
                 }
                 true
             }
-            RolloutRecord::Event(CodexEvent::ItemStarted(_) | CodexEvent::TurnAborted(_))
-            | RolloutRecord::Compacted(_) => true,
+            RolloutRecord::Event(CodexEvent::TurnAborted(_)) => {
+                if legacy {
+                    let id = self.assistant_message_id(at);
+                    if let Some(message) = self.message_mut(&id) {
+                        message.completed_at_ms = at;
+                        message
+                            .details
+                            .get_or_insert_with(AgentTranscriptDetails::default)
+                            .outcome = Some(AgentTurnOutcome::Interrupted);
+                    }
+                    self.begin_turn();
+                }
+                true
+            }
+            RolloutRecord::Event(CodexEvent::ItemStarted(_)) | RolloutRecord::Compacted(_) => true,
             RolloutRecord::AppServerLike(value) if legacy => {
                 if let Some(record) = value.as_object() {
                     match nonempty(record.get("type")) {
@@ -494,6 +378,68 @@ impl CodexTranscriptAdapter {
         self.active_assistant_message_id = None;
     }
 
+    fn accept_context(&mut self, context: &TurnContext, legacy: bool) {
+        self.model.clone_from(&context.model);
+        if let Some(cwd) = context.cwd.as_ref().filter(|cwd| !cwd.is_empty()) {
+            self.directory = Some(cwd.clone());
+        }
+        if legacy {
+            let model = self.model.clone();
+            let provider = self.provider.clone();
+            if let Some(id) = self.active_assistant_message_id.clone()
+                && let Some(message) = self.message_mut(&id)
+            {
+                let details = message
+                    .details
+                    .get_or_insert_with(AgentTranscriptDetails::default);
+                details.model = model;
+                details.provider = provider;
+            }
+        }
+    }
+
+    fn complete_message(&mut self, id: &str, error: Option<String>, at: Option<u64>) {
+        if let Some(message) = self.message_mut(id) {
+            message.completed_at_ms = at;
+            message
+                .details
+                .get_or_insert_with(AgentTranscriptDetails::default)
+                .outcome = Some(if error.is_some() {
+                AgentTurnOutcome::Failed
+            } else {
+                AgentTurnOutcome::Completed
+            });
+            message.error = error;
+        }
+    }
+
+    fn accept_usage(&mut self, payload: &Map<String, Value>, at: Option<u64>) -> bool {
+        let Some(usage) = self.usage_tracker.accept(&Value::Object(payload.clone())) else {
+            return false;
+        };
+        let id = if self.active_assistant_message_id.is_some()
+            || self.active_user_message_id.is_some()
+        {
+            Some(self.assistant_message_id(at))
+        } else {
+            self.messages
+                .iter()
+                .rev()
+                .find(|message| message.role == AgentMessageRole::Assistant)
+                .map(|message| message.id.clone())
+        };
+        let Some(message) = id.as_ref().and_then(|id| self.message_mut(id)) else {
+            return false;
+        };
+        message
+            .details
+            .get_or_insert_with(AgentTranscriptDetails::default)
+            .usage
+            .get_or_insert_with(AgentTokenUsage::default)
+            .add(&usage);
+        true
+    }
+
     fn rollback_legacy(&mut self, num_turns: u32) {
         let turns = project_turns(&self.messages);
         let remove_count = usize::try_from(num_turns).unwrap_or(usize::MAX);
@@ -522,35 +468,71 @@ impl CodexTranscriptAdapter {
     }
 
     fn user_message(&mut self, text: String, id: String, at: Option<u64>, explicit_id: bool) {
+        let text = question_reply_text(&text).unwrap_or(text);
         let text = text.trim().to_owned();
         if text.is_empty() || injected_user_context(&text) {
             return;
         }
-        let signature = format!("user\n{text}");
+        let parts = user_prompt_parts(&format!("user:{id}:text"), &text, at);
+        let prompt_text = parts
+            .iter()
+            .filter_map(|part| match part {
+                AgentTranscriptPart::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let signature = format!(
+            "user\n{}",
+            if prompt_text.is_empty() {
+                "[image]"
+            } else {
+                &prompt_text
+            }
+        );
         if let Some((existing, sequence, existing_explicit_id)) =
             self.recent_messages.get_mut(&signature)
             && self.sequence.saturating_sub(*sequence) <= 4
             && (!explicit_id || !*existing_explicit_id)
         {
             *sequence = self.sequence;
-            self.active_user_message_id = Some(existing.clone());
+            let existing = existing.clone();
+            if let Some(message) = self.message_mut(&existing)
+                && !message
+                    .parts
+                    .iter()
+                    .any(|part| matches!(part, AgentTranscriptPart::Image { .. }))
+            {
+                for part in parts {
+                    if let AgentTranscriptPart::Image {
+                        source,
+                        timestamp_ms,
+                        ..
+                    } = part
+                    {
+                        message.parts.push(AgentTranscriptPart::Image {
+                            id: format!("{existing}:image:{}", message.parts.len()),
+                            source,
+                            timestamp_ms,
+                        });
+                    }
+                }
+            }
+            self.active_user_message_id = Some(existing);
             return;
         }
         let message_id = format!("user:{id}");
         self.recent_messages
             .insert(signature, (message_id.clone(), self.sequence, explicit_id));
         self.put_message(AgentTranscriptMessage {
+            details: None,
             id: message_id.clone(),
             role: AgentMessageRole::User,
             parent_id: None,
             created_at_ms: at,
             completed_at_ms: None,
             error: None,
-            parts: vec![AgentTranscriptPart::Text {
-                id: format!("{message_id}:text"),
-                text,
-                timestamp_ms: at,
-            }],
+            parts,
             diffs: Vec::new(),
         });
         self.active_user_message_id = Some(message_id);
@@ -571,6 +553,11 @@ impl CodexTranscriptAdapter {
         );
         if self.message(&id).is_none() {
             self.put_message(AgentTranscriptMessage {
+                details: Some(AgentTranscriptDetails {
+                    model: self.model.clone(),
+                    provider: self.provider.clone(),
+                    ..Default::default()
+                }),
                 id: id.clone(),
                 role: AgentMessageRole::Assistant,
                 parent_id: self.active_user_message_id.clone(),
@@ -683,8 +670,11 @@ impl CodexTranscriptAdapter {
         });
         let (old_state, old_name, old_at) = existing.unwrap_or((
             AgentToolState {
+                duration_ms: None,
+                input_json: None,
                 status: AgentToolStatus::Pending,
                 input: Vec::new(),
+                questions: Vec::new(),
                 output: None,
                 error: None,
                 title: None,
@@ -715,7 +705,10 @@ impl CodexTranscriptAdapter {
             tool: name,
             timestamp_ms: old_at,
             state: AgentToolState {
+                duration_ms: old_state.duration_ms,
+                input_json: old_state.input_json,
                 status,
+                questions: questions_from_input(&input),
                 input,
                 output: output.or(old_state.output),
                 error: error.or(old_state.error),
@@ -753,7 +746,7 @@ impl CodexTranscriptAdapter {
             .unwrap_or_else(|| self.sequence.to_string());
         match kind {
             "message" if item.get("role").and_then(Value::as_str) == Some("user") => {
-                self.user_message(text_content(item.get("content")), id, at, true);
+                self.user_message(user_content(item.get("content")), id, at, true);
             }
             "agent_message" => self.assistant_text(
                 nonempty(item.get("text")).unwrap_or_default().to_owned(),
@@ -818,6 +811,14 @@ impl CodexTranscriptAdapter {
         let call_id = nonempty(payload.get("call_id"))
             .map(str::to_owned)
             .unwrap_or_else(|| item_id.clone());
+        let input_call_id = call_id.clone();
+        let raw_input = match kind {
+            "local_shell_call" | "web_search_call" => payload.get("action"),
+            "function_call" | "custom_tool_call" | "tool_search_call" => {
+                payload.get("arguments").or_else(|| payload.get("input"))
+            }
+            _ => None,
+        };
         match kind {
             "message" => {
                 let content = text_content(payload.get("content"));
@@ -825,7 +826,12 @@ impl CodexTranscriptAdapter {
                     Some("assistant") => {
                         self.assistant_text(content, item_id, at, false, has_item_id);
                     }
-                    Some("user") => self.user_message(content, item_id, at, has_item_id),
+                    Some("user") => self.user_message(
+                        user_content(payload.get("content")),
+                        item_id,
+                        at,
+                        has_item_id,
+                    ),
                     _ => {}
                 }
             }
@@ -971,6 +977,24 @@ impl CodexTranscriptAdapter {
                 at,
             ),
             _ => {}
+        }
+        if let Some(input_json) = tool_input_json(raw_input) {
+            let target_id = self
+                .pending_tools
+                .get(&input_call_id)
+                .map(|pending| &pending.target_id)
+                .unwrap_or(&input_call_id);
+            let key = format!("tool:{target_id}");
+            if let Some(location) = self.tools.get(&key).cloned()
+                && let Some(message) = self.message_mut(&location.message_id)
+                && let Some(AgentTranscriptPart::Tool { state, .. }) =
+                    message.parts.iter_mut().find(|part| part.id() == key)
+            {
+                // Continuation calls retain the original invocation's arguments.
+                if state.input_json.is_none() {
+                    state.input_json = Some(input_json);
+                }
+            }
         }
     }
 
@@ -1154,6 +1178,30 @@ impl CodexTranscriptAdapter {
             }
             _ => return false,
         }
+        let key = format!("tool:{call_id}");
+        if let Some(location) = self.tools.get(&key).cloned()
+            && let Some(message) = self.message_mut(&location.message_id)
+            && let Some(AgentTranscriptPart::Tool { state, .. }) =
+                message.parts.iter_mut().find(|part| part.id() == key)
+        {
+            state.duration_ms = tool_duration(&Value::Object(payload.clone()))
+                .or_else(|| {
+                    state
+                        .completed_at_ms
+                        .zip(state.started_at_ms)
+                        .and_then(|(end, start)| end.checked_sub(start))
+                })
+                .or(state.duration_ms);
+            if state.input_json.is_none() {
+                state.input_json = tool_input_json(
+                    payload
+                        .get("arguments")
+                        .or_else(|| payload.get("input"))
+                        .or_else(|| payload.get("action"))
+                        .or_else(|| payload.get("changes")),
+                );
+            }
+        }
         true
     }
 
@@ -1175,14 +1223,24 @@ impl CodexTranscriptAdapter {
                 }
                 self.begin_turn();
             }
-            "user_message" => self.user_message(
-                nonempty(payload.get("message"))
+            "user_message" => {
+                let mut text = nonempty(payload.get("message"))
                     .unwrap_or_default()
-                    .to_owned(),
-                format!("event:{call_id}"),
-                at,
-                false,
-            ),
+                    .to_owned();
+                for source in payload
+                    .get("local_images")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                {
+                    if !text.contains(source) {
+                        text.push('\n');
+                        text.push_str(source);
+                    }
+                }
+                self.user_message(text, format!("event:{call_id}"), at, false);
+            }
             "agent_message" => self.assistant_text(
                 nonempty(payload.get("message"))
                     .unwrap_or_default()
@@ -1237,18 +1295,20 @@ impl CodexTranscriptAdapter {
                         },
                         text,
                         timestamp_ms: at,
+                        questions: Vec::new(),
                     },
                     at,
                 );
             }
             _ => {
-                if let Some(text) = interactive_response_notice(kind) {
+                if let Some((text, questions)) = interactive_response_notice(payload) {
                     self.put_part(
                         AgentTranscriptPart::Notice {
                             id: format!("notice:{}", self.sequence),
                             level: AgentNoticeLevel::Info,
-                            text: text.to_owned(),
+                            text,
                             timestamp_ms: at,
+                            questions,
                         },
                         at,
                     );
@@ -1271,6 +1331,41 @@ struct CachedCodexLine {
     end_offset: u64,
 }
 
+/// Referenced immutable prefixes are separate from the live file's byte cursor.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct CodexInheritedHistory {
+    pub header: Value,
+    pub records: Vec<Value>,
+}
+
+pub(crate) struct CodexCachedHistoryPrefix {
+    pub bytes: String,
+    pub inherited_history: Option<CodexInheritedHistory>,
+}
+
+impl CodexInheritedHistory {
+    fn replay(&self, adapter: &mut CodexTranscriptAdapter) -> Result<(), AgentCacheError> {
+        let RolloutRecord::SessionMeta(meta) = decode_rollout_record(&self.header) else {
+            return Err(AgentCacheError::Malformed(
+                "invalid inherited history header".into(),
+            ));
+        };
+        if meta.history_mode != CodexHistoryMode::Paginated || meta.history_base.is_none() {
+            return Err(AgentCacheError::Malformed(
+                "invalid inherited history mode".into(),
+            ));
+        }
+        adapter.accept(&self.header);
+        for record in &self.records {
+            adapter.accept(record);
+        }
+        // Ancestor turn contexts must not replace the child rollout's identity.
+        adapter.directory = meta.cwd;
+        adapter.rollout_reducer.resume_provider(meta.model_provider);
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct CachedCodexSession {
     schema_version: u32,
@@ -1284,6 +1379,8 @@ struct CachedCodexSession {
     revision: Option<u64>,
     #[serde(default)]
     transcript: Option<AgentTranscriptState>,
+    #[serde(default)]
+    inherited_history: Option<CodexInheritedHistory>,
 }
 
 #[derive(Serialize)]
@@ -1295,23 +1392,38 @@ struct CachedCodexSessionRef<'a> {
     lines: &'a [CachedCodexLine],
     history_mode: CodexHistoryMode,
     revision: u64,
+    inherited_history: Option<&'a CodexInheritedHistory>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CodexBindResult {
-    pub source_generation: u64,
-    pub start_offset: u64,
-    pub rebuilt: bool,
-}
-
-#[derive(Clone, Debug)]
-pub struct CodexIngestResult {
-    pub source_generation: u64,
-    pub received_offset: u64,
-    pub committable_offset: u64,
-    pub malformed_records: u32,
-    pub changed: bool,
-    pub update: Option<AgentTranscriptUpdate>,
+/// Schema 1 stored the old projection as well as its authoritative raw prefix.
+/// Validate its content without treating newly recovered metadata as corruption.
+fn legacy_projection_matches(replay: &AgentTranscriptState, cached: &AgentTranscriptState) -> bool {
+    let content_messages = |messages: &[AgentTranscriptMessage]| {
+        messages
+            .iter()
+            .filter(|message| !message.parts.is_empty())
+            .map(|message| {
+                let mut message = message.clone();
+                message.details = None;
+                for part in &mut message.parts {
+                    if let AgentTranscriptPart::Tool { state, .. } = part {
+                        state.input_json = None;
+                        state.duration_ms = None;
+                    }
+                }
+                message
+            })
+            .collect::<Vec<_>>()
+    };
+    let replay_messages = content_messages(&replay.messages);
+    let cached_messages = content_messages(&cached.messages);
+    let mut cached_turns = cached.turns.clone();
+    for turn in &mut cached_turns {
+        turn.details = None;
+    }
+    replay.info == cached.info
+        && replay_messages == cached_messages
+        && project_turns(&replay_messages) == cached_turns
 }
 
 /// Pure state machine shared by live sessions and deterministic tests. Remote
@@ -1319,15 +1431,13 @@ pub struct CodexIngestResult {
 #[derive(Clone, Debug)]
 pub struct CodexSessionCore {
     requested_session_id: String,
-    source: Option<CodexSourceIdentity>,
-    source_generation: u64,
+    cursor: FileSourceCursor,
     revision: u64,
     adapter: CodexTranscriptAdapter,
-    framer: TranscriptJsonlFramer,
     cached_lines: Vec<CachedCodexLine>,
-    committed_offset: u64,
-    initial_history_end: Option<u64>,
     history_gate: InitialHistoryGate,
+    restored_history: bool,
+    inherited_history: Option<CodexInheritedHistory>,
 }
 
 impl CodexSessionCore {
@@ -1335,24 +1445,86 @@ impl CodexSessionCore {
         let session_id = session_id.into();
         Self {
             requested_session_id: session_id.clone(),
-            source: None,
-            source_generation: 0,
+            cursor: FileSourceCursor::default(),
             revision: 0,
             adapter: CodexTranscriptAdapter::new(session_id),
-            framer: TranscriptJsonlFramer::default(),
             cached_lines: Vec::new(),
-            committed_offset: 0,
-            initial_history_end: None,
             history_gate: InitialHistoryGate::default(),
+            restored_history: false,
+            inherited_history: None,
         }
     }
 
+    pub(crate) fn invalidate_source(&mut self) {
+        self.cursor.source = None;
+    }
+
+    pub(crate) fn rollout_path(&self) -> Option<&str> {
+        self.cursor
+            .source
+            .as_ref()
+            .filter(|source| source.requested_session_id == self.requested_session_id)
+            .map(|source| source.rollout_path.as_str())
+    }
+
+    pub(crate) fn inherited_history(&self) -> Option<&CodexInheritedHistory> {
+        self.inherited_history.as_ref()
+    }
+
+    /// Copy only a complete physical prefix, preserving its original byte offsets.
+    pub(crate) fn cached_history_prefix(
+        &self,
+        end_byte_offset: u64,
+    ) -> Option<CodexCachedHistoryPrefix> {
+        if self.adapter.history_mode != CodexHistoryMode::Paginated
+            || end_byte_offset > self.committable_offset()
+        {
+            return None;
+        }
+        let count = self
+            .cached_lines
+            .partition_point(|line| line.end_offset <= end_byte_offset);
+        let lines = &self.cached_lines[..count];
+        if lines.last()?.end_offset != end_byte_offset {
+            return None;
+        }
+        let mut bytes = String::new();
+        let mut previous = 0;
+        for line in lines {
+            // Empty lines also represent bytes discarded by the framer after
+            // decoding errors. Reload them instead of hiding malformed input.
+            if line.raw_line.is_empty() {
+                return None;
+            }
+            // The framer strips CRLF. Reconstruct it from the stored physical
+            // boundaries, and reject caches that dropped or changed raw bytes.
+            let content_length = u64::try_from(line.raw_line.len()).ok()?;
+            let terminator_length = line
+                .end_offset
+                .checked_sub(previous)?
+                .checked_sub(content_length)?;
+            if !matches!(terminator_length, 1 | 2) {
+                return None;
+            }
+            bytes.push_str(&line.raw_line);
+            if terminator_length == 2 {
+                bytes.push('\r');
+            }
+            bytes.push('\n');
+            previous = line.end_offset;
+        }
+        Some(CodexCachedHistoryPrefix {
+            bytes,
+            inherited_history: self.inherited_history.clone(),
+        })
+    }
+
     pub fn source_generation(&self) -> u64 {
-        self.source_generation
+        self.cursor.generation
     }
 
     pub fn committed_offset(&self) -> u64 {
-        self.committed_offset
+        self.cursor.committed
     }
 
     pub fn revision(&self) -> u64 {
@@ -1360,7 +1532,7 @@ impl CodexSessionCore {
     }
 
     pub fn received_offset(&self) -> u64 {
-        self.framer.received_offset()
+        self.cursor.framer.received_offset()
     }
 
     pub fn state(&self) -> AgentTranscriptState {
@@ -1378,14 +1550,24 @@ impl CodexSessionCore {
 
     pub fn mark_stale_update(&mut self, error: impl Into<String>) -> AgentTranscriptUpdate {
         self.history_gate.mark_stale(error);
-        self.bump_revision();
-        self.status_update()
+        self.next_status_update()
     }
 
     pub fn mark_restarting_update(&mut self, reason: impl Into<String>) -> AgentTranscriptUpdate {
         self.history_gate.restart(reason);
-        self.bump_revision();
-        self.status_update()
+        self.next_status_update()
+    }
+
+    pub(crate) fn mark_discovery_retry_update(
+        &mut self,
+        reason: impl Into<String>,
+    ) -> AgentTranscriptUpdate {
+        // A validated cache is usable offline while discovery retries. Partial
+        // history from an interrupted first read must still finish its boundary.
+        if self.restored_history {
+            self.history_gate.complete();
+        }
+        self.mark_restarting_update(reason)
     }
 
     pub fn mark_unavailable(&mut self, error: impl Into<String>) -> AgentTranscriptState {
@@ -1395,20 +1577,13 @@ impl CodexSessionCore {
 
     pub fn mark_unavailable_update(&mut self, error: impl Into<String>) -> AgentTranscriptUpdate {
         self.history_gate.mark_unavailable(error);
-        self.bump_revision();
-        self.status_update()
+        self.next_status_update()
     }
 
     pub fn mark_live(&mut self) -> bool {
-        if self.adapter.history_mode != CodexHistoryMode::Unsupported
+        self.adapter.history_mode != CodexHistoryMode::Unsupported
             && self.opening_boundary_reached()
-            && self.history_gate.complete()
-        {
-            self.bump_revision();
-            true
-        } else {
-            false
-        }
+            && self.history_gate.complete_revision(&mut self.revision)
     }
 
     pub fn mark_live_update(&mut self) -> Option<AgentTranscriptUpdate> {
@@ -1421,16 +1596,18 @@ impl CodexSessionCore {
     }
 
     pub fn close_update(&mut self) -> AgentTranscriptUpdate {
-        self.source_generation = self.source_generation.saturating_add(1);
+        self.cursor.generation = self.cursor.generation.saturating_add(1);
         self.history_gate.close();
-        self.bump_revision();
-        self.status_update()
+        self.next_status_update()
     }
 
     pub fn restore_cache(&mut self, bytes: &[u8]) -> Result<AgentTranscriptState, AgentCacheError> {
         let cached: CachedCodexSession = serde_json::from_slice(bytes)
             .map_err(|error| AgentCacheError::Malformed(error.to_string()))?;
-        if !matches!(cached.schema_version, 1 | 2 | CODEX_CACHE_SCHEMA_VERSION) {
+        if !matches!(
+            cached.schema_version,
+            1 | 2 | 3 | CODEX_CACHE_SCHEMA_VERSION
+        ) {
             return Err(AgentCacheError::Malformed("unsupported schema".to_owned()));
         }
         if cached.requested_session_id != self.requested_session_id {
@@ -1445,6 +1622,15 @@ impl CodexSessionCore {
         }
         let mut previous = 0;
         let mut adapter = CodexTranscriptAdapter::new(self.requested_session_id.clone());
+        if let Some(history) = &cached.inherited_history {
+            history.replay(&mut adapter)?;
+            if let Some(first) = cached.lines.first()
+                && serde_json::from_str::<Value>(&first.raw_line).ok().as_ref()
+                    != Some(&history.header)
+            {
+                return Err(AgentCacheError::ReplayDiverged);
+            }
+        }
         for line in &cached.lines {
             if line.end_offset <= previous || line.end_offset > cached.committed_offset {
                 return Err(AgentCacheError::Malformed(
@@ -1458,9 +1644,7 @@ impl CodexSessionCore {
         }
         // Old caches contain the raw prefix, so migration also reads SessionMeta.
         // New caches must agree with that canonical header before resuming a cursor.
-        if cached.schema_version == CODEX_CACHE_SCHEMA_VERSION
-            && cached.history_mode != Some(adapter.history_mode)
-        {
+        if cached.schema_version >= 3 && cached.history_mode != Some(adapter.history_mode) {
             return Err(AgentCacheError::ReplayDiverged);
         }
         if cached.committed_offset > 0 && adapter.history_mode == CodexHistoryMode::Unselected {
@@ -1477,10 +1661,7 @@ impl CodexSessionCore {
                 transcript.status,
                 transcript.error.clone(),
             );
-            if replay.info != transcript.info
-                || replay.messages != transcript.messages
-                || replay.turns != transcript.turns
-            {
+            if !legacy_projection_matches(&replay, transcript) {
                 return Err(AgentCacheError::ReplayDiverged);
             }
             transcript.revision
@@ -1494,50 +1675,47 @@ impl CodexSessionCore {
                 .revision
                 .ok_or_else(|| AgentCacheError::Malformed("cache revision is missing".to_owned()))?
         };
-        self.source = cached.source;
-        self.committed_offset = cached.committed_offset;
+        self.cursor.source = cached.source;
+        self.cursor.committed = cached.committed_offset;
         self.cached_lines = cached.lines;
+        self.inherited_history = cached.inherited_history;
+        self.restored_history = !adapter.projected_messages().is_empty()
+            && adapter.history_mode != CodexHistoryMode::Unsupported;
         self.adapter = adapter;
         self.revision = revision;
         // A checkpoint can be behind the remote rollout. Keep it hidden until
         // discovery establishes a boundary and the stream catches up to it.
-        self.initial_history_end = None;
+        self.cursor.initial_history_end = None;
         self.history_gate.reset();
-        self.framer = TranscriptJsonlFramer::with_offset(self.committed_offset);
+        self.cursor.framer = TranscriptJsonlFramer::with_offset(self.cursor.committed);
         self.bump_revision();
         Ok(self.state())
     }
 
     pub fn committable_offset(&self) -> u64 {
-        self.framer.committable_offset()
+        self.cursor.framer.committable_offset()
     }
 
     pub fn cache_blob(&self) -> Result<Vec<u8>, AgentCacheError> {
-        let committable = self.framer.committable_offset();
+        let committable = self.cursor.framer.committable_offset();
         let committed_line_count = self
             .cached_lines
             .partition_point(|line| line.end_offset <= committable);
         serde_json::to_vec(&CachedCodexSessionRef {
             schema_version: CODEX_CACHE_SCHEMA_VERSION,
             requested_session_id: &self.requested_session_id,
-            source: self.source.as_ref(),
+            source: self.cursor.source.as_ref(),
             committed_offset: committable,
             lines: &self.cached_lines[..committed_line_count],
             history_mode: self.adapter.history_mode,
             revision: self.revision,
+            inherited_history: self.inherited_history.as_ref(),
         })
         .map_err(|error| AgentCacheError::Malformed(error.to_string()))
     }
 
     pub fn confirm_cache(&mut self, source_generation: u64, offset: u64) -> bool {
-        if source_generation != self.source_generation
-            || offset < self.committed_offset
-            || offset > self.framer.committable_offset()
-        {
-            return false;
-        }
-        self.committed_offset = offset;
-        true
+        self.cursor.confirm(source_generation, offset)
     }
 
     pub fn bind_source(
@@ -1546,37 +1724,52 @@ impl CodexSessionCore {
         file_id: String,
         remote_size: u64,
     ) -> CodexBindResult {
-        let next = CodexSourceIdentity {
-            requested_session_id: self.requested_session_id.clone(),
-            rollout_path: path,
-            file_id,
-        };
-        self.source_generation = self.source_generation.saturating_add(1);
-        // In-process reconnects may happen after records were incorporated but
-        // before the platform cache write was confirmed. Resume after the last
-        // complete handled line, while keeping committed_offset as the durable
-        // crash-recovery checkpoint.
-        let resume_offset = self.framer.committable_offset();
-        let warm = self.source.as_ref() == Some(&next) && remote_size >= resume_offset;
-        if warm {
-            self.framer = TranscriptJsonlFramer::with_offset(resume_offset);
-        } else {
+        let binding = self
+            .cursor
+            .bind(&self.requested_session_id, path, file_id, remote_size);
+        if binding.rebuilt {
             self.adapter = CodexTranscriptAdapter::new(self.requested_session_id.clone());
             self.cached_lines.clear();
-            self.committed_offset = 0;
-            self.framer.reset(0);
+            self.inherited_history = None;
             self.bump_revision();
+            self.history_gate.reset();
+        } else {
+            // Keep already usable history mounted while catching up to the new
+            // opening boundary of the same file. Initial history stays loading.
+            self.history_gate.restart("Synchronizing Codex transcript");
         }
-        self.source = Some(next);
-        // Freeze the opening boundary. Later appends must not keep moving the
-        // target while the initial transcript is being prepared for display.
-        self.initial_history_end = Some(remote_size);
-        self.history_gate.reset();
-        CodexBindResult {
-            source_generation: self.source_generation,
-            start_offset: if warm { resume_offset } else { 0 },
-            rebuilt: !warm,
+        self.restored_history = false;
+        binding
+    }
+
+    pub(crate) fn bind_source_with_history(
+        &mut self,
+        path: String,
+        file_id: String,
+        remote_size: u64,
+        history: Option<CodexInheritedHistory>,
+    ) -> Result<CodexBindResult, AgentCacheError> {
+        let mut binding = self.bind_source(path, file_id, remote_size);
+        if self.inherited_history != history {
+            let mut adapter = CodexTranscriptAdapter::new(self.requested_session_id.clone());
+            if let Some(history) = &history {
+                history.replay(&mut adapter)?;
+            }
+            // A warm cache from an older reader can have the right byte cursor
+            // but no inherited prefix. Rebuild its projection without rereading
+            // or moving that cursor.
+            for line in &self.cached_lines {
+                if let Ok(value) = serde_json::from_str::<Value>(&line.raw_line) {
+                    adapter.accept(&value);
+                }
+            }
+            self.adapter = adapter;
+            self.inherited_history = history;
+            self.bump_revision();
+            self.history_gate.reset();
+            binding.rebuilt = true;
         }
+        Ok(binding)
     }
 
     pub fn ingest(
@@ -1584,17 +1777,17 @@ impl CodexSessionCore {
         source_generation: u64,
         bytes: &[u8],
     ) -> Result<CodexIngestResult, TranscriptParseError> {
-        if source_generation != self.source_generation {
+        if source_generation != self.cursor.generation {
             return Ok(CodexIngestResult {
                 source_generation,
-                received_offset: self.framer.received_offset(),
-                committable_offset: self.framer.committable_offset(),
+                received_offset: self.cursor.framer.received_offset(),
+                committable_offset: self.cursor.framer.committable_offset(),
                 malformed_records: 0,
                 changed: false,
                 update: None,
             });
         }
-        let lines = self.framer.push(bytes)?;
+        let lines = self.cursor.framer.push(bytes)?;
         let mut changed = false;
         let mut reset = false;
         let mut deltas = Vec::new();
@@ -1637,8 +1830,8 @@ impl CodexSessionCore {
         });
         Ok(CodexIngestResult {
             source_generation,
-            received_offset: self.framer.received_offset(),
-            committable_offset: self.framer.committable_offset(),
+            received_offset: self.cursor.framer.received_offset(),
+            committable_offset: self.cursor.framer.committable_offset(),
             malformed_records,
             changed,
             update,
@@ -1649,28 +1842,35 @@ impl CodexSessionCore {
         // Called after ingest has processed every complete record in a chunk.
         // A record still being written at the boundary is live input; waiting
         // for its newline (or a durable cache cursor) could block opening forever.
-        self.initial_history_end
-            .is_some_and(|end| self.framer.received_offset() >= end)
+        self.cursor.caught_up()
+    }
+
+    pub fn initial_history_caught_up(&self) -> bool {
+        self.opening_boundary_reached()
     }
 
     fn status_update(&self) -> AgentTranscriptUpdate {
-        AgentTranscriptUpdate {
-            revision: self.revision,
-            deltas: vec![
-                if self.adapter.history_mode == CodexHistoryMode::Unsupported {
-                    AgentTranscriptDelta::StatusChanged {
-                        status: AgentTranscriptStatus::Unavailable,
-                        error: Some(UNSUPPORTED_HISTORY_MODE.to_owned()),
-                    }
-                } else {
-                    self.history_gate.status_delta()
-                },
-            ],
+        status_update(self.revision, self.status_delta())
+    }
+
+    fn next_status_update(&mut self) -> AgentTranscriptUpdate {
+        let delta = self.status_delta();
+        next_status_update(&mut self.revision, delta)
+    }
+
+    fn status_delta(&self) -> AgentTranscriptDelta {
+        if self.adapter.history_mode == CodexHistoryMode::Unsupported {
+            AgentTranscriptDelta::StatusChanged {
+                status: AgentTranscriptStatus::Unavailable,
+                error: Some(UNSUPPORTED_HISTORY_MODE.to_owned()),
+            }
+        } else {
+            self.history_gate.status_delta()
         }
     }
 
     fn bump_revision(&mut self) {
-        self.revision = self.revision.saturating_add(1);
+        advance_revision(&mut self.revision);
     }
 }
 
@@ -1678,8 +1878,174 @@ impl CodexSessionCore {
 mod tests {
     use super::*;
 
+    #[test]
+    fn usage_model_outcomes_and_nested_inputs_survive_both_history_modes_and_cache() {
+        for mode in ["legacy", "paginated"] {
+            let mut records = vec![record(
+                "session_meta",
+                serde_json::json!({"id":"usage-session", "cwd":"/repo", "history_mode":mode, "model_provider":"openai"}),
+            )];
+            records.push(record(
+                "event_msg",
+                serde_json::json!({"type":"task_started", "turn_id":"turn-1"}),
+            ));
+            records.push(record(
+                "turn_context",
+                serde_json::json!({"turn_id":"turn-1", "cwd":"/repo", "model":"test-model"}),
+            ));
+            let input = serde_json::json!({"query":"check", "options":{"paths":["src","tests"]}});
+            if mode == "paginated" {
+                records.push(record("event_msg", serde_json::json!({"type":"item_completed", "thread_id":"usage-session", "turn_id":"turn-1", "item":{"type":"UserMessage", "id":"user", "content":[{"type":"text","text":"Check"}]}})));
+                records.push(record("event_msg", serde_json::json!({"type":"item_completed", "thread_id":"usage-session", "turn_id":"turn-1", "item":{"type":"DynamicToolCall", "id":"call", "tool":"inspect", "arguments":input, "success":true, "duration":{"secs":2,"nanos":500_000_000}}})));
+            } else {
+                records.push(record(
+                    "event_msg",
+                    serde_json::json!({"type":"user_message", "message":"Check"}),
+                ));
+                records.push(record("response_item", serde_json::json!({"type":"function_call", "call_id":"call", "name":"inspect", "arguments":input.to_string()})));
+                records.push(record("response_item", serde_json::json!({"type":"function_call_output", "call_id":"call", "output":"ok"})));
+            }
+            let usage = serde_json::json!({"type":"token_count", "info":{"total_token_usage":{"input_tokens":40,"output_tokens":10,"cached_input_tokens":20,"reasoning_output_tokens":3,"total_tokens":50}, "last_token_usage":{"input_tokens":40,"output_tokens":10,"cached_input_tokens":20,"reasoning_output_tokens":3,"total_tokens":50}}});
+            records.push(record("event_msg", usage.clone()));
+            records.push(record("event_msg", usage));
+            records.push(record(
+                "event_msg",
+                serde_json::json!({"type":"task_complete", "turn_id":"turn-1"}),
+            ));
+            let bytes = records.concat();
+            let mut core = CodexSessionCore::new("usage-session");
+            let binding = core.bind_source("/rollout".into(), "1:2".into(), bytes.len() as u64);
+            core.ingest(binding.source_generation, &bytes).unwrap();
+            let state = core.state();
+            let details = state.turns[0].details.as_ref().unwrap();
+            assert_eq!(details.model.as_deref(), Some("test-model"), "{mode}");
+            assert_eq!(details.provider.as_deref(), Some("openai"));
+            assert_eq!(details.usage.as_ref().unwrap().total, Some(50));
+            assert_eq!(details.usage.as_ref().unwrap().reasoning, Some(3));
+            assert_eq!(details.outcome, Some(AgentTurnOutcome::Completed));
+            let tool = state
+                .messages
+                .iter()
+                .flat_map(|message| &message.parts)
+                .find_map(|part| match part {
+                    AgentTranscriptPart::Tool { state, .. } => Some(state),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(tool.input_json.as_ref().unwrap()).unwrap(),
+                input
+            );
+            if mode == "paginated" {
+                assert_eq!(tool.duration_ms, Some(2500));
+            }
+            let mut restored = CodexSessionCore::new("usage-session");
+            restored.restore_cache(&core.cache_blob().unwrap()).unwrap();
+            assert_eq!(restored.state().turns, state.turns);
+            assert_eq!(restored.state().messages, state.messages);
+            if mode == "legacy" {
+                let mut old: Value = serde_json::from_slice(&core.cache_blob().unwrap()).unwrap();
+                old["schema_version"] = serde_json::json!(1);
+                old.as_object_mut().unwrap().remove("revision");
+                old.as_object_mut().unwrap().remove("history_mode");
+                old["transcript"] = serde_json::to_value(&state).unwrap();
+                for message in old["transcript"]["messages"].as_array_mut().unwrap() {
+                    message.as_object_mut().unwrap().remove("details");
+                    for part in message["parts"].as_array_mut().unwrap() {
+                        if let Some(tool) = part
+                            .get_mut("Tool")
+                            .and_then(|tool| tool.get_mut("state"))
+                            .and_then(Value::as_object_mut)
+                        {
+                            tool.remove("input_json");
+                            tool.remove("duration_ms");
+                        }
+                    }
+                }
+                for turn in old["transcript"]["turns"].as_array_mut().unwrap() {
+                    turn.as_object_mut().unwrap().remove("details");
+                }
+                let mut migrated = CodexSessionCore::new("usage-session");
+                migrated
+                    .restore_cache(&serde_json::to_vec(&old).unwrap())
+                    .unwrap();
+                assert_eq!(migrated.state().turns, state.turns);
+                old["transcript"]["messages"][0]["parts"][0]["Text"]["text"] =
+                    Value::String("tampered".into());
+                assert!(matches!(
+                    CodexSessionCore::new("usage-session")
+                        .restore_cache(&serde_json::to_vec(&old).unwrap()),
+                    Err(AgentCacheError::ReplayDiverged)
+                ));
+            }
+        }
+    }
+
     fn record(kind: &str, payload: Value) -> Vec<u8> {
         format!("{}\n", serde_json::json!({"timestamp":"2026-08-24T12:00:00.000Z","type":kind,"payload":payload})).into_bytes()
+    }
+
+    #[test]
+    fn legacy_usage_before_text_belongs_to_the_new_prompt_and_duplicates_emit_no_update() {
+        let mut core = CodexSessionCore::new("usage-session");
+        let binding = core.bind_source("/rollout".into(), "1:2".into(), 0);
+        let counter = |input| serde_json::json!({"type":"token_count", "info":{"total_token_usage":{"input_tokens":input,"output_tokens":0,"total_tokens":input}, "last_token_usage":{"input_tokens":10,"output_tokens":0,"total_tokens":10}}});
+        let bytes = [
+            record("session_meta", serde_json::json!({"id":"usage-session"})),
+            record(
+                "event_msg",
+                serde_json::json!({"type":"user_message","message":"First"}),
+            ),
+            record("event_msg", counter(10)),
+            record(
+                "event_msg",
+                serde_json::json!({"type":"task_complete","turn_id":"first"}),
+            ),
+            record(
+                "event_msg",
+                serde_json::json!({"type":"user_message","message":"Second"}),
+            ),
+            record("event_msg", counter(20)),
+        ]
+        .concat();
+        core.ingest(binding.source_generation, &bytes).unwrap();
+        let state = core.state();
+        assert_eq!(state.turns.len(), 2);
+        for turn in &state.turns {
+            assert_eq!(
+                turn.details.as_ref().unwrap().usage.as_ref().unwrap().total,
+                Some(10)
+            );
+        }
+        assert!(
+            !core
+                .ingest(binding.source_generation, &record("event_msg", counter(20)))
+                .unwrap()
+                .changed
+        );
+        assert_eq!(core.state(), state);
+    }
+
+    #[test]
+    fn inherited_history_keeps_historical_providers_and_restores_the_active_provider() {
+        let mut adapter = CodexTranscriptAdapter::new("child");
+        CodexInheritedHistory {
+            header: serde_json::json!({"type":"session_meta","payload":{"id":"child","history_mode":"paginated","model_provider":"current-provider","history_base":{"thread_id":"parent","end_byte_offset":0,"end_ordinal_exclusive":0}}}),
+            records: vec![
+                serde_json::json!({"type":"session_meta","payload":{"id":"parent","model_provider":"historical-provider"}}),
+                serde_json::json!({"type":"turn_context","payload":{"turn_id":"old-turn","model":"old-model"}}),
+            ],
+        }.replay(&mut adapter).unwrap();
+        adapter.accept(&serde_json::json!({"type":"turn_context","payload":{"turn_id":"new-turn","model":"new-model"}}));
+        let state = adapter.snapshot(0, AgentTranscriptStatus::Live, None);
+        assert_eq!(
+            state.turns[0].details.as_ref().unwrap().provider.as_deref(),
+            Some("historical-provider")
+        );
+        assert_eq!(
+            state.turns[1].details.as_ref().unwrap().provider.as_deref(),
+            Some("current-provider")
+        );
     }
 
     fn text_parts(state: &AgentTranscriptState, role: AgentMessageRole) -> Vec<String> {
@@ -1903,6 +2269,26 @@ mod tests {
     }
 
     #[test]
+    fn legacy_image_event_and_response_project_one_user_prompt() {
+        let mut adapter = adapter_with_mode(CodexHistoryMode::Legacy);
+        adapter.accept(&serde_json::json!({ "type": "event_msg", "payload": {
+            "type": "user_message", "message": "Describe this", "local_images": ["/home/me/.whip/uploads/cat.png"]
+        }}));
+        adapter.accept(&serde_json::json!({ "type": "response_item", "payload": {
+            "type": "message", "id": "user-1", "role": "user", "content": [
+                { "type": "input_text", "text": "Describe this" },
+                { "type": "input_image", "image_url": "data:image/png;base64,aW1hZ2U=" }
+            ]
+        }}));
+        let state = adapter.snapshot(1, AgentTranscriptStatus::Live, None);
+        assert_eq!(state.messages.len(), 1);
+        assert_eq!(state.turns.len(), 1);
+        assert!(
+            matches!(&state.messages[0].parts[1], AgentTranscriptPart::Image { source, .. } if source == "/home/me/.whip/uploads/cat.png")
+        );
+    }
+
+    #[test]
     fn legacy_response_messages_with_distinct_ids_are_not_deduplicated_by_text() {
         let mut adapter = adapter_with_mode(CodexHistoryMode::Legacy);
         for value in [
@@ -2040,6 +2426,132 @@ mod tests {
             }),
         ));
         bytes
+    }
+
+    fn question_reply_user_records(mode: CodexHistoryMode, text: &str) -> Vec<u8> {
+        let mut bytes = record(
+            "event_msg",
+            serde_json::json!({"type":"user_message", "message":text}),
+        );
+        bytes.extend(record(
+            "response_item",
+            serde_json::json!({
+                "type":"message", "role":"user", "id":"reply",
+                "content":[{"type":"input_text", "text":text}]
+            }),
+        ));
+        if mode == CodexHistoryMode::Paginated {
+            bytes.extend(completed_item(
+                2,
+                serde_json::json!({
+                    "type":"UserMessage", "id":"reply",
+                    "content":[{"type":"text", "text":text}]
+                }),
+            ));
+        }
+        bytes
+    }
+
+    #[test]
+    fn question_reply_answers_survive_live_updates_and_cache_replay() {
+        let reported = r#"<send_user_message_question_reply>
+[{"answer":"weird it works now","question":"Please try the backtrack → Chat button sequence once more on the connected phone. About how long does the spinner last? I’m collecting the loading diagnostics as you do it.","questionItemId":"[\"request_user_input_async\",\"call_62cc4867a40d4175a1d70ca651e78327\",0]"}]
+</send_user_message_question_reply>"#;
+        let multiple = r#"<send_user_message_question_reply>
+[{"answer":"First line\n你好 \"quoted\"","question":"Details?"},{"answer":"Apple","question":"Which fruit?"}]
+</send_user_message_question_reply>"#;
+        for mode in [CodexHistoryMode::Legacy, CodexHistoryMode::Paginated] {
+            for (text, expected) in [
+                (reported, "weird it works now"),
+                (multiple, "First line\n你好 \"quoted\"\n\nApple"),
+            ] {
+                let mut prefix = history_header(Some(serde_json::to_value(mode).unwrap()));
+                prefix.extend(history_turn(1, mode));
+                let mut core = CodexSessionCore::new("thread");
+                let binding = core.bind_source("/rollout".into(), "1:2".into(), 0);
+                core.ingest(binding.source_generation, &prefix).unwrap();
+                let checkpoint = core.cache_blob().unwrap();
+                let reply = [
+                    record(
+                        "event_msg",
+                        serde_json::json!({"type":"task_started", "turn_id":"turn-2"}),
+                    ),
+                    question_reply_user_records(mode, text),
+                ]
+                .concat();
+                let update = core
+                    .ingest(binding.source_generation, &reply)
+                    .unwrap()
+                    .update
+                    .unwrap();
+                let state = core.state();
+                assert_eq!(
+                    text_parts(&state, AgentMessageRole::User),
+                    ["question 1", expected]
+                );
+                assert_eq!(state.messages.len(), 3);
+                assert_eq!(state.turns.len(), 2);
+                assert!(update.deltas.iter().any(|delta| match delta {
+                    AgentTranscriptDelta::Reset { state } => {
+                        text_parts(state, AgentMessageRole::User)
+                            .last()
+                            .map(String::as_str)
+                            == Some(expected)
+                    }
+                    AgentTranscriptDelta::MessageUpserted { message, .. } => {
+                        message.role == AgentMessageRole::User
+                            && text_parts_in_message(message) == expected
+                    }
+                    _ => false,
+                }));
+
+                let mut restored = CodexSessionCore::new("thread");
+                restored.restore_cache(&checkpoint).unwrap();
+                let rebound = restored.bind_source(
+                    "/rollout".into(),
+                    "1:2".into(),
+                    (prefix.len() + reply.len()) as u64,
+                );
+                assert_eq!(rebound.start_offset, prefix.len() as u64);
+                restored.ingest(rebound.source_generation, &reply).unwrap();
+                assert_eq!(restored.state().messages, state.messages);
+                assert_eq!(restored.state().turns, state.turns);
+
+                restored.restore_cache(&core.cache_blob().unwrap()).unwrap();
+                assert_eq!(restored.state().messages, state.messages);
+                assert_eq!(restored.state().turns, state.turns);
+                prefix.extend(reply);
+                let replay = parse_codex_chunks(&prefix, 7);
+                assert_eq!(replay.messages, state.messages);
+                assert_eq!(replay.turns, state.turns);
+            }
+        }
+    }
+
+    #[test]
+    fn question_reply_examples_and_invalid_payloads_remain_user_text() {
+        for mode in [CodexHistoryMode::Legacy, CodexHistoryMode::Paginated] {
+            for text in [
+                "why is this shown: <send_user_message_question_reply>[{\"answer\":\"hi\"}]</send_user_message_question_reply>",
+                "```\n<send_user_message_question_reply>[{\"answer\":\"hi\"}]</send_user_message_question_reply>\n```",
+                "<send_user_message_question_reply>[{\"answer\":\"hi\"}]</send_user_message_question_reply> please explain",
+                "<send_user_message_question_reply>invalid JSON</send_user_message_question_reply>",
+                "<send_user_message_question_reply>[{\"answer\":\"hi\"}]",
+                "<send_user_message_question_reply>[{\"answer\":42}]</send_user_message_question_reply>",
+                "<send_user_message_question_reply>[{\"answer\":\"hi\"},{\"question\":\"missing answer\"}]</send_user_message_question_reply>",
+                "<send_user_message_question_reply>[]</send_user_message_question_reply>",
+            ] {
+                let bytes = [
+                    history_header(Some(serde_json::to_value(mode).unwrap())),
+                    question_reply_user_records(mode, text),
+                ]
+                .concat();
+                assert_eq!(
+                    text_parts(&parse_codex_chunks(&bytes, 31), AgentMessageRole::User),
+                    [text]
+                );
+            }
+        }
     }
 
     #[test]
@@ -2488,6 +3000,58 @@ mod tests {
     }
 
     #[test]
+    fn recorded_interactions_preserve_questions_and_approval_details_in_both_history_modes() {
+        for mode in [CodexHistoryMode::Legacy, CodexHistoryMode::Paginated] {
+            let mut adapter = adapter_with_mode(mode);
+            adapter.accept(&serde_json::json!({"type":"event_msg", "payload":{
+                "type":"turn_started", "turn_id":"turn"
+            }}));
+            for payload in [
+                serde_json::json!({"type":"request_user_input_async", "turn_id":"turn", "questions":[{
+                    "question":"Which database?", "options":[{"label":"SQLite", "description":"Local storage"}]
+                }]}),
+                serde_json::json!({"type":"exec_approval_request", "turn_id":"turn", "command":["cargo", "test"], "reason":"Run the project checks"}),
+            ] {
+                adapter.accept(&serde_json::json!({"type":"event_msg", "payload":payload}));
+            }
+            let notices = adapter
+                .projected_messages()
+                .iter()
+                .flat_map(|message| &message.parts)
+                .filter_map(|part| {
+                    if let AgentTranscriptPart::Notice {
+                        text, questions, ..
+                    } = part
+                    {
+                        Some((text.as_str(), questions))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(notices.len(), 2);
+            assert_eq!(notices[0].1[0].question, "Which database?");
+            assert_eq!(notices[0].1[0].options[0].label, "SQLite");
+            assert_eq!(
+                notices[0].1[0].options[0].description.as_deref(),
+                Some("Local storage")
+            );
+            assert!(notices[0].0.contains("may continue working"));
+            assert!(notices[1].0.contains("requested command approval"));
+            assert!(
+                notices[1]
+                    .0
+                    .contains("Run the project checks\n\ncargo test")
+            );
+            assert!(
+                notices
+                    .iter()
+                    .all(|(text, _)| text.contains("if this request is still pending"))
+            );
+        }
+    }
+
+    #[test]
     fn paginated_interactive_requests_show_the_legacy_notice_without_inventing_tool_state() {
         for kind in [
             "exec_approval_request",
@@ -2531,6 +3095,123 @@ mod tests {
             assert_eq!(core.state().turns[0].status, AgentTurnStatus::Working);
             assert_eq!(core.state().messages[0].parts.len(), 1);
         }
+    }
+
+    #[test]
+    fn paginated_async_question_items_preserve_options_without_duplicate_markdown() {
+        // Sanitized records from the reported rollout. Async calls are rendered
+        // upstream as AgentMessage items, not DynamicToolCall items or events.
+        let fixture = include_bytes!("../../test-fixtures/codex/async-question.jsonl");
+        let lines = fixture
+            .split_inclusive(|byte| *byte == b'\n')
+            .collect::<Vec<_>>();
+        let mut core = CodexSessionCore::new("thread-fruit");
+        let binding = core.bind_source("/rollout".into(), "1:2".into(), 0);
+        core.ingest(binding.source_generation, &lines[..5].concat())
+            .unwrap();
+        assert!(tool_parts(&core.state()).is_empty());
+        let update = core
+            .ingest(binding.source_generation, lines[5])
+            .unwrap()
+            .update
+            .unwrap();
+        assert!(update.deltas.iter().any(|delta| matches!(delta,
+            AgentTranscriptDelta::MessageUpserted { message, .. }
+                if matches!(message.parts.last(), Some(AgentTranscriptPart::Tool { state, .. })
+                    if state.questions.len() == 1)
+        )));
+        let state = core.state();
+        let tools = tool_parts(&state);
+        assert_eq!(tools.len(), 1);
+        assert_eq!(
+            (tools[0].0, tools[0].1),
+            ("call-fruit", "request_user_input_async")
+        );
+        assert_eq!(tools[0].2.status, AgentToolStatus::Completed);
+        assert_eq!(tools[0].2.questions[0].question, "Orange or apple?");
+        assert_eq!(
+            tools[0].2.questions[0]
+                .options
+                .iter()
+                .map(|option| option.label.as_str())
+                .collect::<Vec<_>>(),
+            ["Orange", "Apple"]
+        );
+        // Tool completion means the async request was delivered, not answered.
+        assert_eq!(state.turns[0].status, AgentTurnStatus::Working);
+        assert_eq!(tools[0].2.started_at_ms, Some(1_791_468_467_919));
+        assert_eq!(tools[0].2.completed_at_ms, Some(1_791_468_467_922));
+        assert_eq!(text_parts(&state, AgentMessageRole::Assistant).len(), 1);
+        let mut restored = CodexSessionCore::new("thread-fruit");
+        restored.restore_cache(&core.cache_blob().unwrap()).unwrap();
+        assert_eq!(restored.state().messages, state.messages);
+        let resumed = restored.bind_source("/rollout".into(), "1:2".into(), fixture.len() as u64);
+        core.ingest(binding.source_generation, &lines[6..].concat())
+            .unwrap();
+        restored
+            .ingest(resumed.source_generation, &lines[6..].concat())
+            .unwrap();
+        let state = core.state();
+        assert_eq!(restored.state().messages, state.messages);
+        assert_eq!(parse_codex_chunks(fixture, 1).messages, state.messages);
+        assert_eq!(state.turns[0].status, AgentTurnStatus::Idle);
+        assert_eq!(tool_parts(&state).len(), 1);
+        assert_eq!(
+            text_parts(&state, AgentMessageRole::Assistant),
+            [
+                "I’ll ask your preference first, then check the current gold price.",
+                "Gold price checked."
+            ]
+        );
+        assert_eq!(
+            state.messages[1]
+                .parts
+                .iter()
+                .map(AgentTranscriptPart::id)
+                .collect::<Vec<_>>(),
+            ["text-fruit", "call-fruit", "text-price"]
+        );
+    }
+
+    #[test]
+    fn legacy_question_calls_decode_json_arguments_and_async_titles() {
+        let mut adapter = adapter_with_mode(CodexHistoryMode::Legacy);
+        for (name, question) in [
+            (
+                "request_user_input_async",
+                serde_json::json!({
+                    "title":"Orange or apple?", "options":["Orange", "Apple"]
+                }),
+            ),
+            (
+                "functions.request_user_input",
+                serde_json::json!({
+                    "header":"Fruit", "question":"Orange or apple?", "options":[
+                        {"label":"Orange", "description":"Citrus"}, {"label":"Apple"}
+                    ]
+                }),
+            ),
+        ] {
+            adapter.accept(&serde_json::json!({"type":"response_item", "payload":{
+                "type":"function_call", "name":name, "call_id":name,
+                "arguments":serde_json::json!({"questions":[question]}).to_string()
+            }}));
+        }
+        let state = adapter.snapshot(0, AgentTranscriptStatus::Live, None);
+        let tools = tool_parts(&state);
+        assert_eq!(tools.len(), 2);
+        for (_, _, tool) in &tools {
+            assert_eq!(tool.questions.len(), 1);
+            assert_eq!(tool.questions[0].question, "Orange or apple?");
+            assert_eq!(tool.questions[0].options[0].label, "Orange");
+            assert_eq!(tool.questions[0].options[1].label, "Apple");
+        }
+        assert_eq!(tools[0].2.questions[0].header, None);
+        assert_eq!(tools[1].2.questions[0].header.as_deref(), Some("Fruit"));
+        assert_eq!(
+            tools[1].2.questions[0].options[0].description.as_deref(),
+            Some("Citrus")
+        );
     }
 
     #[test]
@@ -2627,6 +3308,146 @@ mod tests {
         let lifecycle = parse_codex_chunks(&with_starts, 31);
         assert_eq!(lifecycle.messages, history.messages);
         assert_eq!(lifecycle.turns, history.turns);
+    }
+
+    #[test]
+    fn paginated_user_local_image_is_a_renderable_part() {
+        let mut bytes = record(
+            "session_meta",
+            serde_json::json!({ "id": "requested", "history_mode": "paginated" }),
+        );
+        bytes.extend(record("event_msg", serde_json::json!({ "type": "item_completed", "thread_id": "requested", "turn_id": "turn", "item": {
+            "type": "UserMessage", "id": "user-image", "content": [{ "type": "local_image", "path": "/repo/image.png" }]
+        }})));
+        let state = parse_codex_chunks(&bytes, 31);
+        assert_eq!(state.messages.len(), 1);
+        assert!(
+            matches!(&state.messages[0].parts[..], [AgentTranscriptPart::Image { source, .. }] if source == "/repo/image.png")
+        );
+    }
+
+    fn paginated_item_event(kind: &str, item: Value) -> Vec<u8> {
+        record(
+            "event_msg",
+            serde_json::json!({
+                "type": kind, "thread_id": "thread-current", "turn_id": "turn-current-1",
+                "item": item, "started_at_ms": 10, "completed_at_ms": 20,
+            }),
+        )
+    }
+
+    #[test]
+    fn paginated_follow_up_prompts_stay_in_order_during_live_updates_and_cache_replay() {
+        let lines = paginated_fixture()
+            .split_inclusive(|byte| *byte == b'\n')
+            .collect::<Vec<_>>();
+        let mut prefix = lines[..4].concat();
+        let mut core = CodexSessionCore::new("requested");
+        let binding = core.bind_source("/rollout".into(), "1:2".into(), 0);
+        core.ingest(binding.source_generation, &prefix).unwrap();
+
+        // A tool can finish after queued input is consumed by the same turn.
+        let mut command = serde_json::json!({
+            "type": "CommandExecution", "id": "queued-shell", "command": ["cargo", "test"],
+            "status": "inProgress",
+        });
+        let started = paginated_item_event("item_started", command.clone());
+        core.ingest(binding.source_generation, &started).unwrap();
+        prefix.extend(started);
+
+        for id in ["queued-1", "queued-2"] {
+            let prompt = paginated_item_event(
+                "item_completed",
+                serde_json::json!({
+                    "type": "UserMessage", "id": id,
+                    "content": [{"type": "text", "text": "Also cover errors"}],
+                }),
+            );
+            let update = core
+                .ingest(binding.source_generation, &prompt)
+                .unwrap()
+                .update
+                .unwrap();
+            assert!(update.deltas.iter().any(|delta| matches!(
+                delta, AgentTranscriptDelta::TurnUpserted { index: 0, turn }
+                    if turn.message_ids.last().map(String::as_str) == Some(id)
+                        && turn.status == AgentTurnStatus::Working
+            )));
+            prefix.extend(prompt);
+        }
+        let cache = core.cache_blob().unwrap();
+        let cached_cursor = prefix.len() as u64;
+
+        let answer = paginated_item_event(
+            "item_completed",
+            serde_json::json!({
+                "type": "AgentMessage", "id": "queued-answer",
+                "content": [{"type": "Text", "text": "I will cover errors too."}],
+            }),
+        );
+        command["status"] = serde_json::json!("completed");
+        command["exit_code"] = serde_json::json!(0);
+        let completed = paginated_item_event("item_completed", command);
+        let suffix = [
+            answer,
+            completed,
+            record(
+                "event_msg",
+                serde_json::json!({
+                    "type": "task_complete", "turn_id": "turn-current-1",
+                }),
+            ),
+        ]
+        .concat();
+        core.ingest(binding.source_generation, &suffix).unwrap();
+        let state = core.state();
+        assert_eq!(state.turns.len(), 1);
+        assert_eq!(state.turns[0].status, AgentTurnStatus::Idle);
+        assert_eq!(
+            state.turns[0].message_ids,
+            [
+                "user-current-1",
+                "assistant:turn-current-1",
+                "queued-1",
+                "queued-2",
+                "assistant:turn-current-1:queued-2",
+            ]
+        );
+        assert_eq!(state.messages[4].parent_id.as_deref(), Some("queued-2"));
+        assert_eq!(
+            text_parts_in_message(&state.messages[4]),
+            "I will cover errors too."
+        );
+        assert!(matches!(state.messages[1].parts.last(),
+            Some(AgentTranscriptPart::Tool { state, .. })
+                if state.status == AgentToolStatus::Completed && state.started_at_ms == Some(10)
+        ));
+        assert_eq!(tool_parts(&state).len(), 1);
+
+        let mut restored = CodexSessionCore::new("requested");
+        restored.restore_cache(&cache).unwrap();
+        let rebound = restored.bind_source("/rollout".into(), "1:2".into(), cached_cursor);
+        assert_eq!(rebound.start_offset, cached_cursor);
+        restored.ingest(rebound.source_generation, &suffix).unwrap();
+        let restored_state = restored.state();
+        assert_eq!(restored_state.messages, state.messages);
+        assert_eq!(restored_state.turns, state.turns);
+
+        prefix.extend(suffix);
+        let replayed = parse_codex_chunks(&prefix, 31);
+        assert_eq!(replayed.messages, state.messages);
+        assert_eq!(replayed.turns, state.turns);
+
+        // Backtracking removes every prompt and assistant segment owned by the turn.
+        let rollback = record(
+            "event_msg",
+            serde_json::json!({
+                "type": "thread_rolled_back", "num_turns": 1,
+            }),
+        );
+        core.ingest(binding.source_generation, &rollback).unwrap();
+        assert!(core.state().messages.is_empty());
+        assert!(core.state().turns.is_empty());
     }
 
     #[test]
@@ -2978,7 +3799,7 @@ mod tests {
             .unwrap();
         assert_eq!(core.committed_offset(), 0);
         assert_eq!(core.state().messages.len(), 1);
-        let committable = core.framer.committable_offset();
+        let committable = core.cursor.framer.committable_offset();
         assert_eq!(committable, complete.len() as u64);
         assert!(core.confirm_cache(binding.source_generation, committable));
         assert_eq!(core.committed_offset(), complete.len() as u64);
@@ -3134,6 +3955,8 @@ mod tests {
         );
         core.mark_restarting_update("retrying");
         assert_eq!(core.state().status, AgentTranscriptStatus::Loading);
+        core.mark_discovery_retry_update("rollout temporarily missing");
+        assert_eq!(core.state().status, AgentTranscriptStatus::Loading);
         assert_eq!(
             core.mark_unavailable("missing").status,
             AgentTranscriptStatus::Unavailable
@@ -3193,7 +4016,11 @@ mod tests {
         let should_emit = stale.changed || (current_generation && core.mark_live());
         assert!(!should_emit);
         assert_eq!(core.revision(), revision);
-        assert_eq!(core.state().status, AgentTranscriptStatus::Loading);
+        assert_eq!(core.state().status, AgentTranscriptStatus::Stale);
+        assert_eq!(
+            text_parts(&core.state(), AgentMessageRole::User),
+            ["visible"]
+        );
     }
 
     #[test]
@@ -3252,7 +4079,7 @@ mod tests {
         let mut core = CodexSessionCore::new("thread");
         let binding = core.bind_source("/rollout".into(), "1:2".into(), first.len() as u64);
         core.ingest(binding.source_generation, &first).unwrap();
-        let cursor = core.framer.committable_offset();
+        let cursor = core.cursor.framer.committable_offset();
         let blob = core.cache_blob().unwrap();
         assert!(core.confirm_cache(binding.source_generation, cursor));
 
@@ -3327,12 +4154,13 @@ mod tests {
         let legacy_blob = serde_json::to_vec(&CachedCodexSession {
             schema_version: 1,
             requested_session_id: core.requested_session_id.clone(),
-            source: core.source.clone(),
+            source: core.cursor.source.clone(),
             committed_offset: cached.committed_offset,
             lines: cached.lines,
             history_mode: None,
             revision: None,
             transcript: Some(core.state()),
+            inherited_history: None,
         })
         .unwrap();
         let mut restored = CodexSessionCore::new("thread");
@@ -3401,7 +4229,7 @@ mod tests {
         let mut core = CodexSessionCore::new("thread");
         let old = core.bind_source("/rollout".into(), "1:2".into(), first.len() as u64);
         core.ingest(old.source_generation, &first).unwrap();
-        let cursor = core.framer.committable_offset();
+        let cursor = core.cursor.framer.committable_offset();
         core.confirm_cache(old.source_generation, cursor);
 
         let replacement = core.bind_source("/rollout".into(), "9:9".into(), 0);

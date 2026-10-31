@@ -12,6 +12,7 @@ jest.mock('react-native-whip-ssh', () => (
 
 const mockWhipSsh = require('./mockWhipSsh').getMockWhipSshControl();
 const connectWithPassword: jest.Mock = mockWhipSsh.connectWithPassword;
+jest.mock('../src/services/hostProfiles', () => ({ ensureTailcatIdentity: jest.fn(async profile => profile) }));
 
 const profile: ConnectionProfile = {
   id: 'host-1',
@@ -180,11 +181,14 @@ describe('direct Herdr API requests', () => {
     await client.connect(profile);
     const runtime = jest.mocked(createHostRuntime).mock.results[0].value;
     let finishDisconnect!: () => void;
-    runtime.disconnect = jest.fn(
-      () => new Promise<void>(resolve => {
-        finishDisconnect = resolve;
-      }),
-    );
+    const disconnectStarted = new Promise<void>(resolveStarted => {
+      runtime.disconnect = jest.fn(() => {
+        resolveStarted();
+        return new Promise<void>(resolve => {
+          finishDisconnect = resolve;
+        });
+      });
+    });
 
     const firstDisconnect = client.disconnect();
     const secondDisconnect = client.disconnect();
@@ -192,7 +196,7 @@ describe('direct Herdr API requests', () => {
     const observedDisconnect = firstDisconnect.then(() => {
       disconnected = true;
     });
-    await Promise.resolve();
+    await disconnectStarted;
 
     expect(runtime.disconnect).toHaveBeenCalledTimes(1);
     expect(firstDisconnect).toBe(secondDisconnect);
@@ -814,6 +818,9 @@ describe('direct Herdr API requests', () => {
 test('a recreated HerdrClient adopts a live native runtime without reconnecting SSH', async () => {
   const { getHostRuntime } = require('react-native-whip-ssh');
   const runtime = {
+    herdrEnabled: true,
+    tailcatEnabled: false,
+    matchesSshConfig: jest.fn(() => true),
     runtimeIncarnation: 7,
     status: () => ({ state: 'connected', generation: 4 }),
     connect: jest.fn(async () => {}),
@@ -833,6 +840,23 @@ test('a recreated HerdrClient adopts a live native runtime without reconnecting 
   expect(runtime.detach).toHaveBeenCalledTimes(1);
   await second.disconnect();
   expect(runtime.disconnect).toHaveBeenCalledTimes(1);
+});
+
+test('enabling Tailcat replaces an existing direct SSH runtime', async () => {
+  const { getHostRuntime } = require('react-native-whip-ssh');
+  const direct = {
+    herdrEnabled: true,
+    tailcatEnabled: false,
+    matchesSshConfig: jest.fn(() => false),
+    disconnect: jest.fn(async () => {}),
+  };
+  getHostRuntime.mockReturnValueOnce(direct);
+  const client = new HerdrClient();
+  await client.connect({ ...profile, tailcatEnabled: true, tailcatAddress: 'tc-secret-address' });
+  expect(direct.disconnect).toHaveBeenCalledTimes(1);
+  expect(client.native).not.toBe(direct);
+  expect(client.native.tailcatEnabled).toBe(true);
+  await client.disconnect();
 });
 
 test('detaching during an initial connect does not disconnect the process runtime on a late failure', async () => {

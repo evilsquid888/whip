@@ -1,15 +1,11 @@
 #import <React/RCTBridgeModule.h>
 #import <CoreLocation/CoreLocation.h>
-#import <CoreMotion/CoreMotion.h>
 #import <Network/Network.h>
-#import <AVFoundation/AVFoundation.h>
+#import "WhipSpeechPlayback.h"
 #import <UIKit/UIKit.h>
-#import <sys/utsname.h>
 
 static const NSTimeInterval WhipLocationTimeout = 10;
 static const NSTimeInterval WhipSampleTimeout = 5;
-static const NSTimeInterval WhipSpeechTimeout = 60;
-static const double WhipStandardGravity = 9.80665;
 
 /** One bounded native sample; its stop block owns and releases the OS resource. */
 @interface WhipDeviceSample : NSObject
@@ -112,14 +108,9 @@ static const double WhipStandardGravity = 9.80665;
 }
 @end
 
-@interface WhipDevice : NSObject <RCTBridgeModule, AVSpeechSynthesizerDelegate>
+@interface WhipDevice : NSObject <RCTBridgeModule>
 @property(nonatomic, strong) NSMutableDictionary<NSString *, WhipLocationFix *> *requests;
 @property(nonatomic, strong) NSMutableDictionary<NSString *, WhipDeviceSample *> *samples;
-@property(nonatomic, strong) AVSpeechSynthesizer *speech;
-@property(nonatomic, strong) AVSpeechUtterance *utterance;
-@property(nonatomic, copy) NSString *speechOwner;
-@property(nonatomic, copy) NSString *speechRequest;
-@property(nonatomic, strong) NSTimer *speechTimer;
 @end
 
 @implementation WhipDevice
@@ -146,37 +137,10 @@ RCT_EXPORT_MODULE(WhipDevice)
 }
 - (void)invalidate
 {
-  dispatch_async(dispatch_get_main_queue(), ^{ [self cancelAll]; [self stopCurrentSpeech]; });
+  dispatch_async(dispatch_get_main_queue(), ^{ [self cancelAll]; [WhipSpeechPlayback.shared stopDevice]; });
 }
 - (void)dealloc { [[NSNotificationCenter defaultCenter] removeObserver:self]; }
 
-RCT_EXPORT_METHOD(info:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject)
-{
-  struct utsname system;
-  NSString *model = uname(&system) == 0 ? [NSString stringWithUTF8String:system.machine] : UIDevice.currentDevice.model;
-  resolve(@{@"platform": @"ios", @"os_version": UIDevice.currentDevice.systemVersion,
-    @"model": model, @"manufacturer": @"Apple",
-    @"app_version": [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: NSNull.null,
-    @"locale": NSLocale.preferredLanguages.firstObject ?: @"und",
-    @"time_zone": NSTimeZone.localTimeZone.name});
-}
-RCT_EXPORT_METHOD(battery:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject)
-{
-  UIDevice *device = UIDevice.currentDevice;
-  BOOL monitoring = device.batteryMonitoringEnabled;
-  device.batteryMonitoringEnabled = YES;
-  float level = device.batteryLevel;
-  NSString *state = @"unknown";
-  switch (device.batteryState) {
-    case UIDeviceBatteryStateUnplugged: state = @"unplugged"; break;
-    case UIDeviceBatteryStateCharging: state = @"charging"; break;
-    case UIDeviceBatteryStateFull: state = @"full"; break;
-    default: break;
-  }
-  device.batteryMonitoringEnabled = monitoring;
-  resolve(@{@"level": level < 0 ? (id)NSNull.null : @(level), @"state": state,
-    @"low_power_mode": @(NSProcessInfo.processInfo.lowPowerModeEnabled)});
-}
 RCT_EXPORT_METHOD(location:(NSString *)requestId resolve:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject)
 {
   if (UIApplication.sharedApplication.applicationState != UIApplicationStateActive) {
@@ -249,127 +213,21 @@ RCT_EXPORT_METHOD(network:(NSString *)requestId resolve:(RCTPromiseResolveBlock)
   nw_path_monitor_start(monitor);
 }
 
-RCT_EXPORT_METHOD(sensorSnapshot:(NSString *)requestId sensor:(NSString *)sensor resolve:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject)
-{
-  if (UIApplication.sharedApplication.applicationState != UIApplicationStateActive) {
-    reject(@"device_unavailable", @"Keep Whip foregrounded to sample sensors", nil);
-    return;
-  }
-  if ([sensor isEqualToString:@"barometer"]) {
-    if (![CMAltimeter isRelativeAltitudeAvailable]) {
-      reject(@"sensor_unavailable", @"This device does not have a barometer", nil);
-      return;
-    }
-    if (CMAltimeter.authorizationStatus == CMAuthorizationStatusDenied ||
-        CMAltimeter.authorizationStatus == CMAuthorizationStatusRestricted) {
-      reject(@"permission_denied", @"Motion permission was denied", nil);
-      return;
-    }
-    WhipDeviceSample *sample = [self sample:requestId resolve:resolve reject:reject];
-    CMAltimeter *altimeter = [CMAltimeter new];
-    sample.stop = ^{ [altimeter stopRelativeAltitudeUpdates]; };
-    __weak WhipDeviceSample *weakSample = sample;
-    [altimeter startRelativeAltitudeUpdatesToQueue:NSOperationQueue.mainQueue withHandler:^(CMAltitudeData *data, NSError *error) {
-      if (error) {
-        [weakSample fail:CMAltimeter.authorizationStatus == CMAuthorizationStatusDenied ? @"permission_denied" : @"sensor_unavailable"
-                   message:@"Could not read device pressure"];
-      } else if (data) {
-        double time = (NSDate.date.timeIntervalSince1970 - NSProcessInfo.processInfo.systemUptime + data.timestamp) * 1000;
-        [weakSample complete:@{@"sensor": sensor, @"unit": @"hPa", @"timestamp_ms": @(time),
-          @"reading": @{@"pressure": @(data.pressure.doubleValue * 10)}}];
-      }
-    }];
-    return;
-  }
-  CMMotionManager *motion = [CMMotionManager new];
-  BOOL accelerometer = [sensor isEqualToString:@"accelerometer"];
-  BOOL gyroscope = [sensor isEqualToString:@"gyroscope"];
-  BOOL magnetometer = [sensor isEqualToString:@"magnetometer"];
-  if (!(accelerometer || gyroscope || magnetometer)) {
-    reject(@"invalid_argument", @"Unknown sensor", nil);
-    return;
-  }
-  if ((accelerometer && !motion.accelerometerAvailable) || (gyroscope && !motion.gyroAvailable) ||
-      (magnetometer && !motion.magnetometerAvailable)) {
-    reject(@"sensor_unavailable", @"This device does not have the requested sensor", nil);
-    return;
-  }
-  WhipDeviceSample *sample = [self sample:requestId resolve:resolve reject:reject];
-  motion.accelerometerUpdateInterval = 0.1;
-  motion.gyroUpdateInterval = 0.1;
-  motion.magnetometerUpdateInterval = 0.1;
-  sample.stop = ^{ [motion stopAccelerometerUpdates]; [motion stopGyroUpdates]; [motion stopMagnetometerUpdates]; };
-  __weak WhipDeviceSample *weakSample = sample;
-  NSString *unit = accelerometer ? @"m/s2" : gyroscope ? @"rad/s" : @"uT";
-  void (^complete)(double, double, double, NSTimeInterval, NSError *) = ^(double x, double y, double z, NSTimeInterval timestamp, NSError *error) {
-    if (error) [weakSample fail:@"sensor_unavailable" message:@"Could not read device sensor"];
-    else {
-      double time = (NSDate.date.timeIntervalSince1970 - NSProcessInfo.processInfo.systemUptime + timestamp) * 1000;
-      [weakSample complete:@{@"sensor": sensor, @"unit": unit, @"timestamp_ms": @(time), @"reading": @{@"x": @(x), @"y": @(y), @"z": @(z)}}];
-    }
-  };
-  if (accelerometer) [motion startAccelerometerUpdatesToQueue:NSOperationQueue.mainQueue withHandler:^(CMAccelerometerData *data, NSError *error) {
-    if (data || error) complete(-data.acceleration.x * WhipStandardGravity, -data.acceleration.y * WhipStandardGravity, -data.acceleration.z * WhipStandardGravity, data.timestamp, error);
-  }];
-  else if (gyroscope) [motion startGyroUpdatesToQueue:NSOperationQueue.mainQueue withHandler:^(CMGyroData *data, NSError *error) {
-    if (data || error) complete(data.rotationRate.x, data.rotationRate.y, data.rotationRate.z, data.timestamp, error);
-  }];
-  else [motion startMagnetometerUpdatesToQueue:NSOperationQueue.mainQueue withHandler:^(CMMagnetometerData *data, NSError *error) {
-    if (data || error) complete(data.magneticField.x, data.magneticField.y, data.magneticField.z, data.timestamp, error);
-  }];
-}
-
-- (void)stopCurrentSpeech
-{
-  [self.speechTimer invalidate];
-  self.speechTimer = nil;
-  self.utterance = nil;
-  self.speechOwner = nil;
-  self.speechRequest = nil;
-  [self.speech stopSpeakingAtBoundary:AVSpeechBoundaryImmediate];
-}
 RCT_EXPORT_METHOD(speak:(NSString *)sessionId requestId:(NSString *)requestId text:(NSString *)text language:(NSString *)language rate:(double)rate resolve:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject)
 {
-  if (self.speechOwner && ![self.speechOwner isEqualToString:sessionId]) {
-    reject(@"device_unavailable", @"Another reverse-control session is speaking", nil);
-    return;
-  }
-  AVSpeechSynthesisVoice *voice = [AVSpeechSynthesisVoice voiceWithLanguage:language ?: AVSpeechSynthesisVoice.currentLanguageCode];
-  if (!voice) { reject(@"device_unavailable", @"Requested speech language is unavailable", nil); return; }
-  [self stopCurrentSpeech];
-  if (!self.speech) { self.speech = [AVSpeechSynthesizer new]; self.speech.delegate = self; }
-  AVSpeechUtterance *utterance = [AVSpeechUtterance speechUtteranceWithString:text];
-  utterance.voice = voice;
-  utterance.rate = MIN(AVSpeechUtteranceMaximumSpeechRate, MAX(AVSpeechUtteranceMinimumSpeechRate, AVSpeechUtteranceDefaultSpeechRate * rate));
-  self.speechOwner = sessionId;
-  self.speechRequest = requestId;
-  self.utterance = utterance;
-  __weak WhipDevice *owner = self;
-  self.speechTimer = [NSTimer scheduledTimerWithTimeInterval:WhipSpeechTimeout repeats:NO block:^(NSTimer *timer) { [owner stopCurrentSpeech]; }];
-  [self.speech speakUtterance:utterance];
-  resolve(@{@"started": @YES});
-}
-- (void)speechSynthesizer:(AVSpeechSynthesizer *)synthesizer didFinishSpeechUtterance:(AVSpeechUtterance *)utterance
-{
-  if (self.utterance == utterance) [self stopCurrentSpeech];
-}
-- (void)speechSynthesizer:(AVSpeechSynthesizer *)synthesizer didCancelSpeechUtterance:(AVSpeechUtterance *)utterance
-{
-  if (self.utterance == utterance) [self stopCurrentSpeech];
+  [WhipSpeechPlayback.shared speakDevice:sessionId request:requestId text:text language:language rate:rate resolve:resolve reject:reject];
 }
 RCT_EXPORT_METHOD(stopSpeaking:(NSString *)sessionId resolve:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject)
 {
-  BOOL stopped = [self.speechOwner isEqualToString:sessionId];
-  if (stopped) [self stopCurrentSpeech];
-  resolve(@{@"stopped": @(stopped)});
+  resolve(@{@"stopped": @([WhipSpeechPlayback.shared stopOwner:sessionId kind:WhipSpeechDevice])});
 }
 RCT_EXPORT_METHOD(cancelRequest:(NSString *)requestId)
 {
   [self.samples[requestId] fail:@"cancelled" message:@"Device request cancelled"];
-  if ([self.speechRequest isEqualToString:requestId]) [self stopCurrentSpeech];
+  [WhipSpeechPlayback.shared cancelDeviceRequest:requestId];
 }
 RCT_EXPORT_METHOD(releaseSession:(NSString *)sessionId)
 {
-  if ([self.speechOwner isEqualToString:sessionId]) [self stopCurrentSpeech];
+  [WhipSpeechPlayback.shared stopOwner:sessionId kind:WhipSpeechDevice];
 }
 @end

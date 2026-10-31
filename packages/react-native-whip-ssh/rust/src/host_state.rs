@@ -1,7 +1,10 @@
 //! Authoritative connected-host Herdr domain state.
 
+#[cfg(test)]
+#[path = "host_state_benchmark.rs"]
+mod benchmark;
+
 use std::collections::{HashMap, HashSet};
-use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::herdr_api::{
@@ -44,9 +47,14 @@ pub struct HostStateSnapshot {
     pub last_synced_at_ms: Option<u64>,
     pub last_event_at_ms: Option<u64>,
     pub needs_resync: bool,
-    pub offline_cache_blob: Option<String>,
     pub focus: HostServerFocus,
     pub snapshot: Option<HerdrSessionSnapshot>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct HostOfflineCache {
+    pub revision: u64,
+    pub blob: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
@@ -116,7 +124,6 @@ pub(crate) struct HostState {
     needs_resync: bool,
     resync_running: bool,
     snapshot: Option<HerdrSessionSnapshot>,
-    offline_cache_blob: OnceLock<Option<String>>,
     active_sync: Option<ActiveSync>,
     locally_closed_pane_ids: HashSet<String>,
     agent_statuses: HashMap<String, HerdrAgentStatus>,
@@ -139,7 +146,6 @@ impl Default for HostState {
             needs_resync: false,
             resync_running: false,
             snapshot: None,
-            offline_cache_blob: OnceLock::new(),
             active_sync: None,
             locally_closed_pane_ids: HashSet::new(),
             agent_statuses: HashMap::new(),
@@ -177,21 +183,28 @@ impl HostState {
             last_synced_at_ms: self.last_synced_at_ms,
             last_event_at_ms: self.last_event_at_ms,
             needs_resync: self.needs_resync,
-            offline_cache_blob: self
-                .offline_cache_blob
-                .get_or_init(|| {
-                    if self.freshness != HostFreshness::Fresh {
-                        return None;
-                    }
-                    crate::app_core::offline::encode(
-                        self.snapshot.as_ref()?,
-                        self.last_synced_at_ms.max(self.last_event_at_ms)?,
-                    )
-                })
-                .clone(),
             focus,
             snapshot: self.snapshot.clone(),
         }
+    }
+
+    /// Export the latest validated metadata only when persistence requests it.
+    /// A pending write can outlive a transport failure or a refresh; retain the
+    /// authoritative snapshot in that case. Decoding always marks it stale.
+    pub(crate) fn export_offline_cache(
+        &self,
+        last_revision: Option<u64>,
+    ) -> Option<HostOfflineCache> {
+        if last_revision == Some(self.revision) {
+            return None;
+        }
+        Some(HostOfflineCache {
+            revision: self.revision,
+            blob: crate::app_core::offline::encode(
+                self.snapshot.as_ref()?,
+                self.last_synced_at_ms.max(self.last_event_at_ms)?,
+            )?,
+        })
     }
 
     pub(crate) fn terminal_id_for_pane(&self, pane_id: &str) -> Option<String> {
@@ -279,6 +292,17 @@ impl HostState {
         self.bump_revision();
     }
 
+    pub(crate) fn plain_ssh_connected(&mut self, generation: u64) {
+        *self = Self {
+            revision: self.revision,
+            connection_generation: generation,
+            connection_ready: true,
+            freshness: HostFreshness::Fresh,
+            ..Self::default()
+        };
+        self.bump_revision();
+    }
+
     pub(crate) fn mark_reconnecting(&mut self, reason: String) {
         self.connection_ready = false;
         self.active_sync = None;
@@ -341,6 +365,21 @@ impl HostState {
             return self.fail_sync(token, reason);
         }
         normalize_snapshot(&mut snapshot);
+        // Only carry locally observed label origins across a continuous event
+        // stream. A reconnect may have missed a manual rename on an old server.
+        if self.connection_ready {
+            for tab in &mut snapshot.tabs {
+                if tab.label_is_custom.is_none() {
+                    tab.label_is_custom = self.snapshot.as_ref().and_then(|previous| {
+                        previous
+                            .tabs
+                            .iter()
+                            .find(|old| old.tab_id == tab.tab_id)
+                            .and_then(|old| old.label_is_custom)
+                    });
+                }
+            }
+        }
         // A full snapshot is the authoritative status baseline. Events received
         // while it was in flight were also projected onto the old snapshot for
         // the UI, but only their replay against this baseline can establish a
@@ -703,7 +742,6 @@ impl HostState {
 
     fn bump_revision(&mut self) {
         self.revision = self.revision.saturating_add(1);
-        self.offline_cache_blob.take();
     }
 
     fn bump_revision_with_agent_transitions(&mut self) {
@@ -1061,7 +1099,7 @@ fn upsert_workspace(snapshot: &mut HerdrSessionSnapshot, workspace: HerdrWorkspa
     }
 }
 
-fn upsert_tab(snapshot: &mut HerdrSessionSnapshot, tab: HerdrTabInfo) -> Result<(), String> {
+fn upsert_tab(snapshot: &mut HerdrSessionSnapshot, mut tab: HerdrTabInfo) -> Result<(), String> {
     if !snapshot
         .workspaces
         .iter()
@@ -1077,6 +1115,7 @@ fn upsert_tab(snapshot: &mut HerdrSessionSnapshot, tab: HerdrTabInfo) -> Result<
         .iter_mut()
         .find(|item| item.tab_id == tab.tab_id)
     {
+        tab.label_is_custom = tab.label_is_custom.or(current.label_is_custom);
         *current = tab;
     } else {
         snapshot.tabs.push(tab);
@@ -1405,6 +1444,7 @@ fn apply_event_to_snapshot(
                 .find(|item| item.tab_id == *tab_id)
                 .ok_or_else(|| format!("rename references unknown tab {tab_id}"))?;
             tab.label.clone_from(label);
+            tab.label_is_custom = Some(!label.trim().is_empty());
         }
         HerdrEvent::TabMoved {
             workspace_id, tabs, ..
@@ -1574,7 +1614,12 @@ fn apply_control_to_snapshot(
             Ok(ControlProjection::Applied)
         }
         HerdrControlResult::TabCreated { tab, root_pane } => {
-            upsert_tab(snapshot, tab.clone())?;
+            let mut tab = tab.clone();
+            if let HerdrControlRequest::TabCreate { label, .. } = request {
+                tab.label_is_custom =
+                    Some(label.as_ref().is_some_and(|label| !label.trim().is_empty()));
+            }
+            upsert_tab(snapshot, tab)?;
             upsert_pane(snapshot, root_pane.clone())?;
             focus_pane(snapshot, &root_pane.pane_id)?;
             Ok(ControlProjection::AppliedNeedsResync(
@@ -1582,7 +1627,11 @@ fn apply_control_to_snapshot(
             ))
         }
         HerdrControlResult::TabInfo { tab } => {
-            upsert_tab(snapshot, tab.clone())?;
+            let mut projected_tab = tab.clone();
+            if let HerdrControlRequest::TabRename { label, .. } = request {
+                projected_tab.label_is_custom = Some(!label.trim().is_empty());
+            }
+            upsert_tab(snapshot, projected_tab)?;
             if matches!(request, HerdrControlRequest::TabFocus { .. }) {
                 focus_tab(snapshot, &tab.tab_id)?;
                 if snapshot.focused_pane_id.is_none() {
@@ -1680,13 +1729,19 @@ mod tests {
             workspace_id: workspace_id.to_owned(),
             number: 1.0,
             label: id.to_owned(),
+            label_is_custom: None,
             focused: id == "t1",
             pane_count: 99.0,
             agent_status: HerdrAgentStatus::Idle,
         }
     }
 
-    fn pane(id: &str, workspace_id: &str, tab_id: &str, status: HerdrAgentStatus) -> HerdrPaneInfo {
+    pub(super) fn pane(
+        id: &str,
+        workspace_id: &str,
+        tab_id: &str,
+        status: HerdrAgentStatus,
+    ) -> HerdrPaneInfo {
         HerdrPaneInfo {
             pane_id: id.to_owned(),
             terminal_id: format!("term-{id}"),
@@ -1710,7 +1765,7 @@ mod tests {
         }
     }
 
-    fn agent(pane_id: &str, kind: HerdrAgentKind, session_id: &str) -> HerdrAgentInfo {
+    pub(super) fn agent(pane_id: &str, kind: HerdrAgentKind, session_id: &str) -> HerdrAgentInfo {
         agent_in(pane_id, "w1", "t1", kind, session_id)
     }
 
@@ -1778,7 +1833,7 @@ mod tests {
         }
     }
 
-    fn snapshot() -> HerdrSessionSnapshot {
+    pub(super) fn snapshot() -> HerdrSessionSnapshot {
         HerdrSessionSnapshot {
             version: "test".to_owned(),
             protocol: 22,
@@ -1826,30 +1881,54 @@ mod tests {
     }
 
     #[test]
-    fn offline_cache_is_only_emitted_for_fresh_metadata_and_tracks_native_updates() {
-        assert!(
-            HostState::default()
-                .projection()
-                .offline_cache_blob
-                .is_none()
-        );
+    fn offline_cache_export_reads_latest_metadata_and_skips_persisted_revisions() {
+        assert!(HostState::default().export_offline_cache(None).is_none());
         let mut state = synced_state();
-        let synced_blob = state.projection().offline_cache_blob.unwrap();
-        let cached = crate::app_core::offline::decode(&synced_blob).unwrap();
+        let synced = state.export_offline_cache(None).unwrap();
+        let cached = crate::app_core::offline::decode(&synced.blob).unwrap();
         assert_eq!(cached.snapshot, state.snapshot);
         assert_eq!(cached.last_synced_at_ms, Some(10));
 
-        state.apply_event(1, status_event(HerdrAgentStatus::Working), 20);
-        let updated_blob = state.projection().offline_cache_blob.unwrap();
-        let cached = crate::app_core::offline::decode(&updated_blob).unwrap();
-        assert_ne!(updated_blob, synced_blob);
-        assert_eq!(cached.snapshot, state.snapshot);
-        assert_eq!(cached.last_synced_at_ms, Some(20));
+        let (unchanged, _, allocations, bytes) =
+            crate::test_allocations::measured(|| state.export_offline_cache(Some(synced.revision)));
+        assert!(unchanged.is_none());
+        assert_eq!((allocations, bytes), (0, 0));
 
+        state.apply_event(1, status_event(HerdrAgentStatus::Working), 20);
+        state.apply_event(1, status_event(HerdrAgentStatus::Idle), 30);
+        let updated = state.export_offline_cache(Some(synced.revision)).unwrap();
+        let cached = crate::app_core::offline::decode(&updated.blob).unwrap();
+        assert_eq!(updated.revision, state.projection().revision);
+        assert!(updated.revision > synced.revision);
+        assert_eq!(cached.snapshot, state.snapshot);
+        assert_eq!(cached.last_synced_at_ms, Some(30));
+    }
+
+    #[test]
+    fn pending_cache_export_survives_transport_failure_and_snapshot_refresh() {
+        let mut state = synced_state();
+        let expected = state.snapshot.clone();
         state.mark_reconnecting("offline".to_owned());
-        assert!(state.projection().offline_cache_blob.is_none());
+        let export = state.export_offline_cache(None).unwrap();
+        let cached = crate::app_core::offline::decode(&export.blob).unwrap();
+        assert_eq!(cached.snapshot, expected);
+        assert_eq!(cached.freshness, HostFreshness::Stale);
+        assert_eq!(cached.last_synced_at_ms, Some(10));
+        let token = state.begin_sync(1);
+        assert_eq!(
+            crate::app_core::offline::decode(&state.export_offline_cache(None).unwrap().blob)
+                .unwrap()
+                .snapshot,
+            expected,
+        );
+        state.fail_sync(token, "refresh failed".into());
         state.mark_disconnected();
-        assert!(state.projection().offline_cache_blob.is_none());
+        assert_eq!(
+            crate::app_core::offline::decode(&state.export_offline_cache(None).unwrap().blob)
+                .unwrap()
+                .snapshot,
+            expected,
+        );
     }
 
     #[test]
@@ -1874,7 +1953,7 @@ mod tests {
         );
 
         let cached =
-            crate::app_core::offline::decode(&state.projection().offline_cache_blob.unwrap())
+            crate::app_core::offline::decode(&state.export_offline_cache(None).unwrap().blob)
                 .unwrap();
         assert_eq!(cached.snapshot, state.snapshot);
         let snapshot = cached.snapshot.unwrap();
@@ -1886,7 +1965,7 @@ mod tests {
         assert_eq!(snapshot.layouts.len(), 1);
     }
 
-    fn scroll_info(offset: f64) -> crate::herdr_api::HerdrPaneScrollInfo {
+    pub(super) fn scroll_info(offset: f64) -> crate::herdr_api::HerdrPaneScrollInfo {
         crate::herdr_api::HerdrPaneScrollInfo {
             offset_from_bottom: offset,
             max_offset_from_bottom: 100.0,
@@ -2516,6 +2595,7 @@ mod tests {
     #[test]
     fn unknown_parent_marks_state_stale_without_manufacturing_entities() {
         let mut state = synced_state();
+        let expected = state.snapshot.clone();
         let result = state.apply_event(
             1,
             HerdrEvent::PaneCreated {
@@ -2526,6 +2606,12 @@ mod tests {
         assert!(matches!(result, ApplyResult::NeedsResync(_)));
         assert_eq!(state.snapshot.as_ref().unwrap().panes.len(), 1);
         assert_eq!(state.freshness, HostFreshness::Stale);
+        assert_eq!(
+            crate::app_core::offline::decode(&state.export_offline_cache(None).unwrap().blob)
+                .unwrap()
+                .snapshot,
+            expected,
+        );
     }
 
     #[test]
@@ -2571,6 +2657,76 @@ mod tests {
         state.complete_sync(token, snapshot(), 70);
         assert_eq!(state.freshness, HostFreshness::Fresh);
         assert_eq!(state.connection_generation, 2);
+    }
+
+    #[test]
+    fn tab_label_origin_follows_explicit_operations_and_is_unknown_after_a_legacy_reconnect() {
+        let mut state = synced_state();
+        assert_eq!(
+            state.snapshot.as_ref().unwrap().tabs[0].label_is_custom,
+            None
+        );
+        let request = HerdrControlRequest::TabCreate {
+            workspace_id: "w1".into(),
+            label: None,
+        };
+        let result = HerdrControlResult::TabCreated {
+            tab: tab("t2", "w1"),
+            root_pane: pane("p2", "w1", "t2", HerdrAgentStatus::Idle),
+        };
+        state.apply_control_result(1, &request, &result);
+        assert_eq!(
+            state.snapshot.as_ref().unwrap().tabs[1].label_is_custom,
+            Some(false)
+        );
+
+        // A normal snapshot refresh does not lose the explicit creation evidence.
+        let mut refresh = state.snapshot.clone().unwrap();
+        refresh.tabs[1].label_is_custom = None;
+        let token = state.begin_sync(1);
+        state.complete_sync(token, refresh.clone(), 10);
+        assert_eq!(
+            state.snapshot.as_ref().unwrap().tabs[1].label_is_custom,
+            Some(false)
+        );
+
+        let mut renamed = tab("t2", "w1");
+        renamed.label = "My manual name".into();
+        state.apply_control_result(
+            1,
+            &HerdrControlRequest::TabRename {
+                tab_id: "t2".into(),
+                label: renamed.label.clone(),
+            },
+            &HerdrControlResult::TabInfo { tab: renamed },
+        );
+        assert_eq!(
+            state.snapshot.as_ref().unwrap().tabs[1].label_is_custom,
+            Some(true)
+        );
+        state.apply_event(
+            1,
+            HerdrEvent::TabRenamed {
+                tab_id: "t2".into(),
+                workspace_id: "w1".into(),
+                label: String::new(),
+            },
+            11,
+        );
+        assert_eq!(
+            state.snapshot.as_ref().unwrap().tabs[1].label_is_custom,
+            Some(false)
+        );
+
+        // The server could have been renamed while disconnected. Never guess.
+        state.mark_reconnecting("closed".into());
+        state.connection_installed(2);
+        let token = state.begin_sync(2);
+        state.complete_sync(token, refresh, 20);
+        assert_eq!(
+            state.snapshot.as_ref().unwrap().tabs[1].label_is_custom,
+            None
+        );
     }
 
     #[test]

@@ -47,6 +47,10 @@ test('chat control recognizes Claude, Codex, and OpenCode panes', () => {
   expect(chatAgentForPane(undefined)).toBeNull();
   expect(chatAgentForPane(pane('codex'))).toBe('codex');
   expect(chatAgentForPane(pane('opencode'))).toBe('opencode');
+  expect(chatAgentForPane(pane('Pi'))).toBe('pi');
+  expect(chatAgentForPane(pane('shell', 'pi', '/custom/session.jsonl'))).toBe('pi');
+  expect(chatAgentForPane(pane('pi-wrapper'))).toBeNull();
+  expect(chatAgentDisplayName('pi')).toBe('Pi');
   expect(chatAgentForPane(pane('open-code'))).toBe('opencode');
   expect(chatAgentForPane(pane('claude'))).toBe('claude');
   expect(chatAgentForPane(pane('shell'))).toBeNull();
@@ -57,6 +61,13 @@ test('chat control recognizes Claude, Codex, and OpenCode panes', () => {
   expect(chatAgentDisplayName('claude')).toBe('Claude');
   expect(agentChatControlState(pane('claude'), false, false))
     .toEqual({ agent: 'claude', disabled: false, loading: false });
+});
+
+test('chat support follows the explicit agent type instead of a matching display label', () => {
+  expect(chatAgentForPane(pane('codex', 'opencode', 'session-id'))).toBe('opencode');
+  expect(agentChatControlState(pane('claude', 'gemini', 'session-id'), false, false)).toBeNull();
+  expect(agentChatControlState({ ...pane('cursor'), display_agent: 'Claude' }, false, false)).toBeNull();
+  expect(chatAgentForPane(pane('claude-wrapper'))).toBeNull();
 });
 
 test('chat control follows the supported active terminal pane', () => {

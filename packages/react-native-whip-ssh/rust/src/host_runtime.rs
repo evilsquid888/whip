@@ -10,18 +10,28 @@ mod connection;
 pub use connection::herdr_protocol_label;
 mod diagnostics;
 mod directory_cache;
+
+pub(crate) fn record_transcript_cache_failure(message: &str) {
+    diagnostics::log_lifecycle(format_args!("conversation cache: {message}"));
+}
 mod events;
 mod git_discovery;
+mod github;
+mod herdr_setup;
 mod host_latency;
+pub use herdr_setup::{HerdrInstallOutcome, HerdrInstallationStatus, HerdrSetup};
 mod interaction;
 pub use interaction::{AgentInteractionChoice, AgentInteractionKind, AgentInteractionPrompt};
 mod monitoring;
+mod notifications;
 mod remote_files;
 mod remote_text;
 pub use remote_text::{RemoteTextAnchor, RemoteTextPage, RemoteTextReader, RemoteTextRow};
 mod selection;
 pub use selection::TerminalSelectionSnapshot;
+mod submissions;
 mod terminal;
+pub(crate) use submissions::submission_transport;
 
 use std::collections::HashMap;
 use std::sync::{
@@ -41,23 +51,38 @@ use crate::herdr_api::{HerdrAgentSessionKind, HerdrPaneInfo};
 use crate::herdr_connection::HerdrConnection;
 use crate::herdr_terminal::HerdrBridgeId;
 use crate::host_state::{
-    AgentStatusTransition, HostFreshness, HostState, HostStateSnapshot, HostSyncStatus,
+    AgentStatusTransition, HostFreshness, HostOfflineCache, HostState, HostStateSnapshot,
+    HostSyncStatus,
 };
 use crate::remote_ops::{PreviewState, RemoteOperationManager, TransferProgress};
-use crate::ssh::{SshErrorCode, SshFailure, SshSession, SshShellClose};
+use crate::ssh::{SshErrorCode, SshFailure, SshSession};
 #[cfg(test)]
 use agents::*;
-use connection::*;
-use diagnostics::*;
-use events::*;
+use connection::{
+    begin_reconnect, begin_reconnect_for_generation, connect_chain_until_cancelled,
+    control_request_inner, current_generation, current_ssh, ensure_herdr_server,
+    is_transport_control_error, reconnect_delay, request_replay, resume_reverse_control,
+    runtime_jitter, start_herdr_server_inner, validate_config, validate_generation,
+};
+pub(crate) use connection::{disconnect_sessions, ssh_config};
+use diagnostics::{
+    emit_diagnostic, emit_diagnostic_started, emit_slow_or_failed_diagnostic, log_lifecycle,
+    measure_latency_on,
+};
+use events::{
+    begin_host_state_sync, reconcile_control_result, reconcile_host_state_subscription,
+    refresh_host_state_inner, schedule_event_retry, schedule_state_resync, start_desired_events,
+};
 pub(crate) use events::{
     deliver_herdr_events, event_subscription_closed, terminal_bridge_closed,
     terminal_kitty_keyboard_report_all_changed,
 };
-use host_latency::*;
-use monitoring::*;
-use remote_files::*;
-use terminal::*;
+use host_latency::{
+    clear_latency_transport, measure_application_latency_inner, measure_host_latency_inner,
+};
+use monitoring::MonitoringState;
+use remote_files::{invalidate_remote_operations, resolved_remote_path};
+use terminal::{close_terminal_intent, restore_resources, schedule_terminal_retry};
 
 const MAX_RECONNECT_ATTEMPTS: u32 = 5;
 const INITIAL_RECONNECT_DELAY_MS: u64 = 750;
@@ -111,6 +136,9 @@ pub enum HostSshCredential {
 
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct HostSshConfig {
+    pub tailcat_address: Option<String>,
+    pub tailcat_private_key: Option<String>,
+    pub tailcat_ssh_server: bool,
     pub host: String,
     pub port: u16,
     pub username: String,
@@ -123,6 +151,7 @@ pub struct HostRuntimeConfig {
     pub runtime_id: String,
     pub ssh: HostSshConfig,
     pub jump_hosts: Vec<HostSshConfig>,
+    pub herdr_enabled: bool,
     pub session_name: String,
     pub herdr_command: String,
     pub socket_path: Option<String>,
@@ -427,6 +456,7 @@ struct RuntimeState {
     ssh_shells: HashMap<String, SshShellRuntime>,
     host_state: HostState,
     agent_order: Option<Vec<String>>,
+    notification_install: Option<notifications::PluginInstallation>,
 }
 
 impl RuntimeState {
@@ -449,6 +479,7 @@ impl RuntimeState {
             ssh_shells: HashMap::new(),
             host_state: HostState::default(),
             agent_order: None,
+            notification_install: None,
         }
     }
 
@@ -586,6 +617,7 @@ struct RuntimeInner {
     agent_view_refresh: Arc<Notify>,
     latency_transport: AsyncMutex<Option<host_latency::LatencyTransport>>,
     herdr_startup: AsyncMutex<()>,
+    herdr_installation: Mutex<Option<herdr_setup::Installation>>,
     herdr_recovery: AsyncMutex<()>,
     shutdown: AsyncMutex<()>,
     cancellation: watch::Sender<u64>,
@@ -638,23 +670,28 @@ fn authoritative_agent_chat_identity(
     pane: &HerdrPaneInfo,
 ) -> Option<AuthoritativeAgentChatIdentity> {
     let session = pane.agent_session.as_ref()?;
-    if session.kind != HerdrAgentSessionKind::Id {
+    if session.kind != HerdrAgentSessionKind::Id
+        && !(session.agent.eq_ignore_ascii_case("pi")
+            && session.kind == HerdrAgentSessionKind::Path)
+    {
         return None;
     }
     let agent = if session.agent.eq_ignore_ascii_case("claude") {
         AgentTranscriptKind::Claude
     } else if session.agent.eq_ignore_ascii_case("codex") {
         AgentTranscriptKind::Codex
+    } else if session.agent.eq_ignore_ascii_case("pi") {
+        AgentTranscriptKind::Pi
     } else if session.agent.eq_ignore_ascii_case("opencode") {
         AgentTranscriptKind::OpenCode
     } else {
         return None;
     };
     Some(AuthoritativeAgentChatIdentity {
-        terminal_id: pane.terminal_id.clone(),
-        pane_id: pane.pane_id.clone(),
+        terminal_id: pane.terminal_id.clone().into(),
+        pane_id: pane.pane_id.clone().into(),
         agent,
-        session_id: session.value.trim().to_owned(),
+        session_id: session.value.trim().into(),
     })
 }
 
@@ -681,7 +718,7 @@ fn emit_host_state(inner: &RuntimeInner) {
             .iter()
             .filter_map(|pane| {
                 authoritative_agent_chat_identity(pane)
-                    .map(|identity| (pane.terminal_id.clone(), identity))
+                    .map(|identity| (identity.terminal_id.clone(), identity))
             })
             .collect::<HashMap<_, _>>();
         inner
@@ -705,7 +742,12 @@ fn emit_host_state(inner: &RuntimeInner) {
         snapshot
             .panes
             .iter()
-            .map(|pane| (pane.terminal_id.clone(), by_pane[pane.pane_id.as_str()]))
+            .map(|pane| {
+                (
+                    pane.terminal_id.clone().into(),
+                    by_pane[pane.pane_id.as_str()],
+                )
+            })
             .collect()
     } else {
         // An interrupted event subscription cannot reliably wake idle agents.
@@ -739,6 +781,7 @@ pub fn clear_host_runtime_event_sink() {
 // React bridge invalidation detaches foreign callbacks, never SSH transports.
 #[unsafe(no_mangle)]
 pub extern "C" fn whip_detach_runtime_ui() {
+    crate::terminal_delivery::clear();
     crate::reverse_control::detach_ui();
     crate::set_usage_foreground(false);
     clear_host_runtime_event_sink();
@@ -880,6 +923,7 @@ pub fn create_host_runtime(
         config.session_name.clone(),
         config.socket_path.clone(),
         config.cached_socket_path.clone(),
+        config.herdr_enabled,
     );
     let inner = Arc::new(RuntimeInner {
         interaction_response: AsyncMutex::new(HashMap::new()),
@@ -902,6 +946,7 @@ pub fn create_host_runtime(
         herdr,
         jump_sessions: Mutex::new(Vec::new()),
         herdr_startup: AsyncMutex::new(()),
+        herdr_installation: Mutex::new(None),
         herdr_recovery: AsyncMutex::new(()),
         shutdown: AsyncMutex::new(()),
         config,
@@ -978,5 +1023,42 @@ impl HostRuntime {
     }
 }
 
+// Snapshot serialization is internal to the Rust persistence worker.
+impl HostRuntime {
+    pub(crate) async fn export_offline_cache(
+        &self,
+        last_revision: Option<u64>,
+    ) -> Result<Option<HostOfflineCache>, HostRuntimeError> {
+        let inner = self.inner.clone();
+        crate::runtime()
+            .map_err(HostRuntimeError::SshTransportFailure)?
+            .spawn_blocking(move || {
+                inner
+                    .state
+                    .lock()
+                    .host_state
+                    .export_offline_cache(last_revision)
+            })
+            .await
+            .map_err(|error| {
+                HostRuntimeError::SshTransportFailure(format!(
+                    "Offline cache export failed: {error}"
+                ))
+            })
+    }
+}
+
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+pub(crate) fn terminal_delivery_test_guard() -> parking_lot::MutexGuard<'static, ()> {
+    tests::EVENT_SINK_TEST_LOCK.lock()
+}
+
+#[cfg(test)]
+pub(crate) fn register_connected_test_runtime(id: &str) -> Arc<HostRuntime> {
+    let inner = tests::connected_runtime_inner(id);
+    runtimes().write().insert(id.to_owned(), inner.clone());
+    Arc::new(HostRuntime { inner })
+}

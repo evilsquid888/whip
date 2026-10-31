@@ -1,7 +1,15 @@
 apply plugin: "com.android.application"
 apply plugin: "org.jetbrains.kotlin.android"
 apply plugin: "com.facebook.react"
-apply plugin: "whip.react-native-fabric-crash-mitigation"
+
+// Firebase's client configuration is optional; local-only builds need no FCM project.
+def whipGoogleServices = System.getenv("WHIP_GOOGLE_SERVICES_JSON")
+if (whipGoogleServices) {
+    def source = file(whipGoogleServices)
+    if (!source.isFile()) throw new GradleException("WHIP_GOOGLE_SERVICES_JSON must name a Firebase client JSON file")
+    copy { from source; into projectDir; rename { "google-services.json" } }
+}
+if (file("google-services.json").isFile()) apply plugin: "com.google.gms.google-services"
 
 def projectRoot = rootDir.getAbsoluteFile().getParentFile().getAbsolutePath()
 def appVersion = new groovy.json.JsonSlurper().parse(file("${projectRoot}/package.json")).version
@@ -117,7 +125,7 @@ android {
         applicationId = "io.github.kaminarios.whip"
         minSdkVersion = rootProject.ext.minSdkVersion
         targetSdkVersion = rootProject.ext.targetSdkVersion
-        versionCode = 231
+        versionCode = 235
         versionName = appVersion
         manifestPlaceholders.whipProfileable = enableProfiling.toString()
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
@@ -181,13 +189,17 @@ def syncTerminalAssets = tasks.register('syncTerminalAssets', Exec) {
     workingDir projectRoot
     commandLine 'node', 'scripts/sync-terminal-assets.ts'
     inputs.files(fileTree("${projectRoot}/scripts") {
-        include 'sync-terminal-assets.ts', 'android-ime-bridge.cjs', 'terminal-*.cjs', 'mermaid-preview-runtime.js'
+        include 'sync-terminal-assets.ts', 'android-ime-bridge.cjs', 'terminal-*.cjs', '*-preview-runtime.js', '*-preview.html', 'diagram-renderer.js', 'diagram-preview.css', 'code-editor*'
     })
     inputs.file("${projectRoot}/src/lib/terminalBoundaryScroll.cjs")
     inputs.file("${projectRoot}/src/lib/terminalControlCharacter.cjs")
+    inputs.file("${projectRoot}/src/lib/terminalFrameSequence.ts")
+    inputs.file("${projectRoot}/src/lib/terminalInputRegion.ts")
+    inputs.file("${projectRoot}/src/lib/codeEditor.ts")
     inputs.dir("${projectRoot}/assets/terminal-fonts")
+    inputs.dir("${projectRoot}/assets/gui-fonts")
     inputs.files(fileTree("${projectRoot}/node_modules") {
-        include '@xterm/*/lib/*.js', '@xterm/xterm/css/xterm.css', 'mermaid/dist/mermaid.min.js', 'mermaid/LICENSE'
+        include '@xterm/*/lib/*.js', '@xterm/xterm/css/xterm.css', 'pele/dist/pele.global.js', 'pele/LICENSE', 'marked/lib/marked.umd.js', 'dompurify/dist/purify.min.js', '@codemirror/**', '@lezer/**', 'codemirror/**', 'crelt/**', 'style-mod/**', 'w3c-keyname/**', '@marijn/find-cluster-break/**', 'esbuild/**', '@esbuild/**'
     })
     outputs.dirs(
         "${projectRoot}/android/app/src/main/assets",
@@ -228,7 +240,10 @@ dependencies {
     androidTestImplementation("androidx.test:runner:1.7.0")
     androidTestImplementation("androidx.test.ext:junit:1.3.0")
     constraints {
-        implementation("com.google.code.gson:gson:2.14.0") {
+        implementation("com.google.guava:guava:33.7.2-android") {
+            because("GHSA-xxph-c9ww-hj94 allows excessive allocation during deserialization")
+        }
+        implementation("com.google.code.gson:gson:2.15.0") {
             because("Gson versions before 2.8.9 have a deserialization vulnerability")
         }
         implementation("commons-io:commons-io:2.22.0") {
@@ -239,13 +254,13 @@ dependencies {
     // The version of react-native is set by the React Native Gradle Plugin
     implementation("com.facebook.react:react-android")
     implementation("androidx.biometric:biometric:1.1.0")
-    implementation("androidx.webkit:webkit:1.14.0")
+    implementation("androidx.webkit:webkit:1.18.0")
     def shizukuVersion = "13.1.5"
     implementation("dev.rikka.shizuku:api:${shizukuVersion}")
     implementation("dev.rikka.shizuku:provider:${shizukuVersion}")
     implementation("com.google.android.gms:play-services-auth-blockstore:16.4.0")
     // 21.4.0 requires Kotlin 2.3 metadata; Expo currently uses Kotlin 2.1.
-    implementation("com.google.android.gms:play-services-location:21.3.0")
+    implementation("com.google.android.gms:play-services-location:21.4.0")
 
     if (hermesEnabled.toBoolean()) {
         implementation("com.facebook.react:hermes-android")

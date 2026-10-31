@@ -1,0 +1,2 @@
+# Optional: configure this server-side when Expo push security is enabled.
+# EXPO_ACCESS_TOKEN=your-expo-push-security-access-token

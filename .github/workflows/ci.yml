@@ -3,21 +3,43 @@ name: CI
 on:
   push:
     branches: [main]
-    paths-ignore:
-      - '**/*.md'
+    paths: &app-paths
+      - '**'
+      - '!whipair/**'
+      - '!whip-notify/**'
+      - '!launch-videos/**'
+      - '!assets/screenshots/**'
+      - '!fastlane/metadata/**'
+      - '!feedback-worker/**'
+      - '!notify-relay/**'
+      - '!__tests__/feedbackWorker*.test.ts'
+      - '!__tests__/notifyRelay*.test.ts'
+      - '!jest.workers.config.js'
+      - '!.github/workflows/ci-feedback-worker.yml'
+      - '!.github/workflows/ci-notify-relay.yml'
+      - '!.github/workflows/ci-whipair.yml'
+      - '!.github/workflows/ci-whip-notify.yml'
+      - '!.github/workflows/publish-whipair.yml'
+      - '!.github/workflows/publish-whipair-packages.yml'
+      - '!.github/workflows/release-whip-notify.yml'
+      - '!scripts/prepare-notify-install-tag.sh'
+      # The app imports this library and embeds its platform detection script.
+      - 'whip-notify/Cargo.toml'
+      - 'whip-notify/src/**'
+      - '!whip-notify/src/main.rs'
+      - '!whip-notify/src/host.rs'
+      - '!whip-notify/src/host/**'
+      - 'whip-notify/platform.sh'
+      - '!**/*.md'
   pull_request:
     branches: [main]
-    paths-ignore:
-      - '**/*.md'
+    paths: *app-paths
   schedule:
     - cron: '17 9 * * 1'
   workflow_dispatch:
 
 permissions:
   contents: read
-
-env:
-  RUSTUP_TOOLCHAIN: 1.99.0
 
 concurrency:
   group: ci-${{ github.event_name }}-${{ github.ref }}
@@ -41,10 +63,16 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install pinned Rust toolchain
-        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component clippy --component rustfmt
+        run: rustup toolchain install
+
+      - name: Install Go for Tailcat interoperability tests
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: crates/whip-tailcat/tests/reference/go.mod
+          cache-dependency-path: crates/whip-tailcat/tests/reference/go.sum
 
       - name: Cache Rust build
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: packages/react-native-whip-ssh/rust
 
@@ -54,9 +82,15 @@ jobs:
       - name: Lint Whip Rust core
         run: cargo clippy --locked --all-targets -- -D warnings
 
-      - name: Lint WhipAir
-        working-directory: ${{ github.workspace }}/whipair
-        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Check Tailcat client library
+        working-directory: crates/whip-tailcat
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/packages/react-native-whip-ssh/rust/target
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked
+          bash tests/interop.sh
 
       - name: Set up Node.js
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
@@ -69,7 +103,11 @@ jobs:
         run: npm ci --ignore-scripts --include=dev
 
       - name: Test Whip Rust core
-        run: cargo test --locked
+        # Host-runtime tests share process-wide event sinks.
+        run: cargo test --locked -- --test-threads=1
+
+      - name: Test Tailcat against a local upstream relay and server
+        run: bash tests/test-tailcat.sh
 
       - name: Audit Rust dependencies
         uses: rustsec/audit-check@858dc40f52ca2b8570b7a997c1c4e35c6fc9a432 # main
@@ -96,6 +134,9 @@ jobs:
           node-version: 24
           cache: npm
 
+      - name: Check dependency tree
+        run: npm ls --all --package-lock-only > /dev/null
+
       - name: Install dependencies
         run: npm ci
 
@@ -109,9 +150,6 @@ jobs:
         run: |
           npx tsc --noEmit
           npm run check:scripts
-
-      - name: Check feedback Worker
-        run: npm run worker:check
 
       - name: Lint
         run: npm run lint
@@ -142,7 +180,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install Nix
-        uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31
+        uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
@@ -168,7 +206,7 @@ jobs:
           "cmake;3.22.1"
 
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@3f5f9adaf7d9fecd50b5935e54106014257a94e6 # v6
+        uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6
         with:
           dependency-graph: ${{ github.ref == 'refs/heads/main' && 'generate-and-upload' || 'disabled' }}
           dependency-graph-include-projects: '^:app$'
@@ -181,7 +219,7 @@ jobs:
 
       - name: Initialize Java and Kotlin CodeQL
         if: github.event.repository.visibility == 'public'
-        uses: github/codeql-action/init@24c54180a607b1449ed407dd24f251e4e9147c8d # v4
+        uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4
         with:
           languages: java-kotlin
           build-mode: manual
@@ -191,6 +229,7 @@ jobs:
         run: >-
           nix develop .#default -c
           android/gradlew -p android
+          :expo-whip-terminal-input:testDebugUnitTest
           app:checkAppVersion app:lintRelease app:assembleDebug
           app:dependencies --configuration releaseRuntimeClasspath
           -PreactNativeArchitectures=arm64-v8a
@@ -210,7 +249,7 @@ jobs:
 
       - name: Analyze Java and Kotlin
         if: github.event.repository.visibility == 'public'
-        uses: github/codeql-action/analyze@24c54180a607b1449ed407dd24f251e4e9147c8d # v4
+        uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4
         with:
           category: /language:java-kotlin
 
@@ -226,7 +265,7 @@ jobs:
     steps:
       # Submit the Android build's snapshot without checking out or executing code.
       - name: Submit generated Gradle dependency graph
-        uses: gradle/actions/dependency-submission@3f5f9adaf7d9fecd50b5935e54106014257a94e6 # v6
+        uses: gradle/actions/dependency-submission@8da46b539cd8fe6ab27ca75128919a18d757604c # v6
         with:
           dependency-graph: download-and-submit
           dependency-graph-continue-on-failure: false
@@ -236,24 +275,37 @@ jobs:
     name: iOS unsigned compile check
     if: github.event_name != 'schedule'
     runs-on: macos-26
-    timeout-minutes: 45
+    timeout-minutes: 60
     env:
       NODE_ENV: production
+      # Keep both Cargo workspaces' outputs outside node_modules so npm ci
+      # preserves the restored Rust library and UniFFI generator.
+      CARGO_TARGET_DIR: ${{ github.workspace }}/build/ios-rust-target
+      CARGO_INCREMENTAL: '0'
 
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install Nix
-        uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31
+        uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
 
       - name: Report Apple toolchain versions
+        id: apple-toolchain
+        env:
+          RUST_CACHE_ENVIRONMENT: ${{ hashFiles('flake.lock', 'packages/react-native-whip-ssh/rust/rust-toolchain.toml') }}
+          RUST_CACHE_DEPENDENCIES: ${{ hashFiles('packages/react-native-whip-ssh/rust/Cargo.toml', 'packages/react-native-whip-ssh/rust/Cargo.lock', 'package-lock.json', 'patches/uniffi-bindgen-react-native+*.patch') }}
         run: |
-          xcodebuild -version
+          ios_xcode_version="$(xcodebuild -version)"
+          printf '%s\n' "$ios_xcode_version"
           swift --version
+          ios_xcode_hash="$(printf '%s\n' "$ios_xcode_version" | shasum -a 256 | cut -d ' ' -f 1)"
+          ios_cache_prefix="ios-rust-v1-$RUNNER_OS-$RUNNER_ARCH-$RUST_CACHE_ENVIRONMENT-$ios_xcode_hash"
+          echo "cache-prefix=$ios_cache_prefix" >> "$GITHUB_OUTPUT"
+          echo "cache-key=$ios_cache_prefix-$RUST_CACHE_DEPENDENCIES-$GITHUB_SHA" >> "$GITHUB_OUTPUT"
 
       - name: Set up Node.js
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
@@ -261,18 +313,75 @@ jobs:
           node-version: 24
           cache: npm
 
+      - name: Restore iOS Rust builds
+        id: ios-rust-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ${{ env.CARGO_TARGET_DIR }}
+          key: ${{ steps.apple-toolchain.outputs.cache-key }}
+          restore-keys: ${{ steps.apple-toolchain.outputs.cache-prefix }}-
+
       - name: Install dependencies
         run: nix develop .#default -c npm ci --include=dev
 
+      # Save before Xcode runs so a later failure or timeout keeps this cache.
+      - name: Save iOS Rust builds
+        if: steps.ios-rust-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ${{ env.CARGO_TARGET_DIR }}
+          key: ${{ steps.ios-rust-cache.outputs.cache-primary-key }}
+
       - name: Set up Ruby and CocoaPods
-        uses: ruby/setup-ruby@651ff0d62c5c79bed6d53ec518387aae20e72c1a # v1
+        uses: ruby/setup-ruby@7f797815d8adceb1c412e7abefdd1ab4abc47a5f # v1
         with:
           ruby-version: '3.4'
           bundler-cache: true
 
+      - name: Cache React Native downloads
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ~/Library/Caches/ReactNative
+          key: ios-react-native-downloads-v1-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: ios-react-native-downloads-v1-${{ runner.os }}-
+
       - name: Install CocoaPods
         working-directory: ios
-        run: bundle exec pod install
+        env:
+          CURL_HOME: ${{ runner.temp }}/whip-curl
+        run: |
+          mkdir -p "$CURL_HOME"
+          cat > "$CURL_HOME/.curlrc" <<'CURL'
+          connect-timeout = 20
+          max-time = 180
+          speed-limit = 1024
+          speed-time = 30
+          retry = 3
+          retry-all-errors
+          retry-max-time = 240
+          CURL
+          bundle exec pod install
+
+      - name: Test native browser, clipboard, and terminal input on iPhone simulator
+        id: ios-native-tests
+        run: |
+          defaults write com.apple.iphonesimulator ConnectHardwareKeyboard -bool NO
+          nix develop .#default -c ruby scripts/test-ios-browser.rb
+
+      - name: Upload failed iOS native test results
+        if: failure() && steps.ios-native-tests.conclusion == 'failure'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: whip-ios-native-test-results
+          path: build/ios-browser-tests/DerivedData/Logs/Test/*.xcresult
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Compile and validate unsigned iOS device app
         run: |

@@ -3,14 +3,18 @@
 mod agent_sessions;
 mod agent_transcript;
 mod app_core;
+mod app_database;
 mod app_update;
+mod billing;
 mod browser_library;
 mod browser_search_history;
+mod chat_rows;
 mod chat_search;
 mod chat_speech;
 mod codex;
 mod composer_dictation;
 mod git_review;
+mod github;
 mod herdr_api;
 mod herdr_codec;
 mod herdr_connection;
@@ -21,23 +25,38 @@ mod host_profiles;
 mod host_runtime;
 mod host_state;
 mod markdown_images;
+mod notification_crypto;
 mod pairing;
+mod public_keys;
 mod remote_ops;
 mod remote_preview;
 mod reverse_control;
+mod rich_text_html;
+mod secure_id;
+mod speech_playback;
 mod ssh;
+mod syntax_highlighting;
+mod terminal_delivery;
+mod terminal_submissions;
+#[cfg(test)]
+mod test_allocations;
+mod transcript_database;
 mod usage;
 
 pub use agent_sessions::*;
 pub use agent_transcript::*;
 pub use app_core::*;
+pub use app_database::*;
 pub use app_update::*;
+pub use billing::*;
 pub use browser_library::*;
 pub use browser_search_history::*;
+pub use chat_rows::*;
 pub use chat_search::*;
 pub use chat_speech::*;
 pub use composer_dictation::*;
 pub use git_review::*;
+pub use github::*;
 pub use herdr_api::*;
 pub use herdr_events::*;
 pub use herdr_terminal::*;
@@ -45,8 +64,21 @@ pub use host_profiles::*;
 pub use host_runtime::*;
 pub use host_state::*;
 pub use markdown_images::*;
+pub use public_keys::*;
 pub use remote_ops::*;
 pub use reverse_control::*;
+pub use rich_text_html::*;
+pub use secure_id::*;
+pub use ssh::tailcat::{
+    TailcatIdentity, TailcatIdentityError, generate_tailcat_identity, tailcat_server_command,
+};
+pub use syntax_highlighting::*;
+pub use terminal_delivery::*;
+pub use terminal_submissions::*;
+pub use transcript_database::{
+    SavedAgentTranscript, agent_transcript_cache_size, clear_agent_transcript_cache,
+    delete_agent_transcripts_for_host, list_saved_agent_transcripts, read_saved_agent_transcript,
+};
 pub use usage::*;
 
 use std::sync::OnceLock;
@@ -104,6 +136,10 @@ pub enum PairHostError {
     RuntimeInitialization(String),
     #[error("pairing runtime task failed: {0}")]
     RuntimeTaskFailed(String),
+    #[error("unknown SSH jump host key")]
+    HostKeyUnknown(ssh::HostKeyChallenge),
+    #[error("SSH jump host key changed")]
+    HostKeyChanged(ssh::HostKeyChallenge),
 }
 
 impl From<pairing::PairingError> for PairHostError {
@@ -112,6 +148,8 @@ impl From<pairing::PairingError> for PairHostError {
             pairing::PairingError::BadPrefix => Self::BadPrefix,
             pairing::PairingError::BadEncoding => Self::BadEncoding,
             pairing::PairingError::BadPayload => Self::BadPayload,
+            error @ (pairing::PairingError::TailcatJumpHost
+            | pairing::PairingError::TailcatConnection) => Self::SshFailure(error.to_string()),
             pairing::PairingError::ConnectionTimeout => Self::ConnectionTimeout,
             pairing::PairingError::ApprovalTimeout => Self::ApprovalTimeout,
             pairing::PairingError::AuthenticationFailed => Self::AuthenticationFailed,
@@ -123,6 +161,11 @@ impl From<pairing::PairingError> for PairHostError {
             pairing::PairingError::Ssh(error) => Self::SshFailure(error.to_string()),
             pairing::PairingError::SshKey(error) => Self::SshFailure(error.to_string()),
             pairing::PairingError::Json(error) => Self::SshFailure(error.to_string()),
+            pairing::PairingError::JumpHost(error) => match error {
+                ssh::SshFailure::HostKeyUnknown(challenge) => Self::HostKeyUnknown(*challenge),
+                ssh::SshFailure::HostKeyChanged(challenge) => Self::HostKeyChanged(*challenge),
+                error => Self::SshFailure(format!("jump host: {error}")),
+            },
         }
     }
 }
@@ -132,10 +175,11 @@ pub async fn pair_host(
     code: String,
     public_key: String,
     device_name: String,
+    jump_hosts: Vec<HostSshConfig>,
 ) -> Result<pairing::PairHostResult, PairHostError> {
     let task = match runtime() {
         Ok(runtime) => runtime.spawn(async move {
-            pairing::pair_host(&code, &public_key, &device_name)
+            pairing::pair_host(&code, &public_key, &device_name, &jump_hosts)
                 .await
                 .map_err(PairHostError::from)
         }),
@@ -213,6 +257,7 @@ mod tests {
             unreachable_pairing_code(),
             "ssh-ed25519 AAAA test".to_owned(),
             "test device".to_owned(),
+            Vec::new(),
         ))
         .unwrap_err();
         let message = error.to_string();

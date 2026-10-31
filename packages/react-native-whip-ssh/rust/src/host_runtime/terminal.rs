@@ -1,9 +1,17 @@
 //! Herdr terminal bridge lifecycle and recovery.
 
-use super::*;
 use std::future::Future;
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use super::{
+    HostConnectionState, HostRuntime, HostRuntimeError, HostRuntimeEvent, HostTerminalGeometry,
+    HostTerminalResizeOutcome, HostTerminalState, MAX_RECONNECT_ATTEMPTS,
+    RuntimeDiagnosticOperation, RuntimeInner, RuntimeState, SshShellRuntime, TerminalRuntime,
+    begin_reconnect_for_generation, current_ssh, emit, emit_diagnostic, emit_host_state,
+    emit_slow_or_failed_diagnostic, ensure_herdr_server, log_lifecycle, reconnect_delay,
+    request_replay, runtime_jitter, schedule_event_retry, start_desired_events,
+};
 use crate::herdr_api::{HerdrControlError, HerdrControlRequest, HerdrControlResult};
 use crate::herdr_events::close_herdr_event_subscription;
 use crate::herdr_terminal::{
@@ -12,6 +20,10 @@ use crate::herdr_terminal::{
     close_owned_herdr_terminal_bridge, herdr_terminal_input, herdr_terminal_resize,
     herdr_terminal_scroll, start_bridge_on_runtime,
 };
+use crate::ssh::SshShellClose;
+
+#[cfg(test)]
+mod tests;
 
 fn terminal_scroll_read_is_current(
     state: &RuntimeState,
@@ -276,6 +288,10 @@ pub(super) async fn open_terminal_inner(
             debug_assert_eq!(current.bridge_id, Some(bridge_id));
             current.state = HostTerminalState::Attached;
             current.reconnect_attempt = 0;
+            // Release worker ownership atomically with the attach commit. A
+            // close callback can run as soon as the state lock is released;
+            // it must be able to start its own retry worker at that point.
+            current.retry_running = false;
             let geometry = HostTerminalGeometry::normalized(
                 terminal.columns,
                 terminal.rows,
@@ -480,6 +496,7 @@ pub(super) fn ssh_shell_closed(
     if disposition == SshShellCloseDisposition::Ignored {
         return;
     }
+    super::herdr_setup::terminal_interrupted(&inner, &terminal_id, &reason);
     inner.terminal_settled.notify_waiters();
     if disposition == SshShellCloseDisposition::Restore {
         emit(HostRuntimeEvent::TerminalStateChanged {
@@ -570,7 +587,9 @@ pub(super) async fn open_ssh_shell_inner(
     let runtime_id = inner.id.clone();
     let data_terminal_id = terminal_id.clone();
     let data_inner = Arc::downgrade(&inner);
-    let data = Arc::new(move |bytes| {
+    let data = Arc::new(move |bytes: Vec<u8>| {
+        let delivery_generation =
+            crate::terminal_delivery::generation(&runtime_id, &data_terminal_id);
         let Some(inner) = data_inner.upgrade() else {
             return;
         };
@@ -594,6 +613,17 @@ pub(super) async fn open_ssh_shell_inner(
                     })
         };
         if current {
+            super::herdr_setup::observe_terminal_output(&inner, &data_terminal_id, &bytes);
+            if crate::terminal_delivery::deliver_bytes(
+                &runtime_id,
+                &data_terminal_id,
+                &bytes,
+                None,
+                delivery_generation,
+                (generation, operation_epoch),
+            ) {
+                return;
+            }
             emit(HostRuntimeEvent::SshShellData {
                 runtime_id: runtime_id.clone(),
                 terminal_id: data_terminal_id.clone(),
@@ -614,6 +644,7 @@ pub(super) async fn open_ssh_shell_inner(
             );
         }
     });
+    let initial_command = super::herdr_setup::take_terminal_command(&inner, &terminal_id);
     let result = ssh
         .open_shell(
             &terminal_id,
@@ -622,6 +653,7 @@ pub(super) async fn open_ssh_shell_inner(
             geometry.rows,
             data,
             closed,
+            initial_command.as_deref(),
         )
         .await;
     match result {
@@ -686,6 +718,7 @@ pub(super) async fn open_ssh_shell_inner(
                 }
             }
             let error = HostRuntimeError::from(error);
+            super::herdr_setup::terminal_interrupted(&inner, &terminal_id, &error.to_string());
             emit_diagnostic(
                 &inner,
                 operation,
@@ -743,12 +776,7 @@ pub(super) async fn open_terminal_with_retry(
         }
         match open_terminal_inner(inner.clone(), terminal_id.clone(), operation_epoch, false).await
         {
-            Ok(()) => {
-                if let Some(terminal) = inner.state.lock().terminals.get_mut(&terminal_id) {
-                    terminal.retry_running = false;
-                }
-                return Ok(());
-            }
+            Ok(()) => return Ok(()),
             Err(error @ HostRuntimeError::StaleOperation(_)) => return Err(error),
             Err(error) => last_error = Some(error),
         }
@@ -872,9 +900,6 @@ pub(super) async fn restore_resources(inner: Arc<RuntimeInner>, epoch: u64) -> u
         });
         match open_terminal_inner(inner.clone(), terminal_id.clone(), operation_epoch, true).await {
             Ok(()) => {
-                if let Some(terminal) = inner.state.lock().terminals.get_mut(&terminal_id) {
-                    terminal.retry_running = false;
-                }
                 restored += 1;
             }
             Err(error) => {
@@ -1069,6 +1094,12 @@ pub(super) fn schedule_terminal_retry(
     if let Some(bridge_id) = bridge_to_close {
         close_owned_herdr_terminal_bridge(&inner.id, &terminal_id, bridge_id);
     }
+    let status = inner.state.lock().status();
+    let ssh_alive = inner.herdr.current_ssh().is_ok_and(|ssh| ssh.is_alive());
+    log_lifecycle(format_args!(
+        "terminal recovery: runtime={} terminal={} connection={:?} generation={} ssh_alive={ssh_alive} bridge={closed_bridge_id:?} start_worker={start_worker} attempt={reconnect_attempt} reason={reason}",
+        inner.id, terminal_id, status.state, status.generation
+    ));
     emit(HostRuntimeEvent::TerminalStateChanged {
         runtime_id: inner.id.clone(),
         terminal_id: terminal_id.clone(),
@@ -1118,12 +1149,7 @@ pub(super) fn schedule_terminal_retry(
                 match open_terminal_inner(inner.clone(), terminal_id.clone(), operation_epoch, true)
                     .await
                 {
-                    Ok(()) => {
-                        if let Some(terminal) = inner.state.lock().terminals.get_mut(&terminal_id) {
-                            terminal.retry_running = false;
-                        }
-                        return;
-                    }
+                    Ok(()) => return,
                     Err(error) => last_error = error.to_string(),
                 }
             }
@@ -1609,6 +1635,11 @@ impl HostRuntime {
     }
 
     pub fn close_ssh_shell(&self, terminal_id: String) {
+        super::herdr_setup::terminal_interrupted(
+            &self.inner,
+            &terminal_id,
+            "Installation terminal was closed",
+        );
         self.inner.state.lock().ssh_shells.remove(&terminal_id);
         if let Ok(ssh) = current_ssh(&self.inner) {
             let _ = ssh.close_shell(&terminal_id);

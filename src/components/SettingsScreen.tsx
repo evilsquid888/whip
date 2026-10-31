@@ -1,6 +1,6 @@
 import Slider from '@react-native-community/slider';
-import { BellRing, Bot, CaseSensitive, Check, ChevronDown, ChevronRight, ChevronUp, Code2, Fingerprint, History, Image as ImageIcon, ImagePlus, Info, KeyRound, Minus, Monitor, Moon, Palette, Play, Plus, Server, ShieldCheck, SquareTerminal, Sun, Trash2, Volume1, Volume2, X, type LucideIcon } from 'lucide-react-native';
-import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from 'react';
+import { BellRing, Bot, CaseSensitive, Check, ChevronDown, ChevronRight, ChevronUp, Code2, Fingerprint, Gamepad2, History, Image as ImageIcon, ImagePlus, KeyRound, Minus, Monitor, Moon, Palette, Play, Plus, Server, ShieldCheck, SquareTerminal, Sun, Trash2, Volume1, Volume2, X, type LucideIcon } from 'lucide-react-native';
+import { useEffect, useState } from 'react';
 import Clipboard from '@react-native-clipboard/clipboard';
 import { Alert, Image, Modal, Platform, Pressable, ScrollView, StyleSheet, View } from 'react-native';
 import Animated, {
@@ -20,11 +20,17 @@ import {
 import { deviceLanguage } from '@/src/i18n';
 import { useSectionExpansion } from '@/src/hooks/useSectionExpansion';
 import { terminalFontFamily } from '@/src/lib/terminalFonts';
+import {
+  APP_FONT_SIZE_STEP_PERCENT,
+  MAX_APP_FONT_SIZE_PERCENT,
+  MIN_APP_FONT_SIZE_PERCENT,
+} from '@/src/lib/appFontSize';
 import { useTheme } from '@/src/theme';
 import {
   MIN_XTERM_CACHE_CAPACITY,
 } from '@/src/lib/terminalRendererLru';
 import { cn } from '@/src/lib/utils';
+import { APP_FROSTED_GLASS_SURFACE_PROPS, appGlassModalPresentation } from '@/src/lib/appGlass';
 import { limitAgentInstructions } from '@/src/lib/agentInstructions';
 import {
   terminalVolumeKeyActions,
@@ -51,10 +57,13 @@ import { removeTerminalBackgroundImage, selectTerminalBackgroundImage } from '@/
 import { getBillingRolloutPolicy } from '../billing/rollout';
 import { hapticPress, IconButton } from './app-ui';
 import { ConfirmationPopup } from './ConfirmationPopup';
-import { GlassSurface } from './GlassSurface';
+import { ChatCacheSetting } from './ChatCacheSetting';
+import { GlassSurface, useAppGlassEnabled } from './GlassSurface';
 import { GlassButton, GlassIconBadge } from './GlassControls';
 import { CollapsibleSectionCard } from './CollapsibleSectionCard';
 import { SettingsChoiceRow } from './SettingsChoiceRow';
+import { DetailsTitle, SettingsDetailsProvider } from './SettingsDetails';
+import { ShizukuSection } from './ShizukuSection';
 import { Button } from './ui/button';
 import { Icon } from './ui/icon';
 import { Input } from './ui/input';
@@ -63,57 +72,8 @@ import { Text } from './ui/text';
 
 const DOUBLE_TAP_MENU_EXPAND_DURATION = 280;
 const DOUBLE_TAP_MENU_COLLAPSE_DURATION = 220;
-const SettingsDetailsContext = createContext<{ showDetails: (copy: string, y: number) => void }>({
-  showDetails: (_copy: string, _y: number) => undefined,
-});
 
-export function SettingsDetailsProvider({ children }: { children: ReactNode }) {
-  const [tooltipHeight, setTooltipHeight] = useState(0);
-  const [activeDetails, setActiveDetails] = useState<{
-    copy: string;
-    anchorY: number;
-    containerHeight: number;
-  } | null>(null);
-  const containerRef = useRef<View>(null);
-  const showDetails = (copy: string, y: number) => {
-    containerRef.current?.measureInWindow((_x, containerY, _width, containerHeight) => {
-      setActiveDetails({
-        copy,
-        anchorY: y - containerY,
-        containerHeight,
-      });
-    });
-  };
-  const tooltipPosition = {
-    top: activeDetails
-      ? Math.max(12, Math.min(
-        activeDetails.anchorY >= tooltipHeight + 20
-          ? activeDetails.anchorY - tooltipHeight - 8
-          : activeDetails.anchorY + 40,
-        activeDetails.containerHeight - tooltipHeight - 12,
-      ))
-      : 12,
-  };
-  return (
-    <SettingsDetailsContext.Provider value={{ showDetails }}>
-      <View ref={containerRef} className="flex-1" onTouchStart={() => setActiveDetails(null)}>
-        {children}
-        {activeDetails ? (
-          <View pointerEvents="none" className="absolute inset-0">
-            <View
-              onLayout={event => setTooltipHeight(event.nativeEvent.layout.height)}
-              className="absolute left-5 right-5 rounded-xl border border-border bg-foreground/70 px-4 py-3"
-              style={[styles.detailsTooltip, tooltipPosition]}>
-              <Text accessibilityLiveRegion="polite" className="text-sm leading-5 text-background">
-                {activeDetails.copy}
-              </Text>
-            </View>
-          </View>
-        ) : null}
-      </View>
-    </SettingsDetailsContext.Provider>
-  );
-}
+export { DetailsTitle, SettingsDetailsProvider } from './SettingsDetails';
 
 export interface SettingsSectionProps {
   alertsEnabled: boolean;
@@ -126,10 +86,10 @@ export interface SettingsSectionProps {
   globalKeyCount: number;
   knownHostCount: number | null;
   appearance: AppearancePreference;
+  appFontSizePercent: number;
   fullscreenApp: boolean;
   fullscreenAppUnlocked: boolean;
   fullscreenTerminalUnlocked: boolean;
-  smoothSpinners: boolean;
   appBackgroundImageUri: string | null;
   appBackgroundDimming: number;
   appGlassEnabled: boolean;
@@ -156,8 +116,8 @@ export interface SettingsSectionProps {
   onManageGlobalKeychain: () => void;
   onManageKnownHosts: () => void;
   onAppearanceChange: (value: AppearancePreference) => void;
+  onAppFontSizePercentChange: (value: number) => void;
   onFullscreenAppChange: (value: boolean) => void;
-  onSmoothSpinnersChange: (value: boolean) => void;
   onAppBackgroundImageChange: (value: string | null) => void;
   onAppBackgroundDimmingChange: (value: number) => void;
   onAppGlassEnabledChange: (value: boolean) => void;
@@ -335,6 +295,17 @@ export function SettingsSection(props: SettingsSectionProps) {
         expanded={appearanceExpanded}
         onToggle={toggleAppearance}>
         <AppearanceRow value={props.appearance} onChange={props.onAppearanceChange} />
+        <SliderRow
+          title={t('settings.appFontSize')}
+          icon={CaseSensitive}
+          value={props.appFontSizePercent}
+          minimumValue={MIN_APP_FONT_SIZE_PERCENT}
+          maximumValue={MAX_APP_FONT_SIZE_PERCENT}
+          step={APP_FONT_SIZE_STEP_PERCENT}
+          formatValue={value => `${value}%`}
+          onChange={props.onAppFontSizePercentChange}
+          divided
+        />
           <SettingRow
             title={t('settings.fullscreenApp')}
             copy={t('settings.fullscreenAppCopy')}
@@ -342,13 +313,6 @@ export function SettingsSection(props: SettingsSectionProps) {
             onChange={props.onFullscreenAppChange}
             locked={!props.fullscreenAppUnlocked}
             onLockedPress={props.onOpenRancher}
-            divided
-          />
-          <SettingRow
-            title={t('settings.smoothSpinners')}
-            copy={t('settings.smoothSpinnersCopy')}
-            value={props.smoothSpinners}
-            onChange={props.onSmoothSpinnersChange}
             divided
           />
         <View className="border-t border-border">
@@ -412,11 +376,12 @@ export function SettingsSection(props: SettingsSectionProps) {
             autoCorrect={false}
           />
         </View>
+        <ChatCacheSetting />
       </CollapsibleSectionCard>
 
       <CollapsibleSectionCard
         title={t('herd.reverseControl')}
-        icon={Bot}
+        icon={Gamepad2}
         expanded={reverseControlExpanded}
         onToggle={toggleReverseControl}>
         <View className="px-4 py-4">
@@ -433,6 +398,7 @@ export function SettingsSection(props: SettingsSectionProps) {
             autoCorrect={false}
           />
         </View>
+        <ShizukuSection />
       </CollapsibleSectionCard>
 
       <CollapsibleSectionCard
@@ -859,7 +825,7 @@ function SliderRow({ title, icon, value, minimumValue, maximumValue, step, forma
       </View>
       {fontPreview ? (
         <View className="mt-1 overflow-hidden rounded-md bg-terminal-canvas px-3 py-2.5">
-          <Text numberOfLines={1} className="text-terminal-text" style={[styles.fontPreviewText, fontPreviewSize]}>$ herdr status</Text>
+          <Text appFontScaling={false} numberOfLines={1} className="text-terminal-text" style={[styles.fontPreviewText, fontPreviewSize]}>$ herdr status</Text>
         </View>
       ) : null}
     </Pressable>
@@ -1034,6 +1000,7 @@ function TerminalHistoryManager({
   onDelete: (entries: readonly string[]) => void;
 }) {
   const { top, bottom } = useSafeAreaInsets();
+  const appGlassEnabled = useAppGlassEnabled();
   const { t } = useTranslation();
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [deleteSelection, setDeleteSelection] = useState<readonly string[] | null>(null);
@@ -1074,12 +1041,15 @@ function TerminalHistoryManager({
 
   return (
     <Modal
+      {...appGlassModalPresentation(appGlassEnabled, Platform.OS)}
       animationType="slide"
       onRequestClose={onClose}
       statusBarTranslucent
       visible={visible}>
-      <View
-        className="flex-1 bg-background"
+      <GlassSurface
+        {...APP_FROSTED_GLASS_SURFACE_PROPS}
+        className="flex-1"
+        fallbackClassName="bg-background"
         style={{ paddingTop: Math.max(12, top), paddingBottom: Math.max(12, bottom) }}>
         <View className="flex-row items-center border-b border-border px-4 pb-3">
           <View className="min-w-0 flex-1 pr-3">
@@ -1149,7 +1119,7 @@ function TerminalHistoryManager({
             <Text>{t('settings.deleteSelected')}</Text>
           </Button>
         </View>
-      </View>
+      </GlassSurface>
       <ConfirmationPopup
         confirmLabel={t('common.delete')}
         copy={t('settings.deleteHistoryCopy', { count: deleteSelection?.length || 0 })}
@@ -1203,38 +1173,6 @@ function BackgroundImageRow({ busy, uri, dimming, locked, variant, onChoose, onR
   );
 }
 
-export function DetailsTitle({ title, copy, titleClassName = 'text-[15px] font-semibold leading-5', onDetailsPress }: { title: string; copy: string; titleClassName?: string; onDetailsPress?: () => void }) {
-  const { showDetails } = useContext(SettingsDetailsContext);
-  const buttonRef = useRef<View>(null);
-  const { t } = useTranslation();
-  return (
-    <View className="min-w-0">
-      <View className="min-h-11 flex-row items-center">
-        <Text className={`min-w-0 flex-shrink ${titleClassName}`}>{title}</Text>
-        <Pressable
-          ref={buttonRef}
-          accessibilityHint={copy}
-          accessibilityLabel={t('settings.details', { name: title })}
-          accessibilityRole="button"
-          className="ml-1 size-8 items-center justify-center rounded-full active:bg-muted"
-          hitSlop={8}
-          onPress={event => {
-            event.stopPropagation();
-            if (onDetailsPress) {
-              onDetailsPress();
-              return;
-            }
-            buttonRef.current?.measureInWindow((_x, y) => {
-              showDetails(copy, y);
-            });
-          }}>
-          <Icon as={Info} className="text-muted-foreground" size={16} />
-        </Pressable>
-      </View>
-    </View>
-  );
-}
-
 function SettingRow({ title, icon, copy, value, onChange, onDetailsPress, divided = false, disabled = false, locked = false, onLockedPress }: { title: string; icon?: LucideIcon; copy: string; value: boolean; onChange: (value: boolean) => void; onDetailsPress?: () => void; divided?: boolean; disabled?: boolean; locked?: boolean; onLockedPress?: () => unknown }) {
   const label = (
     <View className={cn('min-w-0 flex-1 flex-row items-center gap-5', locked ? 'pr-3' : 'pr-[18px]')}>
@@ -1278,11 +1216,4 @@ const styles = StyleSheet.create({
   fontPreviewText: { fontFamily: terminalFontFamily },
   slider: { height: 36, marginHorizontal: -2 },
   terminalPreviewText: { fontFamily: 'monospace' },
-  detailsTooltip: {
-    elevation: 12,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 5 },
-    shadowOpacity: 0.24,
-    shadowRadius: 12,
-  },
 });

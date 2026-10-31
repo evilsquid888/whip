@@ -1,5 +1,16 @@
 # Search within chat
 
+Herd's Search filters tabs and paths in the current host/workspace view. It does
+not search conversation transcripts. There is no persistent transcript search
+index or background conversation indexing.
+
+Settings → Herd → Clear chat cache removes this device's saved transcripts and
+any leftover index files after confirmation. Hosts, keys and preferences are
+preserved. Offline history must sync from its host again; active conversations
+stay in memory. The control and dialogs follow the app's glass preference and
+show the total cache file size before clearing. Expanding Herd measures it once;
+clearing updates the result. There is no polling or foreground refresh.
+
 Use Find (the magnifying glass) in the bottom rail to search the active view:
 chat searches the current conversation, and terminal searches terminal output.
 Chat search works across OpenCode, Codex, and Claude Code, including
@@ -8,7 +19,7 @@ loaded cached history while offline.
 Search is literal and ignores case. It covers user and assistant text, reasoning,
 plans, notices, errors, tool names/arguments/output, loaded paths, diagnostics,
 and file changes present in the normalized transcript. It does not fetch missing
-remote history or search other conversations.
+remote history. Find remains scoped to the current conversation.
 
 The search panel shows four candidate excerpts per page. Tap a candidate to jump
 directly to it; page arrows select the first result on the adjacent page.
@@ -22,9 +33,14 @@ the candidate excerpts. Revealed rows stay
 open when search closes. Opening search pauses automatic following; Latest
 resumes it. Leaving the chat closes search and releases the index.
 
-Rust owns case conversion, bounded excerpts, matching, selection, and reconciliation
-as the transcript changes. React Native projects presentation documents, coalesces
-updates every 150 ms, and controls the list. Results are limited to the first 500
+Rust constructs search documents directly from its normalized transcript model
+and owns case conversion, bounded excerpts, matching, selection, and reconciliation
+as the transcript changes. Live indexes refresh when the native revision changes;
+offline indexes restore the saved checkpoint on the conversation database worker.
+Document construction and matching run off the UI thread. React Native sends
+queries, coalesces refreshes every 150 ms, and controls the list using the row
+anchors returned with each result. Transcript content is never sent back through
+JavaScript for indexing. Results are limited to the first 500
 occurrences; `500+` means the query should be narrowed. No search text or transcript
 content is sent to an external service or included in search diagnostics.
 
@@ -36,7 +52,8 @@ or Previous / Next reveals the selected occurrence. Terminal results are also
 capped at 500.
 
 The native API changed, so a native app rebuild is required; Metro reload alone
-cannot add direct result selection or native Markdown highlight props. The
+cannot add native transcript search, direct result selection, or native Markdown
+highlight props. The
 `react-native-enriched-markdown` patch includes both shipped TypeScript specs and
 Android/iOS generated props because the dependency ships generated native code.
 The `react-native-code-highlighter` patch exposes rendered token ranges so search

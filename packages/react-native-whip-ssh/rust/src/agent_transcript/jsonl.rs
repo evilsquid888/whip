@@ -1,8 +1,9 @@
 //! Shared byte framing and source cursors for file-backed agent transcripts.
 
-use super::model::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use super::model::{AgentCacheError, AgentTranscriptState, AgentTranscriptUpdate};
 
 pub const MAX_TRANSCRIPT_LINE_BYTES: usize = 4 * 1024 * 1024;
 
@@ -243,7 +244,6 @@ pub type CodexIngestResult = FileIngestResult;
 pub(crate) trait FileTranscriptCore {
     fn state(&self) -> AgentTranscriptState;
     fn source_generation(&self) -> u64;
-    fn revision(&self) -> u64;
     fn committed_offset(&self) -> u64;
     fn received_offset(&self) -> u64;
     fn invalidate_source(&mut self);
@@ -266,9 +266,6 @@ macro_rules! file_core {
             }
             fn source_generation(&self) -> u64 {
                 self.source_generation()
-            }
-            fn revision(&self) -> u64 {
-                self.revision()
             }
             fn committed_offset(&self) -> u64 {
                 self.committed_offset()
@@ -303,3 +300,4 @@ macro_rules! file_core {
 }
 file_core!(super::codex::CodexSessionCore);
 file_core!(super::claude::ClaudeSessionCore);
+file_core!(super::pi::PiSessionCore);

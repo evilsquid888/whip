@@ -1,3 +1,4 @@
+import { bindNotificationRuntime, unbindNotificationRuntime } from './notificationRuntimeRegistry';
 import {
   createHostRuntime,
   getHostRuntime,
@@ -23,6 +24,9 @@ import {
 import { TerminalBridgeController } from './TerminalBridgeController';
 import { agentTranscriptService } from './NativeTranscriptService';
 import { reportBackgroundFailure } from './backgroundOperations';
+import { herdrSnapshotCache } from './herdrSnapshotCache';
+import { settledPromise } from '../lib/promises';
+import { ensureTailcatIdentity } from './hostProfiles';
 
 const HOST_KEY_CHALLENGE_CODES = new Set([
   'HOST_KEY_UNKNOWN',
@@ -62,6 +66,9 @@ export class HerdrClient {
     const attachmentEpoch = ++this.attachmentEpoch;
     await this.disconnecting;
     if (attachmentEpoch !== this.attachmentEpoch) return;
+    if (profile.tailcatEnabled) profile = await ensureTailcatIdentity(profile);
+    if (jumpProfiles.some(value => value.tailcatEnabled)) jumpProfiles = await Promise.all(jumpProfiles.map(ensureTailcatIdentity));
+    if (attachmentEpoch !== this.attachmentEpoch) return;
     const port = Number(profile.port);
     validateSshPort(port);
     jumpProfiles.forEach(jumpProfile => validateSshPort(Number(jumpProfile.port)));
@@ -74,8 +81,12 @@ export class HerdrClient {
       secret: value.authMode === 'password' ? value.secret : normalizePrivateKey(value.secret),
       passphrase: value.passphrase || undefined,
       forwardAgent: value.forwardAgent,
+      tailcatAddress: value.tailcatEnabled ? value.tailcatAddress?.trim() ?? '' : undefined,
+      tailcatPrivateKey: value.tailcatEnabled ? value.tailcatPrivateKey : undefined,
+      tailcatSshServer: Boolean(value.tailcatEnabled && value.tailcatSshServer),
     } as const);
-    const cachedSocketPath = profile.herdrSocketPath?.trim()
+    const herdrEnabled = profile.herdrEnabled !== false;
+    const cachedSocketPath = !herdrEnabled || profile.herdrSocketPath?.trim()
       ? undefined
       : persistedHerdrSocketPathHint(profile.id) || undefined;
     const endpoint = profile.host.trim();
@@ -91,7 +102,8 @@ export class HerdrClient {
       explicitSocketPath: Boolean(profile.herdrSocketPath?.trim()),
       cachedSocketPath: Boolean(cachedSocketPath),
     });
-    const retryRuntime = this.runtimeAwaitingHostKeyTrust && this.profile === profile
+    const retryRuntime = this.runtimeAwaitingHostKeyTrust && this.profile?.id === profile.id
+      && this.runtime?.matchesSshConfig(sshConfig(profile))
       ? this.runtime
       : null;
     if (this.runtimeAwaitingHostKeyTrust && !retryRuntime) {
@@ -101,8 +113,9 @@ export class HerdrClient {
       this.runtime = null;
       this.runtimeAwaitingHostKeyTrust = false;
     }
+    let runtime: HostRuntimeConnection | null = null;
     const handleEvent = (event: HostRuntimeLifecycleEvent) => {
-      if (this.runtime !== runtime) return;
+      if (!runtime || this.runtime !== runtime) return;
       if (event.type === 'host-state' && event.transcriptRetention) {
         if (event.transcriptRetention.runtimeIncarnation !== runtime.runtimeIncarnation) return;
         reportBackgroundFailure(
@@ -112,13 +125,21 @@ export class HerdrClient {
       }
       this.runtimeEventHandler?.(event);
     };
-    const runtime = retryRuntime ?? getHostRuntime(profile.id, handleEvent) ?? createHostRuntime({
+    let existingRuntime = retryRuntime ?? getHostRuntime(profile.id, handleEvent);
+    if (existingRuntime && (existingRuntime.herdrEnabled !== herdrEnabled
+      || !existingRuntime.matchesSshConfig(sshConfig(profile)))) {
+      await existingRuntime.disconnect();
+      if (attachmentEpoch !== this.attachmentEpoch) return;
+      existingRuntime = null;
+    }
+    runtime = existingRuntime ?? createHostRuntime({
       runtimeId: profile.id,
       ssh: sshConfig(profile),
       jumpHosts: jumpProfiles.map(sshConfig),
+      herdrEnabled,
       sessionName: profile.sessionName.trim(),
       herdrCommand: profile.herdrCommand.trim() || DEFAULT_HERDR_COMMAND,
-      socketPath: profile.herdrSocketPath?.trim() || undefined,
+      socketPath: herdrEnabled ? profile.herdrSocketPath?.trim() || undefined : undefined,
       cachedSocketPath,
     }, handleEvent);
     this.runtime = runtime;
@@ -129,6 +150,7 @@ export class HerdrClient {
         await runtime.connect();
       }
       this.runtimeAwaitingHostKeyTrust = false;
+      if (herdrEnabled) bindNotificationRuntime(profile.id, runtime);
     } catch (error) {
       if (attachmentEpoch !== this.attachmentEpoch) throw error;
       this.runtimeAwaitingHostKeyTrust = isHostKeyChallenge(error);
@@ -166,12 +188,15 @@ export class HerdrClient {
     if (!this.runtime) return this.disconnecting ?? Promise.resolve();
 
     const runtime = this.runtime;
+    unbindNotificationRuntime(runtime.runtimeId, runtime);
     this.terminal.reset(runtime);
     this.runtime = null;
     this.runtimeAwaitingHostKeyTrust = false;
     this.profile = null;
 
-    const disconnecting = runtime.disconnect()
+    const cacheFlush = herdrSnapshotCache.flush(runtime.runtimeId);
+    reportBackgroundFailure(cacheFlush, 'herdr-snapshot-cache-disconnect');
+    const disconnecting = settledPromise(cacheFlush).then(() => runtime.disconnect())
       .catch(error => {
         recordRuntimeCleanupFailure('host-runtime-disconnect-failed', error);
       })
@@ -185,6 +210,7 @@ export class HerdrClient {
   detach(): void {
     this.attachmentEpoch += 1;
     this.terminal.detach();
+    if (this.runtime) unbindNotificationRuntime(this.runtime.runtimeId, this.runtime);
     this.runtime?.setMonitoringState(false, false, false);
     this.runtime?.detach();
     this.runtime = null;

@@ -1,7 +1,7 @@
 function handleKeyboardClosedStationaryTap({
   point,
   urlAtPoint,
-  terminalMouseInputEnabled,
+  terminalMouseCaptured,
   dispatchTerminalClick,
   send,
   clearInteractiveSelection,
@@ -11,7 +11,7 @@ function handleKeyboardClosedStationaryTap({
     send({ type: 'open-link', link });
     return;
   }
-  if (terminalMouseInputEnabled()) {
+  if (terminalMouseCaptured()) {
     dispatchTerminalClick(point);
     return;
   }
@@ -26,32 +26,47 @@ function terminalMouseInputSequence(action, column, row) {
   return `\u001b[<${button};${sgrColumn};${sgrRow}${suffix}`;
 }
 
-function terminalMouseClickInput(column, row) {
-  return terminalMouseInputSequence('press', column, row)
-    + terminalMouseInputSequence('release', column, row);
-}
-
 function terminalMouseWheelInput(direction, count, column, row) {
   const action = direction === 'up' ? 'wheel-up' : 'wheel-down';
   const repeats = Math.max(1, Math.round(Number(count) || 1));
   return terminalMouseInputSequence(action, column, row).repeat(repeats);
 }
 
-function setTerminalKeyboardInputEnabled(terminal, enabled) {
+function setTerminalKeyboardInputEnabled(terminal, enabled, nativeInput = false) {
   const keyboardEnabled = enabled !== false;
   const input = terminal.textarea;
   if (input) {
-    input.readOnly = !keyboardEnabled;
-    input.inputMode = keyboardEnabled ? '' : 'none';
+    input.readOnly = nativeInput || !keyboardEnabled;
+    input.inputMode = keyboardEnabled && !nativeInput ? '' : 'none';
   }
-  if (!keyboardEnabled) terminal.blur();
+  if (!keyboardEnabled || nativeInput) terminal.blur();
+  if (nativeInput) setTerminalNativeCursor(terminal, keyboardEnabled);
   return keyboardEnabled;
+}
+
+// xterm still draws the cursor, including application cursor visibility/style.
+// Only its visual focus changes; the native InputConnection owns keyboard focus.
+function setTerminalNativeCursor(terminal, focused) {
+  const element = terminal.element;
+  if (!element) return;
+  const focusClass = 'native-input-focus';
+  if (focused !== undefined) element.classList.toggle(focusClass, focused);
+  const active = element.classList.contains(focusClass);
+  const blink = active && terminal.options.cursorBlink !== false;
+  // Use the DOM renderer's own cursor animation, colors and cursor cells. Its
+  // parser still decides whether a cursor exists (DECTCEM, scrolling, etc.).
+  element.querySelector('.xterm-rows')?.classList.toggle('xterm-focus', active);
+  for (const cursor of element.querySelectorAll('.xterm-cursor')) {
+    cursor.classList.toggle('xterm-cursor-blink', blink);
+  }
+  const style = active ? terminal.options.cursorStyle : 'outline';
+  if (terminal.options.cursorInactiveStyle !== style) terminal.options.cursorInactiveStyle = style;
 }
 
 module.exports = {
   handleKeyboardClosedStationaryTap,
   setTerminalKeyboardInputEnabled,
-  terminalMouseClickInput,
+  setTerminalNativeCursor,
   terminalMouseInputSequence,
   terminalMouseWheelInput,
 };

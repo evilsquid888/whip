@@ -9,28 +9,38 @@ description = "Private WP4 pairing transport for Whip"
 crate-type = ["staticlib", "rlib"]
 
 [dependencies]
+async-trait = "0.1"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 base64 = "0.22"
+whip-notify = { path = "../../../whip-notify", default-features = false }
+whip-tailcat = { path = "../../../crates/whip-tailcat" }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 futures = "0.3"
 hmac = "0.12"
+html5ever = "0.39"
 parking_lot = "0.12"
 resvg = { version = "0.48.1", default-features = false, features = ["text", "raster-images"] }
-russh = { version = "0.63.2", default-features = false, features = ["flate2", "ring"] }
+russh = { version = "0.64.1", default-features = false, features = ["flate2", "ring"] }
 russh-sftp = "2.4"
+scraper = { version = "0.27", default-features = false }
 semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 sha1 = "0.10"
 shlex = "2"
+syntect = { version = "5.3", default-features = false, features = ["default-fancy"] }
 ssh-key = { version = "=0.7.0-rc.11", features = ["ed25519", "getrandom"] }
 thiserror = "2"
 tokio = { version = "1", features = ["fs", "io-util", "net", "rt-multi-thread", "sync", "time"] }
+turso = { version = "0.8.3", default-features = false, features = ["pure-rust-crypto"] }
+two-face = { version = "0.5", default-features = false, features = ["syntect-fancy"] }
 uniffi = "=0.31"
 url = "2"
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 tempfile = "3"
 
 [lints.clippy]
@@ -63,7 +73,7 @@ todo = "deny"
 undocumented_unsafe_blocks = "deny"
 unimplemented = "deny"
 unwrap_used = "deny"
-wildcard_imports = "allow"
+wildcard_imports = "deny"
 
 [profile.release]
 codegen-units = 1

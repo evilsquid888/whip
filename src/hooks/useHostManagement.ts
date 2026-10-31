@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Alert } from 'react-native';
 import type { TFunction } from 'i18next';
 
-import { deleteAgentChatCachesForHost } from '../services/agentChatCache';
+import { deleteAgentTranscriptsForHost } from 'react-native-whip-ssh';
 import { herdrSnapshotCache } from '../services/herdrSnapshotCache';
 import { reportBackgroundFailure } from '../services/backgroundOperations';
 import {
@@ -96,6 +96,7 @@ export interface HostManagementController {
   savePairedHost: (
     result: PairHostResult,
     key: PairingKeySelection,
+    jumpHostId?: string,
   ) => Promise<void>;
   unlockGlobalKeychain: () => Promise<GlobalSshKeyMaterial[] | null>;
   openGlobalKeychain: () => Promise<void>;
@@ -326,7 +327,7 @@ export function useHostManagement({
   );
 
   const savePairedHost = useCallback(
-    async (result: PairHostResult, key: PairingKeySelection) => {
+    async (result: PairHostResult, key: PairingKeySelection, jumpHostId?: string) => {
       const nextKnownHosts = await trustKnownHost({
         host: result.sshHost,
         port: result.sshPort,
@@ -335,7 +336,7 @@ export function useHostManagement({
         fingerprint: result.sshHostFingerprint,
       });
       replaceKnownHostsState({ status: 'loaded', hosts: nextKnownHosts });
-      await persistProfile(profileFromPairing(result, key));
+      await persistProfile(profileFromPairing(result, key, jumpHostId));
       setCredentialRecovery(await credentialRecoveryStatus());
       setNewHostOpen(false);
       if (key.privateKey) setPairingSuccess(result);
@@ -424,7 +425,7 @@ export function useHostManagement({
     setDeleteHostBusy(true);
     onDeleteConnectedHostRef.current(target.id);
     try {
-      await deleteAgentChatCachesForHost(target.id);
+      await deleteAgentTranscriptsForHost(target.id);
       await herdrSnapshotCache.delete(target.id);
       await deleteHostProfile(target.id);
       setCredentialRecovery(await credentialRecoveryStatus());
@@ -461,9 +462,9 @@ export function useHostManagement({
     setNewHostOpen(false);
     setError(null);
   }, []);
-  const openManualHost = useCallback(() => {
+  const openManualHost = useCallback((tailcatEnabled = false, tailcatSshServer = false) => {
     setNewHostOpen(false);
-    setEditorProfile(emptyConnectionProfile());
+    setEditorProfile({ ...emptyConnectionProfile(), tailcatEnabled, tailcatSshServer, authMode: tailcatEnabled && tailcatSshServer ? 'key' : 'password' });
   }, []);
   const closeEditor = useCallback(() => {
     setEditorProfile(null);

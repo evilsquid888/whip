@@ -1,4 +1,5 @@
 import { createRef } from 'react';
+import { runInNewContext } from 'node:vm';
 import Clipboard from '@react-native-clipboard/clipboard';
 import {
   act,
@@ -11,10 +12,12 @@ import {
   TerminalRendererHost,
   type TerminalRendererHandle,
 } from '../src/components/TerminalRendererHost';
-import type { TerminalControlEvent, TerminalFrame } from '../src/lib/terminalBridge';
+import type { TerminalControlEvent, TerminalOutput } from '../src/lib/terminalBridge';
 import type { TerminalRenderTarget } from '../src/lib/terminalRenderer';
 import { MIN_XTERM_CACHE_CAPACITY } from '../src/lib/terminalRendererLru';
 import type { TerminalPreferences } from '../src/services/devicePreferences';
+import type { TerminalBatchRenderer } from '../src/services/TerminalBridgeController';
+import type { TerminalSubmissionPermitLike } from 'react-native-whip-ssh/src/terminalSubmissions';
 
 jest.mock('expo/virtual/env', () => ({ env: {} }));
 jest.mock('react-native-css-interop/jsx-runtime', () =>
@@ -23,6 +26,7 @@ jest.mock('react-native-css-interop/jsx-runtime', () =>
 jest.mock('react-native', () => {
   const mockListeners = new Set<(mockState: string) => void>();
   return {
+    View: 'View',
     AppState: {
       currentState: 'active',
       listeners: mockListeners,
@@ -35,6 +39,22 @@ jest.mock('react-native', () => {
       OS: 'android',
       select: (options: Record<string, unknown>) => options.android,
     },
+  };
+});
+jest.mock('../src/components/NativeTerminalInput', () => {
+  const React = require('react');
+  return {
+    NativeTerminalInput: React.forwardRef((props: { binding: string; onTerminalInput: (event: unknown) => void }, ref: unknown) => {
+      React.useImperativeHandle(ref, () => ({
+        ...mockNativeInput,
+        barrier: (binding: string, commandId: number) => {
+          const acknowledge = () => props.onTerminalInput({ nativeEvent: { binding, commandId } });
+          if (mockNativeInput.hold) mockNativeInput.pending.push(acknowledge);
+          else acknowledge();
+        },
+      }), [props]);
+      return require('react/jsx-runtime').jsx('WhipTerminalInput', props);
+    }),
   };
 });
 jest.mock('react-native-reanimated', () => ({
@@ -74,6 +94,10 @@ const mockAppState = jest.requireMock('react-native').AppState as {
   listeners: Set<(state: string) => void>;
   addEventListener: jest.Mock;
 };
+const mockNativeInput = {
+  setEnabled: jest.fn(), focus: jest.fn(), blur: jest.fn(), reset: jest.fn(),
+  cursorKeys: jest.fn(), kittyKeyboard: jest.fn(), modifiedInput: jest.fn(), hold: false, pending: [] as Array<() => void>,
+};
 
 const preferences: TerminalPreferences = {
   fullscreen: true,
@@ -98,6 +122,10 @@ describe('TerminalRendererHost lifecycle', () => {
     mockAppState.currentState = 'active';
     mockAppState.listeners.clear();
     mockAppState.addEventListener.mockClear();
+    mockNativeInput.hold = false;
+    mockNativeInput.pending = [];
+    mockNativeInput.focus.mockClear();
+    mockNativeInput.blur.mockClear();
   });
 
   afterEach(() => {
@@ -136,7 +164,7 @@ describe('TerminalRendererHost lifecycle', () => {
   ) => {
     const retained = new Set<string>();
     let nextAttachmentId = 0;
-    let frameHandler: ((frame: TerminalFrame) => void) | null = null;
+    let frameHandler: ((frame: TerminalOutput) => void) | null = null;
     let closedHandler: ((reason?: string) => void) | undefined;
     let controlHandler: ((event: TerminalControlEvent) => void) | undefined;
     const closeTerminalBridge = jest.fn((terminalId: string) => {
@@ -149,9 +177,11 @@ describe('TerminalRendererHost lifecycle', () => {
     const openTerminal = jest.fn(
       async (
         terminalId: string,
-        onFrame: (frame: TerminalFrame) => void,
+        onFrame: (frame: TerminalOutput) => void,
         onClosed?: (reason?: string) => void,
         onControl?: (event: TerminalControlEvent) => void,
+        _initialGeometry?: unknown,
+        _renderer?: TerminalBatchRenderer,
       ) => {
         retained.add(terminalId);
         frameHandler = onFrame;
@@ -178,6 +208,7 @@ describe('TerminalRendererHost lifecycle', () => {
         releaseTerminal,
         resizeTerminal,
         scrollTerminal,
+        acknowledgeTerminalBatch: jest.fn(),
       },
       native: {
         requestHerdrApi: jest.fn(async () => ({ type: 'ok' as const })),
@@ -187,7 +218,7 @@ describe('TerminalRendererHost lifecycle', () => {
       closeTerminalBridge,
       detachTerminal,
       isTerminalBridgeRetained,
-      emitFrame: (frame: TerminalFrame) => frameHandler?.(frame),
+      emitFrame: (frame: TerminalOutput) => frameHandler?.(frame),
       emitControl: (event: TerminalControlEvent) => controlHandler?.(event),
       disconnect: (terminalId = 'term-1') => {
         retained.delete(terminalId);
@@ -337,6 +368,91 @@ describe('TerminalRendererHost lifecycle', () => {
     };
   };
 
+  test('credits only the current renderer generation after a completed batch', async () => {
+    const scroll = { offset_from_bottom: 0, max_offset_from_bottom: 0, viewport_rows: 24 };
+    const client = createClient({ 'term-1': scroll });
+    const target = createTarget('term-1', client, scroll);
+    const { webView, injected } = await mountReadyHost(target);
+    const delivery = client.openTerminal.mock.calls.at(-1)?.[5];
+    expect(delivery).toBeDefined();
+    delivery!.onBatch({ batchId: '7', json: '[]', chunkCount: 1, payloadBytes: 3 }, '99', 123);
+    expect(injected.at(-1)).toContain('window.herdrDeliverBatch([]');
+    const written = {
+      type: 'terminal-batch-written', key: target.key, identity: delivery!.identity,
+      generation: '99', batchId: '7', inboundCookie: 123, localMs: 2, base64Ms: 0.1,
+    };
+    await sendRendererMessage(webView, { ...written, identity: 'retired' });
+    await sendRendererMessage(webView, { ...written, generation: '98' });
+    expect(client.terminal.acknowledgeTerminalBatch).not.toHaveBeenCalled();
+    await sendRendererMessage(webView, written);
+    expect(client.terminal.acknowledgeTerminalBatch).toHaveBeenCalledWith('term-1', delivery!.identity, '99', '7');
+  });
+
+  test('writes graphics intact between consecutive terminal repaint frames', async () => {
+    const scroll = { offset_from_bottom: 0, max_offset_from_bottom: 0, viewport_rows: 24 };
+    const client = createClient({ 'term-1': scroll });
+    const target = createTarget('term-1', client, scroll);
+    const { injected } = await mountReadyHost(target);
+    const frame = {
+      type: 'terminal.frame' as const,
+      encoding: 'ansi' as const,
+      seq: 7, full: true, width: 80, height: 24,
+      bytes: Buffer.from('before').toString('base64'),
+      final: true,
+    };
+    act(() => client.emitFrame(frame));
+    injected.length = 0;
+    client.resizeTerminal.mockClear();
+    const protocol = '\u001b_Ga=T,f=24,s=128,t=d,m=0;' + 'abcd'.repeat(20_000) + '\u001b\\';
+    const image = new TextEncoder().encode(protocol);
+    const storage = new Uint8Array(image.length + 2);
+    storage.set(image, 1);
+    act(() => {
+      client.emitFrame({ type: 'terminal.graphics', bytes: storage.subarray(1, -1) });
+      client.emitFrame({ ...frame, seq: 8, full: false, bytes: Buffer.from('after').toString('base64') });
+    });
+
+    const written: string[] = [];
+    const pending = new Map<number, string>();
+    const window = {
+      herdrWriteBase64Chunk: (key: string, sequence: number, data: string, final: boolean) => {
+        expect(key).toBe(target.key);
+        const encoded = (pending.get(sequence) || '') + data;
+        if (final) {
+          written.push(Buffer.from(encoded, 'base64').toString('utf8'));
+          pending.delete(sequence);
+        } else {
+          pending.set(sequence, encoded);
+        }
+      },
+    };
+    for (const script of injected) runInNewContext(script, { window });
+    expect(written).toEqual([protocol, 'after']);
+    expect(pending.size).toBe(0);
+    expect(client.resizeTerminal).not.toHaveBeenCalled();
+  });
+
+  test('forwards SSH byte views without UTF-8 loss or surrounding buffer bytes', async () => {
+    const scroll = { offset_from_bottom: 0, max_offset_from_bottom: 0, viewport_rows: 24 };
+    const client = createClient({});
+    const base = createTarget('ssh-shell', client, scroll);
+    const target = { ...base, session: { ...base.session, kind: 'ssh' as const } };
+    const { injected } = await mountReadyHost(target);
+    injected.length = 0;
+    const storage = Uint8Array.of(42, 0xff, 0, 0xe7, 0x95, 0x8c, 43);
+    act(() => client.emitFrame({
+      type: 'terminal.frame', encoding: 'utf8', seq: 1, full: false,
+      width: 80, height: 24, bytes: storage.subarray(1, -1),
+    }));
+    const written: Buffer[] = [];
+    const window = {
+      herdrReset: jest.fn(),
+      herdrWriteBase64Chunk: (_key: string, _sequence: number, data: string) => written.push(Buffer.from(data, 'base64')),
+    };
+    for (const script of injected) runInNewContext(script, { window });
+    expect(Buffer.concat(written)).toEqual(Buffer.from(storage.subarray(1, -1)));
+  });
+
   test('reads context for its requesting pane and drops it after switching panes', async () => {
     const scroll = { offset_from_bottom: 0, max_offset_from_bottom: 0, viewport_rows: 24 };
     const client = createClient({ 'term-1': scroll, 'term-2': scroll });
@@ -382,7 +498,7 @@ describe('TerminalRendererHost lifecycle', () => {
       .toEqual(['window.herdrActivate(null); true;']);
   });
 
-  test('touches do not take WebView focus while terminal keyboard input is disabled', async () => {
+  test('Android touches keep WebView keyboard focus disabled', async () => {
     const scroll = { offset_from_bottom: 0, max_offset_from_bottom: 100, viewport_rows: 24 };
     const client = createClient({ 'term-1': scroll });
     const target = createTarget('term-1', client, scroll);
@@ -392,12 +508,228 @@ describe('TerminalRendererHost lifecycle', () => {
       act(() => handle.current?.setKeyboardEnabled(enabled));
       expect(injected.at(-1)).toContain(`herdrSetKeyboardEnabled("${target.key}", ${enabled})`);
       requestFocus.mockClear();
+      mockNativeInput.focus.mockClear();
       injected.length = 0;
       act(() => { webView.props.onTouchStart(); });
-      expect(requestFocus).toHaveBeenCalledTimes(enabled ? 1 : 0);
-      if (enabled) expect(injected.at(-1)).toContain(`herdrFocus("${target.key}")`);
-      else expect(injected).toEqual([]);
+      expect(requestFocus).not.toHaveBeenCalled();
+      expect(mockNativeInput.focus).toHaveBeenCalledTimes(enabled ? 1 : 0);
+      expect(injected).toEqual(enabled ? [`window.herdrFocus("${target.key}"); true;`] : []);
+      expect(webView.props.focusable).toBe(false);
     }
+  });
+
+  test('native slash and subsequent characters use the existing queue immediately without WebView input', async () => {
+    const scroll = { offset_from_bottom: 0, max_offset_from_bottom: 0, viewport_rows: 24 };
+    const target = createTarget('term-1', createClient({ 'term-1': scroll }), scroll);
+    const { handle, injected, eventCallbacks } = await mountReadyHost(target);
+    act(() => handle.current!.setKeyboardEnabled(true));
+    const input = renderer.root.findByType('WhipTerminalInput' as never);
+    injected.length = 0;
+    for (const character of '/resume') {
+      await act(async () => {
+        input.props.onTerminalInput({ nativeEvent: { binding: input.props.binding, data: character } });
+      });
+      expect(eventCallbacks.onInput).toHaveBeenLastCalledWith(target, character);
+    }
+    expect(eventCallbacks.onInput).toHaveBeenCalledTimes(7);
+    expect(injected).toEqual([]);
+  });
+
+  test('native typing, rail Tab and paste stay ordered while an earlier write is pending', async () => {
+    const scroll = { offset_from_bottom: 0, max_offset_from_bottom: 0, viewport_rows: 24 };
+    const client = createClient({ 'term-1': scroll });
+    const target = createTarget('term-1', client, scroll);
+    const { handle, eventCallbacks } = await mountReadyHost(target);
+    act(() => handle.current!.setKeyboardEnabled(true));
+    const input = renderer.root.findByType('WhipTerminalInput' as never);
+    const order: string[] = [];
+    let release!: () => void;
+    const firstWrite = new Promise<void>(resolve => { release = resolve; });
+    eventCallbacks.onInput.mockImplementation((_target, data: string) => {
+      order.push(data);
+      return data === '/' ? firstWrite : undefined;
+    });
+    client.native.requestHerdrApi.mockImplementation(async () => { order.push('paste'); return { type: 'ok' }; });
+    const type = (data: string) => input.props.onTerminalInput({ nativeEvent: { binding: input.props.binding, data } });
+    await act(async () => { type('/'); });
+    mockNativeInput.hold = true;
+    act(() => { handle.current!.input('\t'); });
+    expect(mockNativeInput.pending).toHaveLength(1);
+    await act(async () => {
+      type('r'); // Reaches native input before the UI-thread rail barrier.
+      mockNativeInput.pending.shift()!();
+      handle.current!.paste('pasted');
+      mockNativeInput.pending.shift()!();
+      type('x');
+    });
+    expect(order).toEqual(['/']);
+    await act(async () => { release(); });
+    expect(order).toEqual(['/', 'r', '\t', 'paste', 'x']);
+  });
+
+  test('Expo view command failure rejects pending barriers without sending the external edit', async () => {
+    const scroll = { offset_from_bottom: 0, max_offset_from_bottom: 0, viewport_rows: 24 };
+    const target = createTarget('term-1', createClient({ 'term-1': scroll }), scroll);
+    const { handle, eventCallbacks } = await mountReadyHost(target);
+    mockNativeInput.hold = true;
+    const input = renderer.root.findByType('WhipTerminalInput' as never);
+    let failure: unknown;
+    const permit = { checkActive: jest.fn(), dispatch: jest.fn(async () => {}) } as unknown as TerminalSubmissionPermitLike;
+    await act(async () => {
+      const pending = handle.current!.submitPastes(target, ['must not send'], true, permit).catch((error: unknown) => { failure = error; });
+      input.props.onCommandError(new Error('Native view is unavailable'));
+      await pending;
+    });
+    expect(failure).toEqual(new Error('Native view is unavailable'));
+    expect(eventCallbacks.onInput).not.toHaveBeenCalled();
+    expect(target.client.native.submitPastes).not.toHaveBeenCalled();
+    expect(permit.dispatch).not.toHaveBeenCalled();
+  });
+
+  test('late Expo command errors cannot reject another pane\'s pending input', async () => {
+    const scroll = { offset_from_bottom: 0, max_offset_from_bottom: 0, viewport_rows: 24 };
+    const client = createClient({ 'term-1': scroll, 'term-2': scroll });
+    const first = createTarget('term-1', client, scroll);
+    const second = createTarget('term-2', client, scroll);
+    const { handle, activateTarget, eventCallbacks, webView } = await mountReadyHost(first, [first, second]);
+    const oldError = renderer.root.findByType('WhipTerminalInput' as never).props.onCommandError;
+    await activateTarget(second);
+    await sendRendererMessage(webView, { type: 'terminal-ready', key: second.key });
+    await sendRendererMessage(webView, {
+      type: 'resize', source: 'fit', key: second.key,
+      cols: 80, rows: 24, cellWidthPx: 8, cellHeightPx: 16,
+    });
+    mockNativeInput.hold = true;
+    await act(async () => {
+      expect(handle.current!.input('\t')).toBe(true);
+      oldError(new Error('Old native view was removed'));
+      expect(eventCallbacks.onError).not.toHaveBeenCalled();
+      mockNativeInput.pending.shift()!();
+    });
+    expect(eventCallbacks.onInput).toHaveBeenCalledWith(second, '\t');
+  });
+
+  test('stale native events cannot reach another pane or a hidden composer', async () => {
+    const scroll = { offset_from_bottom: 0, max_offset_from_bottom: 0, viewport_rows: 24 };
+    const client = createClient({ 'term-1': scroll, 'term-2': scroll });
+    const first = createTarget('term-1', client, scroll);
+    const second = createTarget('term-2', client, scroll);
+    const { handle, activateTarget, setPresentation, eventCallbacks } = await mountReadyHost(first, [first, second]);
+    act(() => handle.current!.setKeyboardEnabled(true));
+    const binding = renderer.root.findByType('WhipTerminalInput' as never).props.binding;
+    await activateTarget(second);
+    const input = renderer.root.findByType('WhipTerminalInput' as never);
+    await act(async () => { input.props.onTerminalInput({ nativeEvent: { binding, data: 'stale' } }); });
+    expect(eventCallbacks.onInput).not.toHaveBeenCalled();
+    await setPresentation(false);
+    await act(async () => {
+      input.props.onTerminalInput({ nativeEvent: { binding: input.props.binding, data: 'hidden' } });
+    });
+    expect(eventCallbacks.onInput).not.toHaveBeenCalled();
+  });
+
+  test('SSH paste reserves its queue position while xterm encodes bracketed paste', async () => {
+    const scroll = { offset_from_bottom: 0, max_offset_from_bottom: 0, viewport_rows: 24 };
+    const base = createTarget('term-1', createClient({ 'term-1': scroll }), scroll);
+    const target = { ...base, session: { ...base.session, kind: 'ssh' as const } };
+    const { handle, injected, webView, eventCallbacks } = await mountReadyHost(target);
+    act(() => handle.current!.setKeyboardEnabled(true));
+    const input = renderer.root.findByType('WhipTerminalInput' as never);
+    await act(async () => {
+      handle.current!.paste('two\nlines');
+      input.props.onTerminalInput({ nativeEvent: { binding: input.props.binding, data: 'x' } });
+    });
+    expect(injected.some(script => script.includes('herdrEncodePastes'))).toBe(true);
+    expect(eventCallbacks.onInput).not.toHaveBeenCalled();
+    const paste = '\u001b[200~two\rlines\u001b[201~';
+    await sendRendererMessage(webView, { type: 'encoded-paste', key: target.key, requestId: 1, parts: [paste] });
+    expect(eventCallbacks.onInput.mock.calls.map(([, data]) => data)).toEqual([paste, 'x']);
+  });
+
+  test('composer permits dispatch xterm-encoded pastes inside the native keyboard input reservation', async () => {
+    const scroll = { offset_from_bottom: 0, max_offset_from_bottom: 0, viewport_rows: 24 };
+    const base = createTarget('term-1', createClient({ 'term-1': scroll }), scroll);
+    const target = { ...base, session: { ...base.session, kind: 'ssh' as const } };
+    const { handle, webView, eventCallbacks } = await mountReadyHost(target);
+    const order: string[] = [];
+    let release!: () => void;
+    const permit = {
+      checkActive: jest.fn(),
+      dispatch: jest.fn(async () => { order.push('submission'); await new Promise<void>(resolve => { release = resolve; }); }),
+    } as unknown as TerminalSubmissionPermitLike;
+    let pending!: Promise<void>;
+    act(() => handle.current!.setKeyboardEnabled(true));
+    await act(async () => {
+      pending = handle.current!.submitPastes(target, ['two\nlines', '/file.png'], true, permit);
+      renderer.root.findByType('WhipTerminalInput' as never).props.onTerminalInput({
+        nativeEvent: { binding: renderer.root.findByType('WhipTerminalInput' as never).props.binding, data: 'x' },
+      });
+    });
+    expect(permit.dispatch).not.toHaveBeenCalled();
+    const parts = ['\u001b[200~two\rlines\u001b[201~', '\u001b[200~/file.png\u001b[201~'];
+    await sendRendererMessage(webView, { type: 'encoded-paste', key: target.key, requestId: 1, parts });
+    expect(permit.dispatch).toHaveBeenCalledWith(parts);
+    expect(eventCallbacks.onInput).not.toHaveBeenCalled();
+    await act(async () => { release(); await pending; });
+    expect(order).toEqual(['submission']);
+    expect(eventCallbacks.onInput).toHaveBeenCalledWith(target, 'x');
+    expect(target.client.native.submitPastes).not.toHaveBeenCalled();
+  });
+
+  test('xterm cursor mode and transport keyboard protocol are forwarded to native hardware input', async () => {
+    const scroll = { offset_from_bottom: 0, max_offset_from_bottom: 0, viewport_rows: 24 };
+    const client = createClient({ 'term-1': scroll });
+    const target = createTarget('term-1', client, scroll);
+    const { webView } = await mountReadyHost(target);
+    await sendRendererMessage(webView, { type: 'keyboard-modes', key: target.key, applicationCursorKeys: true });
+    expect(mockNativeInput.cursorKeys).toHaveBeenLastCalledWith(true);
+    act(() => client.emitControl({ type: 'protocol-state', state: { kittyKeyboardReportAll: true } }));
+    expect(mockNativeInput.kittyKeyboard).toHaveBeenLastCalledWith(true);
+  });
+
+  test('iOS owns native keyboard focus while xterm still renders', async () => {
+    const platform = jest.requireMock('react-native').Platform;
+    platform.OS = 'ios';
+    try {
+      const scroll = { offset_from_bottom: 0, max_offset_from_bottom: 0, viewport_rows: 24 };
+      const target = createTarget('term-1', createClient({ 'term-1': scroll }), scroll);
+      const { handle, requestFocus, injected } = await mountReadyHost(target);
+      act(() => handle.current!.setKeyboardEnabled(true));
+      expect(mockNativeInput.focus).not.toHaveBeenCalled();
+      act(() => handle.current!.focus());
+      expect(mockNativeInput.focus).toHaveBeenCalled();
+      expect(requestFocus).not.toHaveBeenCalled();
+      expect(injected.some(script => script.includes('herdrFocus'))).toBe(true);
+      expect(renderer.root.findAllByType('WhipTerminalInput' as never)).toHaveLength(1);
+    } finally { platform.OS = 'android'; }
+  });
+
+  test.each(['android', 'ios'])('%s restores keyboard access without native focus after entering a tab', async os => {
+    const platform = jest.requireMock('react-native').Platform;
+    platform.OS = os;
+    try {
+      const scroll = { offset_from_bottom: 0, max_offset_from_bottom: 0, viewport_rows: 24 };
+      const client = createClient({ 'term-1': scroll, 'term-2': scroll });
+      const first = createTarget('term-1', client, scroll);
+      const second = createTarget('term-2', client, scroll);
+      const { handle, activateTarget, setPresentation, webView } = await mountReadyHost(first, [first, second]);
+      act(() => handle.current!.setKeyboardEnabled(true));
+      expect(mockNativeInput.setEnabled).toHaveBeenLastCalledWith(false);
+      act(() => handle.current!.focus());
+      expect(mockNativeInput.setEnabled).toHaveBeenLastCalledWith(true);
+      mockNativeInput.focus.mockClear();
+
+      await setPresentation(true, false);
+      await setPresentation(true, true);
+      await activateTarget(second);
+      await activateTarget(first);
+      expect(mockNativeInput.focus).not.toHaveBeenCalled();
+      expect(mockNativeInput.setEnabled).toHaveBeenLastCalledWith(false);
+
+      act(() => { webView.props.onTouchStart(); });
+      expect(mockNativeInput.focus).toHaveBeenCalledTimes(1);
+      expect(mockNativeInput.setEnabled).toHaveBeenLastCalledWith(true);
+    } finally { platform.OS = 'android'; }
   });
 
   test('metadata updates do not reactivate the selected terminal; tab changes do', async () => {
@@ -1161,6 +1493,7 @@ describe('TerminalRendererHost lifecycle', () => {
       await emitAppState('active');
       expect(client.openTerminal).toHaveBeenLastCalledWith(
         'term-1', expect.any(Function), expect.any(Function), expect.any(Function), size,
+        expect.objectContaining({ key: target.key, identity: expect.any(String) }),
       );
       await sendRendererMessage(webView, { type: 'fit-complete', key: target.key });
     }

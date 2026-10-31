@@ -1,11 +1,13 @@
+import { KeyboardAwareScrollView as ScrollView } from 'react-native-keyboard-controller';
 import { useState } from 'react';
-import { ScrollView } from 'react-native';
+
 import { useTranslation } from 'react-i18next';
 
 import { AboutSection } from './AboutScreen';
 import { UsageSection } from './UsageSection';
 import { AppLogsSection } from './AppLogsScreen';
 import { FeedbackSection } from './FeedbackSection';
+import { TipJarSection } from './TipJarSection';
 import {
   SettingsDetailsProvider,
   SettingsSection,
@@ -13,12 +15,9 @@ import {
 } from './SettingsScreen';
 import { GlassSurface } from './GlassSurface';
 import { Text } from './ui/text';
-import { hasCapability } from '../billing/capabilities';
-import type { WhipTier } from '../billing/tiers';
 import type { WhipEntitlementsController } from '../billing/useWhipEntitlements';
 import { MembershipSection } from './MembershipSection';
 import { RancherPurchaseSheet } from './RancherPurchaseSheet';
-import { ShizukuSection } from './ShizukuSection';
 
 type Props = Omit<
   SettingsSectionProps,
@@ -29,7 +28,6 @@ type Props = Omit<
   | 'glassUnlocked'
   | 'onOpenRancher'
 > & {
-  accessTier: WhipTier;
   entitlements: WhipEntitlementsController;
   membershipEnabled: boolean;
   onOpenLicenses: () => void;
@@ -58,6 +56,9 @@ export function MoreScreen(props: Props) {
           />
         ) : null}
         <AboutSection onOpenLicenses={props.onOpenLicenses} />
+        {props.developerOptionsEnabled ? (
+          <TipJarSection />
+        ) : null}
         <UsageSection />
         {props.developerOptionsEnabled ? <FeedbackSection /> : null}
         <SettingsSection
@@ -71,22 +72,16 @@ export function MoreScreen(props: Props) {
           globalKeyCount={props.globalKeyCount}
           knownHostCount={props.knownHostCount}
           appearance={props.appearance}
+          appFontSizePercent={props.appFontSizePercent}
           fullscreenApp={props.fullscreenApp}
-          fullscreenAppUnlocked={hasCapability(props.accessTier, 'fullscreen-app')}
-          fullscreenTerminalUnlocked={hasCapability(props.accessTier, 'fullscreen-terminal')}
-          smoothSpinners={props.smoothSpinners}
+          fullscreenAppUnlocked={props.entitlements.hasCapability('fullscreen-app')}
+          fullscreenTerminalUnlocked={props.entitlements.hasCapability('fullscreen-terminal')}
           appBackgroundImageUri={props.appBackgroundImageUri}
           appBackgroundDimming={props.appBackgroundDimming}
           appGlassEnabled={props.appGlassEnabled}
-          customAppBackgroundUnlocked={hasCapability(
-            props.accessTier,
-            'custom-app-background',
-          )}
-          customTerminalBackgroundUnlocked={hasCapability(
-            props.accessTier,
-            'custom-terminal-background',
-          )}
-          glassUnlocked={hasCapability(props.accessTier, 'glass')}
+          customAppBackgroundUnlocked={props.entitlements.hasCapability('custom-app-background')}
+          customTerminalBackgroundUnlocked={props.entitlements.hasCapability('custom-terminal-background')}
+          glassUnlocked={props.entitlements.hasCapability('glass')}
           onOpenRancher={openRancher}
           developerOptionsEnabled={props.developerOptionsEnabled}
           language={props.language}
@@ -110,8 +105,8 @@ export function MoreScreen(props: Props) {
           onManageGlobalKeychain={props.onManageGlobalKeychain}
           onManageKnownHosts={props.onManageKnownHosts}
           onAppearanceChange={props.onAppearanceChange}
+          onAppFontSizePercentChange={props.onAppFontSizePercentChange}
           onFullscreenAppChange={props.onFullscreenAppChange}
-          onSmoothSpinnersChange={props.onSmoothSpinnersChange}
           onAppBackgroundImageChange={props.onAppBackgroundImageChange}
           onAppBackgroundDimmingChange={props.onAppBackgroundDimmingChange}
           onAppGlassEnabledChange={props.onAppGlassEnabledChange}
@@ -130,7 +125,6 @@ export function MoreScreen(props: Props) {
           onTerminalPreferencesChange={props.onTerminalPreferencesChange}
         />
         {props.developerOptionsEnabled ? <AppLogsSection /> : null}
-        <ShizukuSection />
       </ScrollView>
       <RancherPurchaseSheet
         entitlements={props.entitlements}

@@ -6,6 +6,7 @@ import type { AppNavigationController } from '../hooks/useAppNavigation';
 import type { RemoteFilesController } from '../hooks/useRemoteFilesController';
 import type { SessionRuntimeController } from '../hooks/useSessionRuntimeManager';
 import type { useApplicationSecurity } from '../hooks/useApplicationSecurity';
+import { isLiveHostSshConnected } from '../lib/liveHostLatency';
 import {
   ignoreExpectedCancellation,
   reportBackgroundFailure,
@@ -16,6 +17,7 @@ import { ConnectionScreen } from './ConnectionScreen';
 import { DeleteHostConfirmationPopup } from './DeleteHostConfirmationPopup';
 import { FullScreenOverlay } from './FullScreenOverlay';
 import { GlobalKeychainScreen } from './GlobalKeychainScreen';
+import { GlassBlurTarget } from './GlassSurface';
 import { KnownHostsScreen } from './KnownHostsScreen';
 import { LicensesScreen } from './LicensesScreen';
 import { NewHostScreen } from './NewHostScreen';
@@ -64,53 +66,67 @@ export function AppOverlays({
             dimming={appBackgroundDimming}
           />
           <NewHostScreen
+            hosts={hosts.hosts}
             onCancel={hosts.closeNewHost}
             onManual={hosts.openManualHost}
             onLoadGlobalKeys={hosts.unlockGlobalKeychain}
             onPaired={hosts.savePairedHost}
+            onAuthenticatePrivateKey={biometricForKeys ? security.verifyBiometric : undefined}
+            onConfirmUnknownHost={hosts.confirmUnknownHost}
+            onTrustHost={hosts.trustChallenge}
           />
         </View>
       )}
 
       {hosts.editorProfile && (
         <View className="absolute inset-0 z-40 bg-background">
-          <AppBackground
-            uri={appBackgroundImageUri}
-            dimming={appBackgroundDimming}
-          />
-          <ConnectionScreen
-            key={hosts.editorProfile.id}
-            initialProfile={hosts.editorProfile}
-            hosts={hosts.hosts}
-            connecting={sessions.connectingHostIds.has(hosts.editorProfile.id)}
-            error={hosts.error}
-            onCancel={hosts.closeEditor}
-            onSave={hosts.saveHost}
-            onConnect={sessions.connect}
-            onDelete={
-              hosts.hosts.some(host => host.id === hosts.editorProfile?.id)
-                ? () => hosts.confirmDelete(hosts.editorProfile!)
-                : undefined
-            }
-            onAuthenticatePrivateKey={
-              biometricForKeys ? security.verifyBiometric : undefined
-            }
-            onLoadGlobalKeys={hosts.unlockGlobalKeychain}
-          />
+          <GlassBlurTarget background={
+            <AppBackground uri={appBackgroundImageUri} dimming={appBackgroundDimming} />
+          }>
+            <ConnectionScreen
+              key={hosts.editorProfile.id}
+              initialProfile={hosts.editorProfile}
+              hosts={hosts.hosts}
+              connecting={sessions.connectingHostIds.has(hosts.editorProfile.id)}
+              connected={sessions.presentationSessions.some(session => session.hostId === hosts.editorProfile?.id && isLiveHostSshConnected(session.connectionStatus))}
+              error={hosts.error}
+              onCancel={hosts.closeEditor}
+              onSave={async profile => {
+                const liveSession = sessions.presentationSessions.find(session => session.hostId === profile.id);
+                if (liveSession && (liveSession.host.herdrEnabled !== false) !== (profile.herdrEnabled !== false)) {
+                  await sessions.connect(profile);
+                } else {
+                  await hosts.saveHost(profile);
+                }
+              }}
+              onConnect={sessions.connect}
+              onDelete={
+                hosts.hosts.some(host => host.id === hosts.editorProfile?.id)
+                  ? () => hosts.confirmDelete(hosts.editorProfile!)
+                  : undefined
+              }
+              onAuthenticatePrivateKey={
+                biometricForKeys ? security.verifyBiometric : undefined
+              }
+              onLoadGlobalKeys={hosts.unlockGlobalKeychain}
+              onConfirmUnknownHost={hosts.confirmUnknownHost}
+              onTrustHost={hosts.trustChallenge}
+            />
+          </GlassBlurTarget>
         </View>
       )}
 
       {hosts.unlockedGlobalKeys !== null && (
         <View className="absolute inset-0 z-50 bg-background">
-          <AppBackground
-            uri={appBackgroundImageUri}
-            dimming={appBackgroundDimming}
-          />
-          <GlobalKeychainScreen
-            initialKeys={hosts.unlockedGlobalKeys}
-            onChanged={hosts.updateGlobalKeys}
-            onClose={hosts.closeGlobalKeychain}
-          />
+          <GlassBlurTarget background={
+            <AppBackground uri={appBackgroundImageUri} dimming={appBackgroundDimming} />
+          }>
+            <GlobalKeychainScreen
+              initialKeys={hosts.unlockedGlobalKeys}
+              onChanged={hosts.updateGlobalKeys}
+              onClose={hosts.closeGlobalKeychain}
+            />
+          </GlassBlurTarget>
         </View>
       )}
 
@@ -164,6 +180,9 @@ export function AppOverlays({
           visible
           onPathChange={path =>
             remoteFiles.rememberPath(remoteFiles.request!.id, path)
+          }
+          onFileChange={path =>
+            remoteFiles.rememberFile(remoteFiles.request!.id, path)
           }
           onClose={() => remoteFiles.close(remoteFiles.request?.id)}
         />

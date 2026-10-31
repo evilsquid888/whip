@@ -5,11 +5,13 @@ import {
   useEffect,
   useEffectEvent,
   useImperativeHandle,
+  useMemo,
   useRef,
 } from 'react';
 import {
   AppState,
   Platform,
+  View,
   type StyleProp,
   type ViewStyle,
 } from 'react-native';
@@ -17,7 +19,7 @@ import Clipboard from '@react-native-clipboard/clipboard';
 import WebView from 'react-native-webview';
 import type { WebViewMessageEvent } from 'react-native-webview/lib/WebViewTypes';
 
-import type { TerminalFrame, TerminalProtocolState } from '../lib/terminalBridge';
+import type { TerminalOutput, TerminalProtocolState } from '../lib/terminalBridge';
 import { TerminalFrameSequence } from '../lib/terminalFrameSequence';
 import {
   TerminalArbitration,
@@ -27,6 +29,7 @@ import {
 import { arrayBufferToBase64 } from '../lib/base64';
 import {
   isOfflineTerminalNavigationInput,
+  nativeTerminalInputWrites,
   TerminalRendererContentState,
   terminalScrollbackMode,
   type TerminalRenderTarget,
@@ -39,6 +42,7 @@ import {
   type TerminalResumeViewport,
 } from '../lib/terminalScroll';
 import { terminalSubmissionWrites } from '../lib/terminalSubmission';
+import type { TerminalSubmissionPermitLike } from 'react-native-whip-ssh/src/terminalSubmissions';
 import { isUnknownRecord, stringArray } from '../lib/unknown';
 import {
   terminalRendererEvictionKeys,
@@ -65,6 +69,7 @@ import {
   terminalInboundBase64Started,
   terminalInboundFrameVisible,
   terminalInboundRendererReceived,
+  terminalInboundDecodeComplete,
   terminalInboundScriptBuildEnded,
   terminalInboundScriptBuildStarted,
   terminalInboundWebViewInjectionEnded,
@@ -87,11 +92,30 @@ import {
 import { IOS_TERMINAL_ASSETS } from '../services/terminalAssets';
 import type { TerminalSessionStatus } from '../terminalSessions';
 import type { PaneScrollInfo } from '../types';
+import {
+  NativeTerminalInput,
+  type NativeTerminalInputHandle,
+  type NativeTerminalInputEvent,
+} from './NativeTerminalInput';
 
 const FRAME_CHUNK_SIZE = 16_384;
+// Benchmark builds can exercise the existing transport with identical app/native code.
+const TERMINAL_BATCH_DELIVERY_ENABLED = process.env.EXPO_PUBLIC_WHIP_TERMINAL_BRIDGE_LEGACY !== '1';
+const TERMINAL_NATIVE_DELIVERY_ENABLED = process.env.EXPO_PUBLIC_WHIP_TERMINAL_BRIDGE_JS !== '1';
+// Keep the counter across Fast Refresh so old callbacks cannot reuse an identity.
+const rendererIdentityState = globalThis as typeof globalThis & { __whipTerminalRendererId?: number };
+function createRendererIdentity(): string {
+  const identity = (rendererIdentityState.__whipTerminalRendererId ?? 0) + 1;
+  rendererIdentityState.__whipTerminalRendererId = identity;
+  return `${Date.now().toString(36)}:${identity}`;
+}
 const TRANSCRIPT_CHUNK_SIZE = 16_384;
+const usesNativeTerminalInput = Platform.OS === 'android' || Platform.OS === 'ios';
+
 const DICTATION_CONTEXT_TIMEOUT_MS = 1_000;
+const PASTE_ENCODING_TIMEOUT_MS = 5_000;
 const WEBVIEW_CONTAINER_STYLE = { backgroundColor: 'transparent' } as const;
+const TERMINAL_WEBVIEW_STYLE = { flex: 1, ...WEBVIEW_CONTAINER_STYLE } as const;
 const IOS_TERMINAL_ASSET_DIRECTORY = IOS_TERMINAL_ASSETS?.directoryURL || '';
 const runtimeProcess: unknown = process;
 const TERMINAL_RENDER_DROP_ENABLED = __DEV__
@@ -130,9 +154,9 @@ function isInteger(value: unknown): value is number {
   return typeof value === 'number' && Number.isInteger(value);
 }
 
-function terminalFrameByteLength(frame: TerminalFrame): number {
+function terminalFrameByteLength(frame: TerminalOutput): number {
   if (typeof frame.bytes !== 'string') return frame.bytes.byteLength;
-  if (frame.encoding !== 'ansi') return frame.bytes.length;
+  if (frame.type === 'terminal.frame' && frame.encoding !== 'ansi') return frame.bytes.length;
   const padding = frame.bytes.endsWith('==') ? 2 : frame.bytes.endsWith('=') ? 1 : 0;
   return Math.floor(frame.bytes.length * 3 / 4) - padding;
 }
@@ -143,6 +167,8 @@ interface WebViewHandle {
 }
 
 interface RendererEntry {
+  identity: string;
+  deliveryGeneration?: string;
   target: TerminalRenderTarget;
   rendererReady: boolean;
   sizeReady: boolean;
@@ -151,7 +177,7 @@ interface RendererEntry {
   controllerAttachment: Promise<TerminalAttachmentId> | null;
   connecting: boolean;
   pendingFrames: Array<{
-    frame: TerminalFrame;
+    frame: TerminalOutput;
     inputTraceCookie: number | null;
     resizeTraceCookie: number | null;
   }>;
@@ -164,6 +190,7 @@ interface RendererEntry {
   protocolState: TerminalProtocolState;
   applicationMouseCapture: boolean;
   alternateScreen: boolean;
+  applicationCursorKeys: boolean;
   arbitration: TerminalArbitration;
   writableWaiters: Array<{
     resolve: () => void;
@@ -194,12 +221,13 @@ export interface TerminalRendererHandle {
   scroll: (direction: 'up' | 'down', lines: number) => void;
   scrollToVisualBottom: () => void;
   search: (query: string, caseSensitive: boolean, regex: boolean, direction: number, selected?: number) => void;
-  setForcedMouseInput: (enabled: boolean) => void;
   setKeyboardEnabled: (enabled: boolean) => void;
+  setInputModifiers: (active: boolean) => void;
   submitPastes: (
     target: TerminalRenderTarget,
     parts: readonly string[],
     newUserInput?: boolean,
+    permit?: TerminalSubmissionPermitLike,
   ) => Promise<void>;
 }
 
@@ -282,7 +310,18 @@ export const TerminalRendererHost = forwardRef<TerminalRendererHandle, Props>(fu
   onError,
 }, forwardedRef) {
   const webView = useRef<WebViewHandle | null>(null);
+  const nativeInput = useRef<NativeTerminalInputHandle | null>(null);
+  const nativeBinding = useMemo(createRendererIdentity, [activeTarget?.key, activeTarget?.client, activeTarget?.session.status]);
+  const nativeBindingRef = useRef(nativeBinding);
+  const nativeCommands = useRef(new Map<number, {
+    binding: string;
+    run: () => void;
+    reject: (reason: Error) => void;
+  }>());
+  const nativeCommandSequence = useRef(0);
   const keyboardEnabled = useRef(false);
+  const inputFocused = useRef(false);
+  const inputPresentation = useRef({ key: activeTarget?.key, visible, renderingEnabled });
   const hostReady = useRef(false);
   const entries = useRef(new Map<string, RendererEntry>());
   const resumeScrolls = useRef(new Map<string, TerminalResumeScrollState>());
@@ -296,7 +335,15 @@ export const TerminalRendererHost = forwardRef<TerminalRendererHandle, Props>(fu
   const serializationTraces = useRef(new Map<string, AppPerformanceTrace>());
   const contextRequests = useRef(new Map<number, { key: string; complete: (text: string) => void }>());
   const contextSequence = useRef(0);
+  const pasteRequests = useRef(new Map<number, {
+    entry: RendererEntry;
+    identity: string;
+    complete: (parts: string[] | null) => void;
+  }>());
+  const pasteSequence = useRef(0);
+  const nativeFrameTraces = useRef(new Map<string, { input: number | null; resize: number | null }>());
   activeKey.current = activeTarget?.key || null;
+  nativeBindingRef.current = nativeBinding;
   offlineTranscriptRef.current = offlineTranscript;
   offlineScrollRef.current = offlineScroll;
   visualViewportRef.current = visualViewport;
@@ -365,6 +412,9 @@ export const TerminalRendererHost = forwardRef<TerminalRendererHandle, Props>(fu
     entry: RendererEntry,
     closeBridge: boolean,
   ) => {
+    for (const request of pasteRequests.current.values()) {
+      if (request.entry === entry) request.complete(null);
+    }
     resumeScrolls.current.delete(key);
     abandonTerminalRendererReadinessTrace(entry.readinessTrace);
     entry.readinessTrace = null;
@@ -572,25 +622,27 @@ export const TerminalRendererHost = forwardRef<TerminalRendererHandle, Props>(fu
 
   const injectFrame = useCallback((
     entry: RendererEntry,
-    frame: TerminalFrame,
+    frame: TerminalOutput,
     inputTraceCookie: number | null = terminalFrameReceived(entry.target.key),
     resizeTraceCookie: number | null = terminalResizeFrameReceived(entry.target.key),
   ) => {
-    const inboundTraceCookie = frame.inboundTraceCookie ?? null;
+    if (entries.current.get(entry.target.key) !== entry) return;
+    const textFrame = frame.type === 'terminal.frame' ? frame : null;
+    const inboundTraceCookie = textFrame?.inboundTraceCookie ?? null;
     terminalInboundRendererReceived(inboundTraceCookie, terminalFrameByteLength(frame));
     if (!hostReady.current || !entry.rendererReady) {
       entry.pendingFrames.push({ frame, inputTraceCookie, resizeTraceCookie });
       return;
     }
-    if (entry.target.session.kind !== 'ssh' && frame.encoding === 'ansi') {
-      const sequence = entry.frameSequence.observe(frame);
+    if (entry.target.session.kind !== 'ssh' && textFrame?.encoding === 'ansi') {
+      const sequence = entry.frameSequence.observe(textFrame);
       if (sequence.requestFull) requestFullFrame(entry);
       if (!sequence.render) {
         abandonTerminalInboundTrace(inboundTraceCookie);
         return;
       }
       if (sequence.reset) entry.resetOnNextFrame = true;
-      if (frame.full) entry.repaintRequested = false;
+      if (textFrame.full) entry.repaintRequested = false;
     }
     const key = JSON.stringify(entry.target.key);
     const serializedInputTraceCookie = inputTraceCookie === null
@@ -614,16 +666,12 @@ export const TerminalRendererHost = forwardRef<TerminalRendererHandle, Props>(fu
         terminalInboundWebViewInjectionEnded(inboundTraceCookie);
       }
     };
-    if (frame.encoding === 'utf8') {
-      if (typeof frame.bytes !== 'string') {
-        abandonTerminalInboundTrace(inboundTraceCookie);
-        return;
-      }
+    if (textFrame?.encoding === 'utf8' && typeof frame.bytes === 'string') {
       injectTracedFrame(`${resetScript}window.herdrWrite(${key}, ${JSON.stringify(frame.bytes)}, ${serializedInputTraceCookie}, ${serializedResizeTraceCookie}, ${serializedInboundTraceCookie});`);
       return;
     }
-    if (typeof frame.bytes === 'string' && typeof frame.final === 'boolean') {
-      injectTracedFrame(`${resetScript}window.herdrWriteBase64Chunk(${key}, ${frame.seq}, ${JSON.stringify(frame.bytes)}, ${frame.final}, ${serializedInputTraceCookie}, ${serializedResizeTraceCookie}, ${serializedInboundTraceCookie});`);
+    if (textFrame && typeof frame.bytes === 'string' && typeof textFrame.final === 'boolean') {
+      injectTracedFrame(`${resetScript}window.herdrWriteBase64Chunk(${key}, ${textFrame.seq}, ${JSON.stringify(frame.bytes)}, ${textFrame.final}, ${serializedInputTraceCookie}, ${serializedResizeTraceCookie}, ${serializedInboundTraceCookie});`);
       return;
     }
     terminalInboundBase64Started(inboundTraceCookie);
@@ -633,8 +681,11 @@ export const TerminalRendererHost = forwardRef<TerminalRendererHandle, Props>(fu
     terminalInboundBase64Ended(inboundTraceCookie);
     terminalInboundScriptBuildStarted(inboundTraceCookie);
     const writes: string[] = [];
+    // Graphics messages have no server sequence. Zero keeps their chunks apart
+    // from any pending, positive-sequence terminal repaint.
+    const sequence = textFrame?.seq ?? 0;
     if (encoded.length === 0) {
-      writes.push(`window.herdrWriteBase64Chunk(${key}, ${frame.seq}, "", true, ${serializedInputTraceCookie}, ${serializedResizeTraceCookie}, ${serializedInboundTraceCookie});`);
+      writes.push(`window.herdrWriteBase64Chunk(${key}, ${sequence}, "", true, ${serializedInputTraceCookie}, ${serializedResizeTraceCookie}, ${serializedInboundTraceCookie});`);
     } else {
       for (let offset = 0; offset < encoded.length; offset += FRAME_CHUNK_SIZE) {
         const chunk = encoded.slice(offset, offset + FRAME_CHUNK_SIZE);
@@ -642,7 +693,7 @@ export const TerminalRendererHost = forwardRef<TerminalRendererHandle, Props>(fu
         const finalTraceCookie = final
           ? `, ${serializedInputTraceCookie}, ${serializedResizeTraceCookie}, ${serializedInboundTraceCookie}`
           : '';
-        writes.push(`window.herdrWriteBase64Chunk(${key}, ${frame.seq}, ${JSON.stringify(chunk)}, ${final}${finalTraceCookie});`);
+        writes.push(`window.herdrWriteBase64Chunk(${key}, ${sequence}, ${JSON.stringify(chunk)}, ${final}${finalTraceCookie});`);
       }
     }
     // A frame can require multiple chunks, but it crosses into the WebView once.
@@ -711,8 +762,12 @@ export const TerminalRendererHost = forwardRef<TerminalRendererHandle, Props>(fu
       frame => injectFrame(entry, frame),
       reason => scheduleReconnect(reason || 'Remote terminal closed', true),
       event => {
+        if (entries.current.get(entry.target.key) !== entry) return;
         if (event.type === 'protocol-state') {
           entry.protocolState = event.state;
+          if (entry.target.key === activeKey.current) {
+            nativeInput.current?.kittyKeyboard(event.state.kittyKeyboardReportAll);
+          }
           reportProtocolState(entry.target, event.state);
         } else if (event.type === 'mouse-capture') {
           entry.applicationMouseCapture = event.enabled;
@@ -728,6 +783,37 @@ export const TerminalRendererHost = forwardRef<TerminalRendererHandle, Props>(fu
         }
       },
       entry.arbitration.latestDimensions() ?? undefined,
+      TERMINAL_BATCH_DELIVERY_ENABLED ? {
+        key: entry.target.key,
+        identity: entry.identity,
+        native: TERMINAL_NATIVE_DELIVERY_ENABLED,
+        onAttached: generation => {
+          if (entries.current.get(entry.target.key) !== entry) return;
+          entry.deliveryGeneration = generation;
+          if (!TERMINAL_NATIVE_DELIVERY_ENABLED) return;
+          const reset = entry.resetOnNextFrame;
+          entry.resetOnNextFrame = false;
+          inject(`window.herdrBindNative(${JSON.stringify(entry.target.key)}, ${JSON.stringify(entry.identity)}, ${JSON.stringify(generation)}, ${reset});`);
+        },
+        canDeliver: () => entries.current.get(entry.target.key) === entry
+          && hostReady.current && entry.rendererReady,
+        onBatch: (batch, generation, inboundCookie) => {
+          if (entries.current.get(entry.target.key) !== entry) return;
+          terminalInboundDecodeComplete(inboundCookie);
+          terminalInboundRendererReceived(inboundCookie, batch.payloadBytes);
+          const inputCookie = terminalFrameReceived(entry.target.key);
+          const resizeCookie = terminalResizeFrameReceived(entry.target.key);
+          const reset = entry.resetOnNextFrame;
+          entry.resetOnNextFrame = false;
+          entry.contentState.receivedLiveFrame();
+          entry.deliveryGeneration = generation;
+          terminalInboundScriptBuildStarted(inboundCookie);
+          const script = `window.herdrDeliverBatch(${batch.json}, ${reset}, ${inputCookie}, ${resizeCookie}, ${inboundCookie});`;
+          terminalInboundScriptBuildEnded(inboundCookie);
+          terminalInboundWebViewInjectionStarted(inboundCookie);
+          try { inject(script); } finally { terminalInboundWebViewInjectionEnded(inboundCookie); }
+        },
+      } : undefined,
     );
     entry.controllerAttachment = attachment;
     attachment.then(() => {
@@ -770,6 +856,7 @@ export const TerminalRendererHost = forwardRef<TerminalRendererHandle, Props>(fu
     if (!entry) {
       const readinessTrace = beginTerminalRendererReadinessTrace();
       entry = {
+        identity: createRendererIdentity(),
         target,
         rendererReady: false,
         sizeReady: false,
@@ -789,13 +876,14 @@ export const TerminalRendererHost = forwardRef<TerminalRendererHandle, Props>(fu
         },
         applicationMouseCapture: false,
         alternateScreen: false,
+        applicationCursorKeys: false,
         arbitration: new TerminalArbitration(),
         writableWaiters: [],
         readinessTrace,
       };
       entries.current.set(target.key, entry);
       if (hostReady.current) {
-        inject(`window.herdrCreate(${JSON.stringify(target.key)});`);
+        inject(`window.herdrCreate(${JSON.stringify(target.key)}, ${JSON.stringify(entry.identity)});`);
         configureEntry(entry);
       }
     } else {
@@ -876,8 +964,91 @@ export const TerminalRendererHost = forwardRef<TerminalRendererHandle, Props>(fu
     return reportInput(target, data);
   }, []);
 
+  // Every external edit crosses a UI-thread barrier before entering the same
+  // arbitration queue as native IME events. This retires stale connections and
+  // preserves native-key / rail / paste ordering without a WebView round trip.
+  const afterNativeInput = useCallback((operation: () => void | Promise<void>): Promise<void> => {
+    if (!usesNativeTerminalInput) return Promise.resolve(operation());
+    if (!nativeInput.current) return Promise.reject(new Error('Terminal input view is unavailable'));
+    return new Promise<void>((resolve, reject) => {
+      const commandId = ++nativeCommandSequence.current;
+      nativeCommands.current.set(commandId, {
+        binding: nativeBinding,
+        run: () => {
+          try { Promise.resolve(operation()).then(resolve, reject); }
+          catch (reason) { reject(reason instanceof Error ? reason : new Error(String(reason))); }
+        },
+        reject,
+      });
+      nativeInput.current?.barrier(nativeBinding, commandId);
+    });
+  }, [nativeBinding]);
+
+  const encodeSshPastes = useCallback((entry: RendererEntry, parts: readonly string[]): Promise<string[]> => {
+    const requestId = ++pasteSequence.current;
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => complete(null), PASTE_ENCODING_TIMEOUT_MS);
+      const complete = (values: string[] | null) => {
+        clearTimeout(timeout);
+        pasteRequests.current.delete(requestId);
+        if (values) resolve(values);
+        else reject(new Error('Terminal paste encoding was interrupted'));
+      };
+      pasteRequests.current.set(requestId, { entry, identity: entry.identity, complete });
+      inject(`window.herdrEncodePastes(${JSON.stringify(entry.target.key)}, ${requestId}, ${JSON.stringify(parts)});`);
+    });
+  }, [inject]);
+
+  const pasteToSsh = useCallback((entry: RendererEntry, data: string) => afterNativeInput(() => {
+    if (!usesNativeTerminalInput) {
+      inject(`window.herdrPaste(${JSON.stringify(entry.target.key)}, ${JSON.stringify(data)});`);
+      return;
+    }
+    // Reserve the queue position before xterm encodes bracketed paste, so
+    // native typing cannot overtake the asynchronous WebView response.
+    return enqueueInput(entry, async () => {
+      for (const value of await encodeSshPastes(entry, [data])) await reportQueuedInput(entry, value);
+    });
+  }), [afterNativeInput, encodeSshPastes, enqueueInput, inject, reportQueuedInput]);
+
+  const focusInput = useCallback(() => {
+    if (usesNativeTerminalInput) {
+      if (keyboardEnabled.current && visible && renderingEnabled && appState.current === 'active') {
+        inputFocused.current = true;
+        nativeInput.current?.setEnabled(true);
+        nativeInput.current?.focus();
+        activeCall('herdrFocus');
+      }
+    } else {
+      webView.current?.requestFocus();
+      activeCall('herdrFocus');
+    }
+  }, [activeCall, renderingEnabled, visible]);
+
+  const handleNativeInput = ({ binding, data, commandId }: NativeTerminalInputEvent) => {
+    if (binding !== nativeBinding) return;
+    if (typeof commandId === 'number') {
+      const command = nativeCommands.current.get(commandId);
+      nativeCommands.current.delete(commandId);
+      if (command?.binding === binding) command.run();
+      return;
+    }
+    if (!visible || !renderingEnabled || !keyboardEnabled.current || appState.current !== 'active') return;
+    const entry = activeKey.current ? entries.current.get(activeKey.current) : null;
+    if (!entry || typeof data !== 'string' || !data) return;
+    enqueueInput(entry, async () => {
+      for (const write of nativeTerminalInputWrites(data)) await reportQueuedInput(entry, write);
+    }).catch(
+      reason => reportError(entry.target, String(reason)),
+    );
+  };
+
   useImperativeHandle(forwardedRef, () => ({
-    blur: () => activeCall('herdrBlur'),
+    blur: () => {
+      inputFocused.current = false;
+      nativeInput.current?.blur();
+      activeCall('herdrBlur');
+    },
     cancelPendingResumeScroll: () => {
       const key = activeKey.current;
       const entry = key ? entries.current.get(key) : null;
@@ -901,10 +1072,7 @@ export const TerminalRendererHost = forwardRef<TerminalRendererHandle, Props>(fu
       });
     },
     fit: () => activeCall('herdrFit'),
-    focus: () => {
-      webView.current?.requestFocus();
-      activeCall('herdrFocus');
-    },
+    focus: focusInput,
     input: data => {
       const key = activeKey.current;
       const entry = key ? entries.current.get(key) : null;
@@ -918,7 +1086,7 @@ export const TerminalRendererHost = forwardRef<TerminalRendererHandle, Props>(fu
         activeCall('herdrOfflineInput', [data]);
         return true;
       }
-      enqueueInput(entry, () => reportQueuedInput(entry, data)).catch(
+      afterNativeInput(() => enqueueInput(entry, () => reportQueuedInput(entry, data))).catch(
         reason => reportError(entry.target, String(reason)),
       );
       return true;
@@ -932,17 +1100,18 @@ export const TerminalRendererHost = forwardRef<TerminalRendererHandle, Props>(fu
         && entry.target.session.kind === 'ssh'
       ) return;
       if (entry.target.session.kind === 'ssh') {
-        activeCall('herdrPaste', [data]);
+        pasteToSsh(entry, data)
+          .catch(reason => reportError(entry.target, String(reason)));
         return;
       }
-      enqueueInput(entry, () => entry.target.client.native.requestHerdrApi({
+      afterNativeInput(() => enqueueInput(entry, () => entry.target.client.native.requestHerdrApi({
         method: 'pane.send_input',
         params: {
           pane_id: entry.target.session.paneId,
           text: prepareTerminalPaste(data),
           keys: [],
         },
-      }).then(() => undefined)).catch(
+      }).then(() => undefined))).catch(
         reason => reportError(entry.target, String(reason)),
       );
     },
@@ -996,16 +1165,14 @@ export const TerminalRendererHost = forwardRef<TerminalRendererHandle, Props>(fu
       'herdrSearch',
       [query, caseSensitive, regex, direction, selected],
     ),
-    setForcedMouseInput: enabled => activeCall(
-      'herdrSetForcedMouseInput',
-      [enabled],
-    ),
     setKeyboardEnabled: enabled => {
       keyboardEnabled.current = enabled;
-      if (enabled) webView.current?.requestFocus();
+      if (!enabled) inputFocused.current = false;
+      nativeInput.current?.setEnabled(enabled && visible && renderingEnabled && inputFocused.current);
       activeCall('herdrSetKeyboardEnabled', [enabled]);
     },
-    submitPastes: (target, parts, newUserInput = true) => {
+    setInputModifiers: active => nativeInput.current?.modifiedInput(active),
+    submitPastes: (target, parts, newUserInput = true, permit) => {
       const entry = ensureEntry(target);
       if (!entry) return Promise.reject(new Error('Terminal is not available'));
       if (
@@ -1014,25 +1181,61 @@ export const TerminalRendererHost = forwardRef<TerminalRendererHandle, Props>(fu
       ) {
         return Promise.reject(new Error('Terminal is offline and read-only'));
       }
+      if (permit) {
+        return afterNativeInput(() => enqueueInput(entry, async () => {
+          permit.checkActive();
+          const prepared = entry.target.session.kind === 'ssh'
+            ? await encodeSshPastes(entry, parts) : parts.map(prepareTerminalPaste);
+          permit.checkActive();
+          await permit.dispatch(prepared);
+        }, newUserInput));
+      }
       if (entry.target.session.kind === 'ssh') {
-        inject(`window.herdrSubmitPastes(${JSON.stringify(target.key)}, ${JSON.stringify(parts)});`);
-        return Promise.resolve();
+        if (usesNativeTerminalInput) return afterNativeInput(() => enqueueInput(entry, async () => {
+          const encoded = await encodeSshPastes(entry, parts);
+          for (const value of terminalSubmissionWrites(encoded)) {
+            await entry.target.client.terminal.writeToTerminal(entry.target.session.terminalId, value);
+          }
+        }, newUserInput));
+        return afterNativeInput(() => inject(`window.herdrSubmitPastes(${JSON.stringify(target.key)}, ${JSON.stringify(parts)});`));
       }
       const prepared = parts.map(prepareTerminalPaste);
       const inputTrace = beginTerminalInputTrace(entry.target.key, 'submit');
-      return enqueueInput(entry, () => withTerminalWriteTrace(
+      if (inputTrace && TERMINAL_NATIVE_DELIVERY_ENABLED) inject(`window.herdrTraceNextNative(${JSON.stringify(entry.target.key)});`);
+      return afterNativeInput(() => enqueueInput(entry, () => withTerminalWriteTrace(
         inputTrace,
         () => entry.target.client.native.submitPastes(
           entry.target.session.paneId,
           [...prepared],
         ),
-      ), newUserInput).catch(reason => {
+      ), newUserInput)).catch(reason => {
         endTerminalWriteTrace(inputTrace, false);
         reportError(entry.target, String(reason));
         throw reason;
       });
     },
-  }), [activeCall, cancelResumeScroll, connectEntry, enqueueInput, ensureEntry, inject, reportQueuedInput]);
+  }), [activeCall, afterNativeInput, cancelResumeScroll, connectEntry, encodeSshPastes, enqueueInput, ensureEntry, focusInput, inject, pasteToSsh, renderingEnabled, reportQueuedInput, visible]);
+
+  useEffect(() => {
+    const previous = inputPresentation.current;
+    if (previous.key !== activeTarget?.key || previous.visible !== visible || previous.renderingEnabled !== renderingEnabled)
+      inputFocused.current = false;
+    inputPresentation.current = { key: activeTarget?.key, visible, renderingEnabled };
+    nativeInput.current?.setEnabled(keyboardEnabled.current && visible && renderingEnabled && inputFocused.current);
+    nativeInput.current?.cursorKeys(activeKey.current
+      ? entries.current.get(activeKey.current)?.applicationCursorKeys === true : false);
+    nativeInput.current?.kittyKeyboard(activeKey.current
+      ? entries.current.get(activeKey.current)?.protocolState.kittyKeyboardReportAll === true : false);
+    const pending = nativeCommands.current;
+    return () => {
+      for (const [id, command] of pending) {
+        if (command.binding === nativeBinding) {
+          pending.delete(id);
+          command.reject(new Error('Terminal input target changed or closed'));
+        }
+      }
+    };
+  }, [activeTarget?.key, nativeBinding, renderingEnabled, visible]);
 
   useEffect(() => {
     const valid = new Map(targets.map(target => [target.key, target]));
@@ -1166,6 +1369,8 @@ export const TerminalRendererHost = forwardRef<TerminalRendererHandle, Props>(fu
       appState.current = state;
       syncPresentation();
       if (state !== 'active') {
+        nativeInput.current?.blur();
+        if (usesNativeTerminalInput) activeCall('herdrBlur');
         if (wasActive && hostReady.current) {
           for (const entry of entries.current.values()) {
             if (
@@ -1261,6 +1466,7 @@ export const TerminalRendererHost = forwardRef<TerminalRendererHandle, Props>(fu
     });
     return () => subscription.remove();
   }, [
+    activeCall,
     connectEntry,
     inject,
     preferences.pauseResizeInBackground,
@@ -1273,6 +1479,7 @@ export const TerminalRendererHost = forwardRef<TerminalRendererHandle, Props>(fu
   useEffect(() => () => {
     resumeScrolls.current.clear();
     for (const request of contextRequests.current.values()) request.complete('');
+    for (const request of pasteRequests.current.values()) request.complete(null);
     for (const entry of entries.current.values()) {
       reportResidencyEnd(entry.target, TerminalResidencyEndReason.Evicted);
       if (
@@ -1288,12 +1495,22 @@ export const TerminalRendererHost = forwardRef<TerminalRendererHandle, Props>(fu
       endAppPerformanceTrace(trace);
     }
     serializationTraces.current.clear();
+    nativeFrameTraces.current.clear();
     entries.current.clear();
   }, [inject, relinquishController]);
 
   const handleMessage = async (event: WebViewMessageEvent) => {
     const message = parseTerminalWebMessage(event.nativeEvent.data);
     if (!message) return;
+    if (message.type === 'encoded-paste' && isInteger(message.requestId)) {
+      const request = pasteRequests.current.get(message.requestId);
+      if (request && request.entry.target.key === message.key
+        && request.entry.identity === request.identity
+        && entries.current.get(request.entry.target.key) === request.entry) {
+        request.complete(stringArray(message.parts));
+      }
+      return;
+    }
     if (message.type === 'dictation-context' && typeof message.requestId === 'number') {
       const request = contextRequests.current.get(message.requestId);
       if (request && request.key === message.key) {
@@ -1303,9 +1520,16 @@ export const TerminalRendererHost = forwardRef<TerminalRendererHandle, Props>(fu
     }
     if (message.type === 'ready') {
       const reloaded = hostReady.current;
+      if (reloaded) {
+        nativeInput.current?.reset();
+        for (const request of pasteRequests.current.values()) request.complete(null);
+      }
       hostReady.current = true;
       for (const entry of entries.current.values()) {
         if (reloaded) {
+          const previousIdentity = entry.identity;
+          entry.identity = createRendererIdentity();
+          entry.deliveryGeneration = undefined;
           entry.rendererReady = false;
           entry.sizeReady = false;
           entry.pendingResize = null;
@@ -1313,8 +1537,11 @@ export const TerminalRendererHost = forwardRef<TerminalRendererHandle, Props>(fu
           entry.contentState = new TerminalRendererContentState();
           entry.frameSequence.reset();
           entry.repaintRequested = false;
+          entry.target.client.terminal.restartTerminalDelivery?.(
+            entry.target.session.terminalId, previousIdentity, entry.identity,
+          );
         }
-        inject(`window.herdrCreate(${JSON.stringify(entry.target.key)});`);
+        inject(`window.herdrCreate(${JSON.stringify(entry.target.key)}, ${JSON.stringify(entry.identity)});`);
         configureEntry(entry);
       }
       syncPresentation();
@@ -1344,13 +1571,16 @@ export const TerminalRendererHost = forwardRef<TerminalRendererHandle, Props>(fu
     }
     if (message.type === 'trace-write-received') {
       if (isInteger(message.inboundCookie)) {
-        terminalInboundWebViewReceived(message.inboundCookie);
+        terminalInboundWebViewReceived(message.inboundCookie, isFiniteNumber(message.sentAt) ? message.sentAt : undefined);
       }
       return;
     }
     if (message.type === 'trace-xterm-written') {
       if (isInteger(message.inboundCookie)) {
-        terminalInboundXtermWritten(message.inboundCookie);
+        terminalInboundXtermWritten(message.inboundCookie,
+          isFiniteNumber(message.sentAt) ? message.sentAt : undefined,
+          isFiniteNumber(message.localMs) ? message.localMs : undefined,
+          isFiniteNumber(message.base64Ms) ? message.base64Ms : undefined);
       }
       return;
     }
@@ -1361,12 +1591,62 @@ export const TerminalRendererHost = forwardRef<TerminalRendererHandle, Props>(fu
         terminalResizeFrameRendered(message.resizeCookie);
       }
       if (isInteger(message.inboundCookie)) {
-        terminalInboundFrameVisible(message.inboundCookie);
+        terminalInboundFrameVisible(message.inboundCookie,
+          isFiniteNumber(message.sentAt) ? message.sentAt : undefined,
+          isFiniteNumber(message.visibleMs) ? message.visibleMs : undefined);
       }
       return;
     }
     const entry = typeof message.key === 'string' ? entries.current.get(message.key) : null;
     if (!entry) return;
+    if (message.type === 'terminal-native-unavailable') {
+      if (typeof message.generation === 'string' && message.identity === entry.identity && message.generation === entry.deliveryGeneration) {
+        if (message.reset === true) entry.resetOnNextFrame = true;
+        entry.target.client.terminal.useJavascriptTerminalDelivery?.(entry.target.session.terminalId, entry.identity, message.generation);
+      }
+      return;
+    }
+    if (message.type === 'terminal-native-frame' || message.type === 'terminal-native-visible') {
+      if (typeof message.generation !== 'string' || message.identity !== entry.identity || message.generation !== entry.deliveryGeneration || typeof message.batchId !== 'string') return;
+      const key = `${entry.target.key}:${message.generation}:${message.batchId}`;
+      if (message.type === 'terminal-native-frame') {
+        const oldest = nativeFrameTraces.current.keys().next().value;
+        if (nativeFrameTraces.current.size >= 128 && oldest !== undefined) nativeFrameTraces.current.delete(oldest);
+        nativeFrameTraces.current.set(key, { input: terminalFrameReceived(entry.target.key), resize: terminalResizeFrameReceived(entry.target.key) });
+      } else {
+        const trace = nativeFrameTraces.current.get(key);
+        nativeFrameTraces.current.delete(key);
+        if (trace?.input !== null && trace?.input !== undefined) terminalFrameRendered(trace.input);
+        if (trace?.resize !== null && trace?.resize !== undefined) terminalResizeFrameRendered(trace.resize);
+      }
+      return;
+    }
+    if (message.type === 'terminal-native-baseline') {
+      if (message.identity === entry.identity && message.generation === entry.deliveryGeneration) {
+        if (message.fullFrame === true) entry.repaintRequested = false;
+        entry.contentState.receivedLiveFrame();
+      }
+      return;
+    }
+    if (message.type === 'terminal-batch-written') {
+      if (message.identity !== entry.identity || message.generation !== entry.deliveryGeneration
+          || typeof message.generation !== 'string' || typeof message.batchId !== 'string') return;
+      if (isInteger(message.inboundCookie)) {
+        terminalInboundXtermWritten(message.inboundCookie,
+          isFiniteNumber(message.sentAt) ? message.sentAt : undefined,
+          isFiniteNumber(message.localMs) ? message.localMs : undefined,
+          isFiniteNumber(message.base64Ms) ? message.base64Ms : undefined);
+      }
+      if (message.fullFrame === true) entry.repaintRequested = false;
+      entry.target.client.terminal.acknowledgeTerminalBatch(
+        entry.target.session.terminalId, entry.identity, message.generation, message.batchId,
+      );
+      return;
+    }
+    if (message.type === 'terminal-sequence-gap') {
+      if (message.identity === entry.identity && message.generation === entry.deliveryGeneration) requestFullFrame(entry);
+      return;
+    }
     if (message.type === 'fit-complete') {
       if (appState.current !== 'active' || !entry.arbitration.shouldSendResize()) return;
       const resume = resumeScrolls.current.get(entry.target.key);
@@ -1388,7 +1668,12 @@ export const TerminalRendererHost = forwardRef<TerminalRendererHandle, Props>(fu
       return;
     }
     if (message.type === 'terminal-ready') {
+      if (message.identity !== undefined && message.identity !== entry.identity) return;
       entry.rendererReady = true;
+      entry.target.client.terminal.flushTerminalDelivery?.(entry.target.session.terminalId, entry.identity);
+      if (entry.controllerAttached && entry.target.session.kind !== 'ssh' && !entry.contentState.hasLiveState) {
+        requestFullFrame(entry);
+      }
       terminalRendererBecameReady(entry.readinessTrace);
       const frames = entry.pendingFrames;
       entry.pendingFrames = [];
@@ -1418,9 +1703,15 @@ export const TerminalRendererHost = forwardRef<TerminalRendererHandle, Props>(fu
     if (message.type === 'input') {
       const data = message.data;
       if (typeof data !== 'string') return;
-      await enqueueInput(entry, () => reportQueuedInput(entry, data));
+      await afterNativeInput(() => enqueueInput(entry, () => reportQueuedInput(entry, data)));
+    } else if (message.type === 'keyboard-modes') {
+      entry.applicationCursorKeys = message.applicationCursorKeys === true;
+      if (entry.target.key === activeKey.current) {
+        nativeInput.current?.cursorKeys(entry.applicationCursorKeys);
+      }
     } else if (message.type === 'buffered-submit') {
       const inputTrace = beginTerminalInputTrace(entry.target.key, 'submit');
+      if (inputTrace && TERMINAL_NATIVE_DELIVERY_ENABLED) inject(`window.herdrTraceNextNative(${JSON.stringify(entry.target.key)});`);
       try {
         const pastedParts = stringArray(message.parts);
         await enqueueInput(entry, async () => {
@@ -1476,6 +1767,7 @@ export const TerminalRendererHost = forwardRef<TerminalRendererHandle, Props>(fu
           ? Date.now() - message.requestedAtEpochMs
           : undefined,
       );
+      if (resizeTrace && TERMINAL_NATIVE_DELIVERY_ENABLED) inject(`window.herdrTraceNextNative(${JSON.stringify(entry.target.key)});`);
       try {
         const dimensions = {
           columns: message.cols,
@@ -1636,16 +1928,16 @@ export const TerminalRendererHost = forwardRef<TerminalRendererHandle, Props>(fu
       const value = await Clipboard.getString();
       if (value) {
         if (entry.target.session.kind === 'ssh') {
-          inject(`window.herdrPaste(${JSON.stringify(entry.target.key)}, ${JSON.stringify(value)});`);
+          await pasteToSsh(entry, value);
         } else {
-          enqueueInput(entry, () => entry.target.client.native.requestHerdrApi({
+          afterNativeInput(() => enqueueInput(entry, () => entry.target.client.native.requestHerdrApi({
             method: 'pane.send_input',
             params: {
               pane_id: entry.target.session.paneId,
               text: prepareTerminalPaste(value),
               keys: [],
             },
-          }).then(() => undefined)).catch(
+          }).then(() => undefined))).catch(
             reason => reportError(entry.target, String(reason)),
           );
         }
@@ -1665,7 +1957,7 @@ export const TerminalRendererHost = forwardRef<TerminalRendererHandle, Props>(fu
     }
   };
 
-  return (
+  const terminalWebView = (
     <WebView
       ref={value => {
         webView.current = value;
@@ -1677,6 +1969,7 @@ export const TerminalRendererHost = forwardRef<TerminalRendererHandle, Props>(fu
         ? IOS_TERMINAL_ASSET_DIRECTORY
         : undefined}
       javaScriptEnabled
+      focusable={!usesNativeTerminalInput}
       textZoom={100}
       onMessage={handleMessage}
       onLayout={event => {
@@ -1691,12 +1984,26 @@ export const TerminalRendererHost = forwardRef<TerminalRendererHandle, Props>(fu
         if (entry) cancelResumeScroll(entry);
         // Scroll gestures must not take native focus from the composer.
         if (keyboardEnabled.current) {
-          webView.current?.requestFocus();
-          activeCall('herdrFocus');
+          focusInput();
         }
       }}
-      style={style}
+      style={usesNativeTerminalInput ? TERMINAL_WEBVIEW_STYLE : style}
       containerStyle={WEBVIEW_CONTAINER_STYLE}
     />
   );
+  return usesNativeTerminalInput ? (
+    <View style={style}>
+      {terminalWebView}
+      <NativeTerminalInput ref={nativeInput} binding={nativeBinding}
+        onCommandError={error => {
+          if (nativeBindingRef.current !== nativeBinding) return;
+          const commands = [...nativeCommands.current.values()];
+          nativeCommands.current.clear();
+          for (const command of commands) command.reject(error);
+          const entry = activeKey.current ? entries.current.get(activeKey.current) : null;
+          if (entry) reportError(entry.target, String(error));
+        }}
+        onTerminalInput={event => handleNativeInput(event.nativeEvent)} />
+    </View>
+  ) : terminalWebView;
 });

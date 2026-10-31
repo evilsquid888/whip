@@ -1,4 +1,73 @@
-use super::*;
+use std::io::SeekFrom;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+
+use russh::client;
+use russh_sftp::client::SftpSession;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::sync::watch;
+
+impl super::Session {
+    pub(super) async fn open_unix_stream(
+        &self,
+        path: &str,
+    ) -> Result<russh::Channel<client::Msg>, russh::Error> {
+        if !self.builtin_tailcat_ssh {
+            return self.handle.channel_open_direct_streamlocal(path).await;
+        }
+        self.open_socket_bridge(&format!("-U -- {}", crate::remote_ops::shell_quote(path)))
+            .await
+    }
+
+    pub(super) async fn open_tcpip(
+        &self,
+        host: &str,
+        port: u16,
+        origin_port: u16,
+    ) -> Result<russh::Channel<client::Msg>, russh::Error> {
+        if !self.builtin_tailcat_ssh {
+            return self
+                .handle
+                .channel_open_direct_tcpip(
+                    host,
+                    u32::from(port),
+                    "127.0.0.1",
+                    u32::from(origin_port),
+                )
+                .await;
+        }
+        self.open_socket_bridge(&format!(
+            "-- {} {port}",
+            crate::remote_ops::shell_quote(host)
+        ))
+        .await
+    }
+
+    async fn open_socket_bridge(
+        &self,
+        destination: &str,
+    ) -> Result<russh::Channel<client::Msg>, russh::Error> {
+        let channel = self.handle.channel_open_session().await?;
+        // -N closes the socket's write half at stdin EOF while preserving reads.
+        channel
+            .exec(true, format!("exec nc -N {destination}"))
+            .await?;
+        Ok(channel)
+    }
+}
+
+use super::{
+    CommandOutput, ExecDelivery, LengthFormat, NEXT_TEMP_ID, REMOTE_HOME_COMMAND, RemoteForward,
+    Session, SftpEntry, SftpFileServer, SftpMetadata, ShellCommand, ShellDelivery,
+    SshConnectionConfig, SshFailure, SshSession, SshShellClose, StreamCommand, TransportError,
+    UnixSocketDelivery, browser_proxy, close_local_forward_for_key, connect_inner, connect_sftp_on,
+    directory_download, disconnect_key, exec_channel_command_for_key, execute_on, latency_on,
+    open_exec_channel_with_delivery, open_local_forward_on, open_unix_socket_channel_with_framing,
+    request_unix_socket_bytes_on, reverse_forward, sessions, sftp_create_dir_all_on,
+    sftp_file_servers, sftp_list_on, sftp_transfer_file_on, shell_command_for_id, shells,
+    start_sftp_file_server_on, start_shell_on, unix_socket_channel_command_for_key,
+    write_unix_socket_channel_for_key,
+};
 
 impl SshSession {
     pub(crate) async fn open_browser_proxy(&self) -> Result<u16, SshFailure> {
@@ -44,6 +113,30 @@ impl SshSession {
         execute_on(&self.inner, command).await.map_err(Into::into)
     }
 
+    /// Send private configuration over stdin, never a remote process argument.
+    pub(crate) async fn execute_with_input(
+        &self,
+        command: &str,
+        input: &[u8],
+    ) -> Result<CommandOutput, SshFailure> {
+        super::execute_with_input_on(&self.inner, command, Some(input))
+            .await
+            .map_err(Into::into)
+    }
+
+    pub(crate) async fn open_direct_tcpip(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> Result<russh::ChannelStream<client::Msg>, SshFailure> {
+        self.inner
+            .open_tcpip(host, port, 0)
+            .await
+            .map(russh::Channel::into_stream)
+            .map_err(TransportError::from)
+            .map_err(Into::into)
+    }
+
     pub(crate) async fn remote_home(&self) -> Result<String, SshFailure> {
         self.inner.remote_home().await.map_err(Into::into)
     }
@@ -83,6 +176,12 @@ impl SshSession {
         local_port: u16,
         remote_port: u16,
     ) -> Result<RemoteForward, SshFailure> {
+        if self.inner.builtin_tailcat_ssh {
+            return Err(TransportError::InvalidRequest(
+                "Tailcat's SSH server does not support reverse port forwarding".into(),
+            )
+            .into());
+        }
         reverse_forward::open(self.inner.clone(), local_port, remote_port)
             .await
             .map_err(Into::into)
@@ -324,6 +423,7 @@ impl SshSession {
         rows: u32,
         data: Arc<dyn Fn(Vec<u8>) + Send + Sync>,
         closed: Arc<dyn Fn(SshShellClose) + Send + Sync>,
+        initial_command: Option<&str>,
     ) -> Result<(), SshFailure> {
         start_shell_on(
             self.resource_key.clone(),
@@ -333,6 +433,7 @@ impl SshSession {
             columns,
             rows,
             ShellDelivery::Rust { data, closed },
+            initial_command,
         )
         .await
         .map_err(Into::into)

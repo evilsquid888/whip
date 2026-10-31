@@ -1,14 +1,39 @@
+import {
+  HerdrAgentStatus,
+  LocalAlertCoordinator,
+  LocalAlertDelivery,
+  LocalAlertEffectAdmission,
+  LocalAlertScope,
+  LocalAlertAction_Tags,
+  LocalAlertOutcome,
+  LocalAlertSpeechEnd,
+  type LocalAlertEffect,
+  type LocalAlertRequest,
+  type LocalAlertRuntime,
+} from 'react-native-whip-ssh';
 import * as Notifications from 'expo-notifications';
-import * as Speech from 'expo-speech';
 import { Platform, Vibration } from 'react-native';
 
-import type { AgentInfo } from '../types';
+import type { AgentInfo, AgentStatus } from '../types';
 import type { AgentNotificationTarget } from '../lib/notificationNavigation';
 import { agentNotificationTitle } from '../lib/agentStatusEvents';
+import { transcriptTitleKey } from '../lib/transcriptTabTitles';
+import { notificationRegistrationProof } from '../lib/notificationRegistration';
 import type { AgentAlertLevel } from './devicePreferences';
-import { armPersistentAgentAlert, dismissPersistentAgentAlert, watchSpeechShake } from './backgroundMonitoring';
+import { agentTranscriptService } from './NativeTranscriptService';
+import {
+  armPersistentAgentAlert,
+  dismissPersistentAgentAlert,
+} from './backgroundMonitoring';
 import i18n from '../i18n';
 import { isChatSpeechActive } from './chatSpeechFocus';
+import { getSpeechPlayback, type SpeechEndReason } from './speechPlayback';
+import { setNotificationDeliveryAvailable } from './notificationPipelineHealth';
+import {
+  notificationRuntimes,
+  subscribeNotificationRuntimeChanges,
+} from './notificationRuntimeRegistry';
+import { reportBackgroundFailure } from './backgroundOperations';
 import {
   operationalErrorDetails,
   recordOperationalDiagnostic,
@@ -19,34 +44,84 @@ const BRIEF_CHANNEL_ID = 'agent-state-brief-v1';
 const REGULAR_CHANNEL_ID = 'agent-state-regular-v1';
 const ALERT_LEVEL_DATA_KEY = 'agentAlertLevel';
 const ALERT_VIBRATION_PATTERN = [
-  300, 100, 300, 100, 300, 100, 300, 2000,
-  300, 100, 300, 100, 300, 100, 300, 2000,
-  300, 100, 300, 100, 300, 100, 300, 2000,
+  300, 100, 300, 100, 300, 100, 300, 2000, 300, 100, 300, 100, 300, 100, 300,
+  2000, 300, 100, 300, 100, 300, 100, 300, 2000,
 ];
 const BRIEF_VIBRATION_PATTERN = [0, 200];
-const SPEECH_TIMEOUT_MS = 10_000;
 const DEFAULT_PERSISTENT_ALERT_TIMEOUT_MS = 30_000;
-type ActiveAgentNotification = {
-  paneTargetKey: string;
-  tabTargetKey: string;
-  persistent: boolean;
+const DELIVERY = {
+  persistent: LocalAlertDelivery.Persistent,
+  brief: LocalAlertDelivery.Brief,
+  regular: LocalAlertDelivery.Regular,
 };
-type AgentAlertTargets = Pick<ActiveAgentNotification, 'paneTargetKey' | 'tabTargetKey'>;
-
-const activeAgentNotifications = new Map<string, ActiveAgentNotification>();
-const pendingPaneAlertCounts = new Map<string, number>();
-const pendingTabAlertCounts = new Map<string, number>();
-const paneDismissalGenerations = new Map<string, number>();
-const tabDismissalGenerations = new Map<string, number>();
-let alertDismissalGeneration = 0;
-let persistentAgentNotificationId: string | null = null;
-let speakingAgentAlertTargets: AgentAlertTargets | null = null;
+const STATUS: Record<AgentStatus, HerdrAgentStatus> = {
+  idle: HerdrAgentStatus.Idle,
+  working: HerdrAgentStatus.Working,
+  blocked: HerdrAgentStatus.Blocked,
+  done: HerdrAgentStatus.Done,
+  unknown: HerdrAgentStatus.Unknown,
+};
+const SPEECH_END: Record<SpeechEndReason, LocalAlertSpeechEnd> = {
+  completed: LocalAlertSpeechEnd.Completed,
+  stopped: LocalAlertSpeechEnd.Stopped,
+  shake: LocalAlertSpeechEnd.Shake,
+  replaced: LocalAlertSpeechEnd.Replaced,
+  interrupted: LocalAlertSpeechEnd.Interrupted,
+  busy: LocalAlertSpeechEnd.Busy,
+};
 
 export type AgentAlertDelivery = AgentAlertLevel | 'brief';
+type AlertTarget = Pick<AgentNotificationTarget, 'hostId' | 'paneId'>;
+let coordinator: LocalAlertCoordinator | undefined;
+
+function runtimeFor(hostId: string): LocalAlertRuntime | undefined {
+  const runtime = notificationRuntimes.get(hostId);
+  return (
+    runtime && {
+      runtimeId: runtime.runtimeId,
+      incarnation: BigInt(runtime.runtimeIncarnation),
+    }
+  );
+}
+
+function native(): LocalAlertCoordinator {
+  if (!coordinator) {
+    coordinator = new LocalAlertCoordinator();
+    for (const hostId of notificationRuntimes.keys())
+      reportBackgroundFailure(
+        runEffects(
+          coordinator,
+          coordinator.setRuntime(hostId, runtimeFor(hostId)),
+        ),
+        'local-alert-runtime-attach',
+      );
+  }
+  return coordinator;
+}
+
+subscribeNotificationRuntimeChanges(hostId => {
+  if (coordinator)
+    reportBackgroundFailure(
+      runEffects(
+        coordinator,
+        coordinator.setRuntime(hostId, runtimeFor(hostId)),
+      ),
+      'local-alert-runtime-change',
+    );
+});
 
 Notifications.setNotificationHandler({
   handleNotification: notification => {
-    const regular = notification.request.content.data?.[ALERT_LEVEL_DATA_KEY] === 'regular';
+    if (notificationRegistrationProof(notification.request.content.data)) {
+      return Promise.resolve({
+        shouldPlaySound: false,
+        shouldSetBadge: false,
+        shouldShowBanner: false,
+        shouldShowList: false,
+      });
+    }
+    const regular =
+      notification.request.content.data?.[ALERT_LEVEL_DATA_KEY] === 'regular';
     return Promise.resolve({
       shouldPlaySound: true,
       shouldSetBadge: false,
@@ -60,6 +135,7 @@ Notifications.setNotificationHandler({
 });
 
 export async function prepareAlerts(): Promise<void> {
+  setNotificationDeliveryAvailable(false);
   if (Platform.OS === 'android') {
     try {
       await Notifications.setNotificationChannelAsync(PERSISTENT_CHANNEL_ID, {
@@ -90,6 +166,7 @@ export async function prepareAlerts(): Promise<void> {
   }
   try {
     await Notifications.requestPermissionsAsync();
+    setNotificationDeliveryAvailable(true);
   } catch (error) {
     recordNotificationFailure('error', 'notification-setup-failed', error, {
       stage: 'permissions',
@@ -98,260 +175,318 @@ export async function prepareAlerts(): Promise<void> {
   }
 }
 
-export async function alertAgent(
+function alertRequest(
   agent: AgentInfo,
   speak: boolean,
-  target: Pick<AgentNotificationTarget, 'hostId' | 'paneId'>,
+  target: AlertTarget,
+  tabName: string | undefined,
+  delivery: AgentAlertDelivery,
+  persistentAlertTimeoutMs: number,
+): LocalAlertRequest {
+  const labels = {
+    needsYou: (name: string) => i18n.t('alerts.needsYou', { name }),
+    finished: (name: string) => i18n.t('alerts.finished', { name }),
+  };
+  const title = agentNotificationTitle(agent, tabName, labels);
+  const sessionTitle = speak
+    ? agentTranscriptService.titles.title(
+        transcriptTitleKey(target.hostId, agent),
+      )
+    : undefined;
+  return {
+    ...target,
+    tabId: agent.tab_id,
+    runtime: runtimeFor(target.hostId),
+    title,
+    body:
+      agent.title ||
+      i18n.t('alerts.agentState', { status: agent.agent_status }),
+    announcement: speak
+      ? sessionTitle
+        ? agentNotificationTitle(
+            { ...agent, display_agent: sessionTitle },
+            undefined,
+            labels,
+          )
+        : title
+      : undefined,
+    language:
+      {
+        'zh-Hant': 'zh-TW',
+        'zh-Hans': 'zh-CN',
+        ja: 'ja-JP',
+        es: 'es-ES',
+        en: 'en-US',
+      }[i18n.resolvedLanguage || 'en'] || 'en-US',
+    delivery: DELIVERY[delivery],
+    persistentTimeoutMs: persistentAlertTimeoutMs,
+    android: Platform.OS === 'android',
+  };
+}
+
+export function alertAgent(
+  agent: AgentInfo,
+  speak: boolean,
+  target: AlertTarget,
   tabName?: string,
   delivery: AgentAlertDelivery = 'persistent',
-  persistentAlertTimeoutMs: number = DEFAULT_PERSISTENT_ALERT_TIMEOUT_MS,
+  persistentAlertTimeoutMs = DEFAULT_PERSISTENT_ALERT_TIMEOUT_MS,
 ): Promise<void> {
-  const dismissalGeneration = alertDismissalGeneration;
-  const paneTargetKey = agentAlertTargetKey(target.hostId, target.paneId);
-  const tabTargetKey = agentAlertTargetKey(target.hostId, agent.tab_id);
-  const targets = { paneTargetKey, tabTargetKey };
-  const paneDismissalGeneration = paneDismissalGenerations.get(paneTargetKey) ?? 0;
-  const tabDismissalGeneration = tabDismissalGenerations.get(tabTargetKey) ?? 0;
-  const wasDismissed = () => (
-    dismissalGeneration !== alertDismissalGeneration
-    || paneDismissalGeneration !== (paneDismissalGenerations.get(paneTargetKey) ?? 0)
-    || tabDismissalGeneration !== (tabDismissalGenerations.get(tabTargetKey) ?? 0)
-  );
-  const title = agentNotificationTitle(agent, tabName, {
-    needsYou: name => i18n.t('alerts.needsYou', { name }),
-    finished: name => i18n.t('alerts.finished', { name }),
-  });
-  const body = agent.title || i18n.t('alerts.agentState', { status: agent.agent_status });
-
-  incrementAlertCount(pendingPaneAlertCounts, paneTargetKey);
-  incrementAlertCount(pendingTabAlertCounts, tabTargetKey);
-  try {
-    if (speak && !isChatSpeechActive()) {
-      speakingAgentAlertTargets = targets;
-      try {
-        await speakBeforeAlert(title);
-      } finally {
-        if (speakingAgentAlertTargets === targets) speakingAgentAlertTargets = null;
-      }
-    }
-    if (wasDismissed()) return;
-    const regular = delivery === 'regular';
-    if (Platform.OS !== 'android' && !regular) Vibration.vibrate();
-    const persistent = delivery === 'persistent';
-    const channelId = regular
-      ? REGULAR_CHANNEL_ID
-      : persistent ? PERSISTENT_CHANNEL_ID : BRIEF_CHANNEL_ID;
-    const content: Notifications.NotificationContentInput = {
-      title,
-      body,
-      priority: regular
-        ? Notifications.AndroidNotificationPriority.DEFAULT
-        : Notifications.AndroidNotificationPriority.MAX,
-      data: { ...target, [ALERT_LEVEL_DATA_KEY]: delivery },
-    };
-    if (!regular) {
-      content.sound = 'default';
-      content.vibrate = persistent ? ALERT_VIBRATION_PATTERN : BRIEF_VIBRATION_PATTERN;
-    }
-    let notificationIdentifier: string;
-    try {
-      notificationIdentifier = await Notifications.scheduleNotificationAsync({
-        content,
-        trigger: { channelId },
-      });
-    } catch (error) {
-      recordNotificationFailure('error', 'agent-notification-schedule-failed', error, {
-        stage: 'schedule',
-      });
-      throw error;
-    }
-    if (wasDismissed()) {
-      await dismissScheduledNotification(notificationIdentifier, 'stale-generation-cleanup');
-      return;
-    }
-    activeAgentNotifications.set(notificationIdentifier, { ...targets, persistent });
-    if (Platform.OS === 'android' && persistent) {
-      persistentAgentNotificationId = notificationIdentifier;
-      armPersistentAgentAlert(
-        notificationIdentifier,
-        PERSISTENT_CHANNEL_ID,
+  const owner = native();
+  return runEffects(
+    owner,
+    owner.alert(
+      alertRequest(
+        agent,
+        speak,
+        target,
+        tabName,
+        delivery,
         persistentAlertTimeoutMs,
-      ).catch(error => {
-        recordNotificationFailure('error', 'persistent-agent-alert-arm-failed', error, {
-          stage: 'background-monitoring',
-        });
-        if (persistentAgentNotificationId === notificationIdentifier) {
-          persistentAgentNotificationId = null;
-        }
-      });
-    }
-  } finally {
-    decrementAlertCount(pendingPaneAlertCounts, paneTargetKey);
-    decrementAlertCount(pendingTabAlertCounts, tabTargetKey);
-  }
+      ),
+    ),
+  );
 }
 
-export async function dismissAgentAlerts(): Promise<void> {
-  alertDismissalGeneration += 1;
-  const notificationIds = [...activeAgentNotifications.keys()];
-  activeAgentNotifications.clear();
-  persistentAgentNotificationId = null;
-  speakingAgentAlertTargets = null;
-  await stopSpeech('dismiss-all');
-  await Promise.all(notificationIds.map(identifier => (
-    dismissScheduledNotification(identifier, 'dismiss-all')
-  )));
-  await dismissPersistentAlert('dismiss-all');
+/** Forward a native status transition; Rust decides admission, dismissal and mode. */
+export function transitionAgentAlert(
+  agent: AgentInfo | undefined,
+  status: AgentStatus | null | undefined,
+  target: AlertTarget,
+  options: {
+    enabled: boolean;
+    speak: boolean;
+    foreground: boolean;
+    delivery: AgentAlertLevel;
+    timeoutMs: number;
+    tabName?: string;
+  },
+): Promise<void> {
+  const owner = native();
+  return runEffects(
+    owner,
+    owner.transition({
+      ...target,
+      runtime: runtimeFor(target.hostId),
+      status: status ? STATUS[status] : undefined,
+      enabled: options.enabled,
+      foreground: options.foreground,
+      request: agent
+        ? alertRequest(
+            agent,
+            options.speak,
+            target,
+            options.tabName,
+            options.delivery,
+            options.timeoutMs,
+          )
+        : undefined,
+    }),
+  );
 }
 
-export async function dismissAgentAlertsForTab(hostId: string, tabId: string): Promise<void> {
-  const targetKey = agentAlertTargetKey(hostId, tabId);
-  const notificationIds = [...activeAgentNotifications]
-    .filter(([, alert]) => alert.tabTargetKey === targetKey)
-    .map(([identifier]) => identifier);
-  const pending = pendingTabAlertCounts.has(targetKey);
-  if (!pending && notificationIds.length === 0) return;
-
-  tabDismissalGenerations.set(targetKey, (tabDismissalGenerations.get(targetKey) ?? 0) + 1);
-  for (const identifier of notificationIds) activeAgentNotifications.delete(identifier);
-
-  if (speakingAgentAlertTargets?.tabTargetKey === targetKey) {
-    speakingAgentAlertTargets = null;
-    await stopSpeech('dismiss-tab');
-  }
-  await Promise.all(notificationIds.map(identifier => (
-    dismissScheduledNotification(identifier, 'dismiss-tab')
-  )));
-  if (persistentAgentNotificationId && notificationIds.includes(persistentAgentNotificationId)) {
-    persistentAgentNotificationId = null;
-    await dismissPersistentAlert('dismiss-tab');
-  }
+export function dismissAgentAlerts(): Promise<void> {
+  const owner = native();
+  return runEffects(owner, owner.dismiss(new LocalAlertScope.All()));
 }
 
-export async function dismissAgentAlertsForPane(hostId: string, paneId: string): Promise<void> {
-  const targetKey = agentAlertTargetKey(hostId, paneId);
-  const notificationIds = [...activeAgentNotifications]
-    .filter(([, alert]) => alert.paneTargetKey === targetKey)
-    .map(([identifier]) => identifier);
-  const pending = pendingPaneAlertCounts.has(targetKey);
-  if (!pending && notificationIds.length === 0) return;
-
-  paneDismissalGenerations.set(targetKey, (paneDismissalGenerations.get(targetKey) ?? 0) + 1);
-  for (const identifier of notificationIds) activeAgentNotifications.delete(identifier);
-
-  if (speakingAgentAlertTargets?.paneTargetKey === targetKey) {
-    speakingAgentAlertTargets = null;
-    await stopSpeech('dismiss-pane');
-  }
-  await Promise.all(notificationIds.map(identifier => (
-    dismissScheduledNotification(identifier, 'dismiss-pane')
-  )));
-  if (persistentAgentNotificationId && notificationIds.includes(persistentAgentNotificationId)) {
-    persistentAgentNotificationId = null;
-    await dismissPersistentAlert('dismiss-pane');
-  }
+export function dismissAgentAlertsForTab(
+  hostId: string,
+  tabId: string,
+): Promise<void> {
+  const owner = native();
+  return runEffects(
+    owner,
+    owner.dismiss(new LocalAlertScope.Tab({ hostId, tabId })),
+  );
 }
 
-function agentAlertTargetKey(hostId: string, targetId: string): string {
-  return JSON.stringify([hostId, targetId]);
+export function dismissAgentAlertsForPane(
+  hostId: string,
+  paneId: string,
+): Promise<void> {
+  const owner = native();
+  return runEffects(
+    owner,
+    owner.dismiss(new LocalAlertScope.Pane({ hostId, paneId })),
+  );
 }
 
-function incrementAlertCount(counts: Map<string, number>, targetKey: string): void {
-  counts.set(targetKey, (counts.get(targetKey) ?? 0) + 1);
-}
-
-function decrementAlertCount(counts: Map<string, number>, targetKey: string): void {
-  const remaining = (counts.get(targetKey) ?? 1) - 1;
-  if (remaining > 0) counts.set(targetKey, remaining);
-  else counts.delete(targetKey);
-}
-
-async function speakBeforeAlert(title: string): Promise<void> {
-  await stopSpeech('before-speak');
-  if (isChatSpeechActive()) return;
-  await new Promise<void>(resolve => {
-    let completed = false;
-    let timeout: ReturnType<typeof setTimeout> | null = null;
-    let stopShakeWatching = () => {};
-    const finish = () => {
-      if (completed) return;
-      completed = true;
-      if (timeout) clearTimeout(timeout);
-      stopShakeWatching();
-      resolve();
-    };
-
-    stopShakeWatching = watchSpeechShake(() => {
-      // Dismiss the pending alert too, so stopping its announcement does not
-      // immediately replace speech with a ringing notification.
-      void dismissAgentAlerts().then(finish, finish);
-    });
-    timeout = setTimeout(() => {
-      stopSpeech('speech-timeout').then(finish, finish);
-    }, SPEECH_TIMEOUT_MS);
-    try {
-      Speech.speak(title, {
-        language: {
-          'zh-Hant': 'zh-TW',
-          'zh-Hans': 'zh-CN',
-          ja: 'ja-JP',
-          es: 'es-ES',
-          en: 'en-US',
-        }[i18n.resolvedLanguage || 'en'] || 'en-US',
-        onDone: finish,
-        onStopped: finish,
-        onError: error => {
-          recordNotificationFailure('warn', 'agent-alert-speech-failed', error, {
-            stage: 'speech-callback',
+async function runEffects(
+  owner: LocalAlertCoordinator,
+  effects: LocalAlertEffect[],
+): Promise<void> {
+  await Promise.all(
+    effects.map(async effect => {
+      // Yield before native TTS admission so an immediate dismissal can fence it.
+      if (effect.action.tag === LocalAlertAction_Tags.Speak)
+        await Promise.resolve();
+      const admission = owner.beginEffect(effect.id);
+      if (admission === LocalAlertEffectAdmission.Duplicate) return;
+      let outcome: LocalAlertOutcome;
+      let scheduleFailure: { error: unknown } | undefined;
+      if (admission === LocalAlertEffectAdmission.Skip)
+        outcome = new LocalAlertOutcome.Skipped();
+      else {
+        try {
+          outcome = await performEffect(effect);
+        } catch (error) {
+          outcome = new LocalAlertOutcome.Failed({
+            message: error instanceof Error ? error.message : String(error),
           });
-          finish();
+          recordEffectFailure(effect, error);
+          if (effect.action.tag === LocalAlertAction_Tags.Schedule)
+            scheduleFailure = { error };
+        }
+      }
+      await runEffects(owner, owner.completeEffect(effect.id, outcome));
+      if (scheduleFailure) throw scheduleFailure.error;
+    }),
+  );
+}
+
+async function performEffect({
+  action,
+}: LocalAlertEffect): Promise<LocalAlertOutcome> {
+  switch (action.tag) {
+    case LocalAlertAction_Tags.Speak: {
+      const { token, text, language } = action.inner;
+      const reason = isChatSpeechActive()
+        ? 'busy'
+        : await getSpeechPlayback().speakAnnouncement(token, text, language);
+      return new LocalAlertOutcome.SpeechEnded({ reason: SPEECH_END[reason] });
+    }
+    case LocalAlertAction_Tags.StopSpeech:
+      await getSpeechPlayback().stopAnnouncement(action.inner.token);
+      break;
+    case LocalAlertAction_Tags.Schedule: {
+      const request = action.inner.request;
+      const regular = request.delivery === LocalAlertDelivery.Regular;
+      const persistent = request.delivery === LocalAlertDelivery.Persistent;
+      if (Platform.OS !== 'android' && !regular) Vibration.vibrate();
+      const delivery: AgentAlertDelivery = regular
+        ? 'regular'
+        : persistent
+          ? 'persistent'
+          : 'brief';
+      const content: Notifications.NotificationContentInput = {
+        title: request.title,
+        body: request.body,
+        priority: regular
+          ? Notifications.AndroidNotificationPriority.DEFAULT
+          : Notifications.AndroidNotificationPriority.MAX,
+        data: {
+          hostId: request.hostId,
+          paneId: request.paneId,
+          [ALERT_LEVEL_DATA_KEY]: delivery,
+        },
+      };
+      if (!regular) {
+        content.sound = 'default';
+        content.vibrate = persistent
+          ? ALERT_VIBRATION_PATTERN
+          : BRIEF_VIBRATION_PATTERN;
+      }
+      const notificationId = await Notifications.scheduleNotificationAsync({
+        content,
+        trigger: {
+          channelId: regular
+            ? REGULAR_CHANNEL_ID
+            : persistent
+              ? PERSISTENT_CHANNEL_ID
+              : BRIEF_CHANNEL_ID,
         },
       });
-    } catch (error) {
-      recordNotificationFailure('warn', 'agent-alert-speech-failed', error, {
-        stage: 'speech-start',
-      });
-      finish();
+      setNotificationDeliveryAvailable(true);
+      return new LocalAlertOutcome.Scheduled({ notificationId });
     }
-  });
-}
-
-async function dismissScheduledNotification(identifier: string, stage: string): Promise<void> {
-  try {
-    await Notifications.dismissNotificationAsync(identifier);
-  } catch (error) {
-    if (isExpectedDismissalRace(error)) return;
-    recordNotificationFailure('warn', 'notification-dismiss-failed', error, { stage });
+    case LocalAlertAction_Tags.DismissNotification:
+      await Notifications.dismissNotificationAsync(action.inner.notificationId);
+      break;
+    case LocalAlertAction_Tags.ArmPersistent:
+      await armPersistentAgentAlert(
+        action.inner.notificationId,
+        PERSISTENT_CHANNEL_ID,
+        action.inner.timeoutMs,
+      );
+      break;
+    case LocalAlertAction_Tags.DismissPersistent:
+      await dismissPersistentAgentAlert(action.inner.notificationId);
+      break;
   }
+  return new LocalAlertOutcome.Done();
 }
 
-async function dismissPersistentAlert(stage: string): Promise<void> {
-  try {
-    await dismissPersistentAgentAlert();
-  } catch (error) {
-    if (isExpectedDismissalRace(error)) return;
-    recordNotificationFailure('warn', 'persistent-agent-alert-dismiss-failed', error, { stage });
-  }
-}
-
-async function stopSpeech(stage: string): Promise<void> {
-  try {
-    await Speech.stop();
-  } catch (error) {
-    recordNotificationFailure('warn', 'agent-alert-speech-stop-failed', error, { stage });
+function recordEffectFailure(effect: LocalAlertEffect, error: unknown): void {
+  switch (effect.action.tag) {
+    case LocalAlertAction_Tags.Schedule:
+      setNotificationDeliveryAvailable(false);
+      recordNotificationFailure(
+        'error',
+        'agent-notification-schedule-failed',
+        error,
+        { stage: 'schedule' },
+      );
+      break;
+    case LocalAlertAction_Tags.ArmPersistent:
+      setNotificationDeliveryAvailable(false);
+      recordNotificationFailure(
+        'error',
+        'persistent-agent-alert-arm-failed',
+        error,
+        { stage: 'background-monitoring' },
+      );
+      break;
+    case LocalAlertAction_Tags.Speak:
+      recordNotificationFailure('warn', 'agent-alert-speech-failed', error, {
+        stage: 'speech-playback',
+      });
+      break;
+    case LocalAlertAction_Tags.StopSpeech:
+      recordNotificationFailure(
+        'warn',
+        'agent-alert-speech-stop-failed',
+        error,
+        { stage: 'speech-playback' },
+      );
+      break;
+    case LocalAlertAction_Tags.DismissNotification:
+      if (!isExpectedDismissalRace(error))
+        recordNotificationFailure(
+          'warn',
+          'notification-dismiss-failed',
+          error,
+          { stage: 'dismiss' },
+        );
+      break;
+    case LocalAlertAction_Tags.DismissPersistent:
+      if (!isExpectedDismissalRace(error))
+        recordNotificationFailure(
+          'warn',
+          'persistent-agent-alert-dismiss-failed',
+          error,
+          { stage: 'dismiss' },
+        );
+      break;
   }
 }
 
 function isExpectedDismissalRace(error: unknown): boolean {
-  const candidate = error && typeof error === 'object'
-    ? error as { code?: unknown; message?: unknown }
-    : null;
+  const candidate =
+    error && typeof error === 'object'
+      ? (error as { code?: unknown; message?: unknown })
+      : null;
   if (
-    candidate?.code === 'ERR_NOTIFICATION_NOT_FOUND'
-    || candidate?.code === 'E_NOTIFICATION_NOT_FOUND'
-  ) return true;
-  return typeof candidate?.message === 'string'
-    && /already (?:dismissed|removed)|not found|does not exist/i.test(candidate.message);
+    candidate?.code === 'ERR_NOTIFICATION_NOT_FOUND' ||
+    candidate?.code === 'E_NOTIFICATION_NOT_FOUND'
+  )
+    return true;
+  return (
+    typeof candidate?.message === 'string' &&
+    /already (?:dismissed|removed)|not found|does not exist/i.test(
+      candidate.message,
+    )
+  );
 }
 
 function recordNotificationFailure(

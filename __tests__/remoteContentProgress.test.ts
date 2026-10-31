@@ -1,4 +1,4 @@
-import AsyncStorage from '@react-native-async-storage/async-storage';
+import { appStorage } from '../src/services/appStorage';
 
 import {
   clearRemoteContentProgress,
@@ -9,9 +9,9 @@ import {
   type RemoteContentIdentity,
 } from '../src/services/remoteContentProgress';
 
-jest.mock('@react-native-async-storage/async-storage', () => ({
+jest.mock('../src/services/appStorage', () => ({
   __esModule: true,
-  default: {
+  appStorage: {
     getItem: jest.fn(),
     removeItem: jest.fn(),
     setItem: jest.fn(),
@@ -24,9 +24,9 @@ const identity: RemoteContentIdentity = {
   fileSize: 1234,
   modificationDate: '2040',
 };
-const getItem = jest.mocked(AsyncStorage.getItem);
-const removeItem = jest.mocked(AsyncStorage.removeItem);
-const setItem = jest.mocked(AsyncStorage.setItem);
+const getItem = jest.mocked(appStorage.getItem);
+const removeItem = jest.mocked(appStorage.removeItem);
+const setItem = jest.mocked(appStorage.setItem);
 
 beforeEach(() => {
   jest.clearAllMocks();
@@ -38,7 +38,7 @@ it('keys progress by host and stable remote path', () => {
   );
 });
 
-it('persists a paged-text byte anchor and ignores it if the remote file changes', async () => {
+it('keeps the saved page after an edit and marks its byte anchor for rebuilding', async () => {
   const progress = {
     kind: 'paged-text' as const,
     anchor: { pageIndex: 2, byteOffset: 1024, lineNumber: 129, continued: false },
@@ -47,7 +47,10 @@ it('persists a paged-text byte anchor and ignores it if the remote file changes'
   await saveRemoteContentProgress(identity, progress);
   getItem.mockResolvedValue(setItem.mock.calls[0][1]);
   await expect(loadRemoteContentProgress(identity)).resolves.toEqual(progress);
-  await expect(loadRemoteContentProgress({ ...identity, modificationDate: 'changed' })).resolves.toBeNull();
+  await expect(loadRemoteContentProgress({ ...identity, modificationDate: 'changed' }))
+    .resolves.toEqual({ ...progress, reanchor: true });
+  await expect(loadRemoteContentProgress({ ...identity, fileSize: 100 }))
+    .resolves.toEqual({ ...progress, reanchor: true });
 });
 
 it('ignores malformed paged-text reading positions', async () => {
@@ -76,15 +79,32 @@ it('persists and loads progress when the remote fingerprint matches', async () =
   await expect(loadRemoteContentProgress(identity)).resolves.toEqual(progress);
 });
 
-it('ignores stale, malformed, or unreadable progress', async () => {
+it('keeps a text offset after an edit without scaling it to the new file length', async () => {
+  const progress = { kind: 'text', offsetX: 0, offsetY: 100, contentWidth: 300, contentHeight: 1000 };
   getItem.mockResolvedValue(JSON.stringify({
     fileSize: identity.fileSize + 1,
     modificationDate: identity.modificationDate,
-    progress: { kind: 'text', offsetX: 0, offsetY: 100, contentWidth: 300, contentHeight: 1000 },
+    progress,
+  }));
+  await expect(loadRemoteContentProgress(identity))
+    .resolves.toEqual({ ...progress, contentWidth: 0, contentHeight: 0 });
+});
+
+it('ignores malformed or unreadable progress and media from a replaced file', async () => {
+  getItem.mockResolvedValue(JSON.stringify({
+    ...identity,
+    progress: { kind: 'text', offsetX: 0, offsetY: -1, contentWidth: 300, contentHeight: 1000 },
   }));
   await expect(loadRemoteContentProgress(identity)).resolves.toBeNull();
 
   getItem.mockResolvedValue('{not json');
+  await expect(loadRemoteContentProgress(identity)).resolves.toBeNull();
+
+  getItem.mockResolvedValue(JSON.stringify({
+    ...identity,
+    fileSize: identity.fileSize + 1,
+    progress: { kind: 'media', positionSeconds: 42, durationSeconds: 300 },
+  }));
   await expect(loadRemoteContentProgress(identity)).resolves.toBeNull();
 });
 

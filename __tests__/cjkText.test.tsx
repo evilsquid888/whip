@@ -1,14 +1,14 @@
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import { Slot } from '@rn-primitives/slot';
-import { Text as NativeText, TextInput, View } from 'react-native';
+import { Text as NativeText } from 'react-native';
 import { AnsiOutput } from '../src/components/AnsiOutput';
-import { CodeEditor, CodePreview } from '../src/components/CodePreview';
 import { renderCjkText } from '../src/components/CjkText';
 import { RemoteTextPreview } from '../src/components/RemoteTextPreview';
 import { Text } from '../src/components/ui/text';
 import { chatCjkFontFamily, guiFontFamilies } from '../src/lib/guiFonts';
 
 jest.mock('react-native-css-interop/jsx-runtime', () => jest.requireActual('react/jsx-runtime'));
+jest.mock('nativewind', () => ({ cssInterop: (component: unknown) => component }));
 jest.mock('@rn-primitives/slot', () => ({ Slot: 'Slot' }));
 jest.mock('react-native', () => ({
   Text: 'Text', TextInput: 'TextInput', View: 'View', ScrollView: 'ScrollView',
@@ -19,13 +19,14 @@ jest.mock('react-native', () => ({
       ? Object.assign({}, ...style.map((item: unknown) => item || {})) : style,
   },
 }));
-jest.mock('react-syntax-highlighter/dist/esm/styles/hljs', () => jest.requireActual('react-syntax-highlighter/dist/cjs/styles/hljs'));
-jest.mock('react-syntax-highlighter/dist/esm/default-highlight', () => jest.requireActual('react-syntax-highlighter/dist/cjs/default-highlight'));
+jest.mock('react-native-whip-ssh', () => ({ highlightCode: jest.fn(async (content: string) => ({
+  dark: [{ start: 0, end: content.length, color: '#aaaaaa', bold: false, italic: true }], light: [],
+})) }));
 jest.mock('../src/hooks/useRemoteScrollProgress', () => ({ useRemoteScrollProgress: () => ({}) }));
 jest.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
 jest.mock('../src/theme', () => ({
   colors: { ink: '#000000', text: '#ffffff' },
-  useTheme: () => ({ isDark: true, colors: { textTertiary: '#aaaaaa', surface: '#000000', primary: '#0000ff' } }),
+  useTheme: () => ({ isDark: true, colors: { text: '#ffffff', canvas: '#000000', textTertiary: '#aaaaaa', surface: '#000000', primary: '#0000ff' } }),
 }));
 
 const content = 'const 中文\u{e0100} = "日本語😀한국어";\n\n';
@@ -60,26 +61,10 @@ test('asChild leaves the supplied element intact', () => {
   expect(tree.root.findByType(Slot).props.children).toBe(child);
 });
 
-test('code and plain-text previews apply UKai without dropping trailing blank lines', () => {
-  act(() => { tree = create(<CodePreview content={content} filename="file.ts" progressIdentity={progressIdentity} />); });
+test('plain-text previews apply UKai without dropping trailing blank lines', () => {
+  act(() => { tree = create(<RemoteTextPreview content={content} progressIdentity={progressIdentity} />); });
   expect(cjkText()).toBe('中文\u{e0100}日本語');
   expect(renderedText(tree.toJSON())).toContain(content);
-  act(() => { tree.update(<RemoteTextPreview content={content} progressIdentity={progressIdentity} />); });
-  expect(cjkText()).toBe('中文\u{e0100}日本語');
-  expect(renderedText(tree.toJSON())).toContain(content);
-});
-
-test('the editor highlight layer uses UKai while retaining the editable value', () => {
-  act(() => { tree = create(<CodeEditor editable filename="file.ts" onChangeText={jest.fn()} value={content} progressIdentity={progressIdentity} />); });
-  act(() => { tree.root.findAllByType(View)[0].props.onLayout({ nativeEvent: { layout: { height: 500, width: 400 } } }); });
-  expect(cjkText()).toBe('中文\u{e0100}日本語');
-  expect(tree.root.findByType(TextInput).props.value).toBe(content);
-});
-
-test('syntax emphasis still surrounds CJK font spans in code comments', () => {
-  act(() => { tree = create(<CodePreview content="/* 中文 */" filename="file.ts" progressIdentity={progressIdentity} />); });
-  const comment = tree.root.findAllByType(NativeText).find(node => node.props.style?.fontFamily === chatCjkFontFamily)!;
-  expect(comment.parent?.props.style.fontStyle).toBe('italic');
 });
 
 test('ANSI output retains colors and emphasis around UKai spans', () => {

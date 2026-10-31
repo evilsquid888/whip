@@ -60,10 +60,15 @@ const noticeSources = [
     source: 'assets/terminal-fonts/NerdFonts-LICENSE.txt',
   },
   {
-    id: 'mermaid',
-    asset: 'assets/licenses/mermaid-MIT.txt',
-    source: 'node_modules/mermaid/LICENSE',
-    dependency: 'mermaid',
+    id: 'noto-sans-symbols-2',
+    asset: 'assets/licenses/noto-sans-symbols-2-OFL-1.1.txt',
+    source: 'assets/terminal-fonts/NotoSansSymbols2-OFL.txt',
+  },
+  {
+    id: 'pele',
+    asset: 'assets/licenses/pele-MIT-and-ISC.txt',
+    source: 'node_modules/pele/LICENSE',
+    dependency: 'pele',
   },
   {
     id: 'xterm-js',
@@ -82,6 +87,7 @@ const noticeSources = [
 const npmLicenseSourceOverrides = new Map([
   ['@react-native-community/slider', 'licenses/npm/react-native-slider-MIT.txt'],
   ['@ubjs/core', 'node_modules/uniffi-bindgen-react-native/LICENSE'],
+  ['@verevoir/qr', 'licenses/npm/verevoir-qr-MIT.txt'],
   ['@xterm/addon-serialize', 'node_modules/@xterm/xterm/LICENSE'],
   ['react-native-whip-ssh', 'LICENSE'],
 ]);
@@ -210,6 +216,7 @@ function normalizeRepositoryUrl(repository: string | undefined) {
   return repository
     .replace(/^git\+/, '')
     .replace(/^git:\/\/github\.com\//, 'https://github.com/')
+    .replace(/^ssh:\/\/git@github\.com[:/]/, 'https://github.com/')
     .replace(/\.git$/, '');
 }
 

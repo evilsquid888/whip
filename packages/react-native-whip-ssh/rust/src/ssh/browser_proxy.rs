@@ -1,6 +1,12 @@
 //! SOCKS5 CONNECT over direct-tcpip: remote DNS, end-to-end TLS, no direct fallback.
-use super::*;
+use std::sync::Arc;
+use std::time::Duration;
+
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::watch;
+
+use super::{Session, TransportError, forwards};
+
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_CONNECTIONS: usize = 128;
 async fn destination<S: AsyncRead + AsyncWrite + Unpin>(
@@ -81,7 +87,7 @@ pub(super) async fn open(key: String, session: Arc<Session>) -> Result<u16, Tran
                         let _permit = permit;
                         let connection = async {
                             let Ok(Ok((host, remote_port))) = tokio::time::timeout(HANDSHAKE_TIMEOUT, destination(&mut local)).await else { return };
-                            let channel = tokio::time::timeout(HANDSHAKE_TIMEOUT, session.handle.channel_open_direct_tcpip(host, u32::from(remote_port), "127.0.0.1", u32::from(port))).await;
+                            let channel = tokio::time::timeout(HANDSHAKE_TIMEOUT, session.open_tcpip(&host, remote_port, port)).await;
                             let Ok(Ok(channel)) = channel else { let _ = reply(&mut local, 5).await; return };
                             if reply(&mut local, 0).await.is_err() { return; }
                             let mut remote = channel.into_stream(); let _ = tokio::io::copy_bidirectional(&mut local, &mut remote).await;

@@ -1,0 +1,38 @@
+{
+  "$schema": "../node_modules/wrangler/config-schema.json",
+  "name": "whip-notify",
+  "account_id": "6347d293a37734d7acd6fabc1a432da4",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-28",
+  "compatibility_flags": ["nodejs_compat"],
+  "routes": [
+    { "pattern": "whip-notify.kosumi.dev", "custom_domain": true },
+  ],
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 0.1,
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "whip-notify",
+      "database_id": "1d31450e-7d93-4f05-95d5-ead25c1dff03",
+      "migrations_dir": "migrations",
+    },
+  ],
+  "ratelimits": [
+    {
+      "name": "LIMITER",
+      "namespace_id": "1001",
+      "simple": {
+        "limit": 60,
+        "period": 60,
+      },
+    },
+  ],
+  "triggers": {
+    "crons": ["*/15 * * * *"],
+  },
+  // Registration is public; Expo's optional server credential is typed separately.
+  "secrets": { "required": [] },
+}

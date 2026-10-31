@@ -19,12 +19,19 @@ jest.mock('react-native', () => ({
   },
   View: 'View',
 }));
+jest.mock('expo-blur', () => ({
+  BlurView: 'BlurView',
+  BlurTargetView: 'BlurTargetView',
+}));
+jest.mock('@callstack/liquid-glass', () => ({
+  isLiquidGlassSupported: false,
+  LiquidGlassView: 'LiquidGlassView',
+}));
 jest.mock(
   '@/src/theme',
   () => ({
     useTheme: () => ({ colors: { canvas: mockCanvasColor } }),
   }),
-  { virtual: true },
 );
 
 function findHosts(root: ReactTestInstance, type: string): ReactTestInstance[] {

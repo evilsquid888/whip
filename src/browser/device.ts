@@ -6,6 +6,7 @@ import {
 } from 'react-native';
 import Clipboard from '@react-native-clipboard/clipboard';
 import { motionSnapshot } from './motion';
+import { sensorSnapshot } from './sensors';
 import type { BrowserSessionIdentity } from './registry';
 import {
   cancelShizukuCommand,
@@ -15,17 +16,13 @@ import {
 } from '../services/shizuku';
 
 const NOTIFICATION_CHANNEL = 'reverse-control-v1';
+// Includes the native acquisition window plus permission and bridge overhead.
+export const DEVICE_LOCATION_TIMEOUT_MS = 40_000;
 
 interface NativeDevice {
-  info(): Promise<Record<string, unknown>>;
-  battery(): Promise<Record<string, unknown>>;
   location(requestId: string): Promise<Record<string, unknown>>;
   cancelLocation(requestId: string): void;
   network(requestId: string): Promise<Record<string, unknown>>;
-  sensorSnapshot(
-    requestId: string,
-    sensor: string,
-  ): Promise<Record<string, unknown>>;
   speak(
     sessionId: string,
     requestId: string,
@@ -50,27 +47,18 @@ async function nativeRequest(
   work: () => Promise<unknown>,
   cancel: () => void,
   signal: AbortSignal,
-  foreground?: () => void,
 ): Promise<unknown> {
   if (signal.aborted) throw failure('cancelled', 'Device action cancelled');
-  foreground?.();
   signal.addEventListener('abort', cancel, { once: true });
-  const subscription = foreground
-    ? AppState.addEventListener('change', state => {
-        if (state === 'background') cancel();
-      })
-    : undefined;
   try {
     const value = await work();
     if (signal.aborted) throw failure('cancelled', 'Device action cancelled');
-    foreground?.();
     return value;
   } catch (error) {
     cancel();
     throw error;
   } finally {
     signal.removeEventListener('abort', cancel);
-    subscription?.remove();
   }
 }
 
@@ -126,8 +114,42 @@ export async function deviceAction(
   };
   active();
   if (action === 'device.motion') return motionSnapshot(signal, foreground);
-  if (action === 'device.info') return native.info();
-  if (action === 'device.battery') return native.battery();
+  if (action === 'device.info') {
+    const Device = require('expo-device') as typeof import('expo-device');
+    const Application =
+      require('expo-application') as typeof import('expo-application');
+    const Localization =
+      require('expo-localization') as typeof import('expo-localization');
+    // iOS has always returned the hardware identifier, rather than a model name.
+    const model: unknown =
+      Platform.OS === 'ios' ? Device.modelId ?? Device.modelName : Device.modelName;
+    return {
+      platform: Platform.OS,
+      os_version: Device.osVersion ?? '',
+      model: typeof model === 'string' ? model : '',
+      manufacturer: Device.manufacturer ?? '',
+      app_version: Application.nativeApplicationVersion,
+      locale: Localization.getLocales()[0]?.languageTag ?? 'und',
+      time_zone: Localization.getCalendars()[0]?.timeZone ?? 'UTC',
+    };
+  }
+  if (action === 'device.battery') {
+    const Battery = require('expo-battery') as typeof import('expo-battery');
+    const { batteryLevel, batteryState, lowPowerMode } =
+      await Battery.getPowerStateAsync();
+    const states = {
+      [Battery.BatteryState.UNKNOWN]: 'unknown',
+      [Battery.BatteryState.UNPLUGGED]: 'unplugged',
+      [Battery.BatteryState.CHARGING]: 'charging',
+      [Battery.BatteryState.FULL]: 'full',
+      [Battery.BatteryState.NOT_CHARGING]: 'unplugged',
+    };
+    return {
+      level: batteryLevel < 0 ? null : batteryLevel,
+      state: states[batteryState] ?? states[Battery.BatteryState.UNKNOWN],
+      low_power_mode: lowPowerMode,
+    };
+  }
   if (action === 'device.network')
     return nativeRequest(
       () => native.network(requestId),
@@ -135,12 +157,7 @@ export async function deviceAction(
       signal,
     );
   if (action === 'device.sensor_snapshot')
-    return nativeRequest(
-      () => native.sensorSnapshot(requestId, String(args.sensor)),
-      () => native.cancelRequest(requestId),
-      signal,
-      foreground,
-    );
+    return sensorSnapshot(String(args.sensor), signal, foreground);
   if (action === 'device.speak')
     return nativeRequest(
       () =>

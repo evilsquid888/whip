@@ -106,7 +106,17 @@ agents and terminal identities. Calls during recovery fail; an interrupted
 privileged command may already have executed and must not be blindly retried.
 If the original port is unavailable, Whip retains authorization and retries
 restoration during subsequent health checks. Explicit host disconnect, agent
-exit, terminal replacement, disabling Reverse Control, and MCP DELETE revoke old access.
+exit, terminal replacement, and disabling Reverse Control revoke old access.
+For Claude Code and OpenCode, MCP DELETE also revokes the launch.
+
+Codex `/new` and `/clear` create another thread inside the existing CLI process
+and reuse its launch-time MCP URL and token. Whip keeps that launch authorized
+across these conversation changes and returns 405 to Codex MCP DELETE requests;
+Codex treats that response as supported client shutdown without deleting the
+server endpoint. This also handles the old client's DELETE arriving after the
+new client initializes. Initial resume verification still requires the intended
+conversation ID, and recovery after Whip process death still validates the
+latest confirmed conversation against a fresh host snapshot.
 
 After process death, recovery is lazy: creating a host runtime does not open a
 listener or connect to another host. Its first fresh snapshot loads that host's
@@ -137,7 +147,9 @@ checks the MCP session identity. It rejects browser Origin headers, unexpected
 Host headers and ambiguous authorization/session headers. Body sizes, read
 times, pending actions and concurrent connections are bounded. Initialize and
 tool calls return JSON; notifications return 202, GET returns 405 (no SSE), and
-authenticated DELETE terminates only that launch. There are no server-initiated
+authenticated DELETE terminates only the corresponding Claude Code or OpenCode
+launch. Codex DELETE returns 405 so thread navigation can reuse its launch.
+There are no server-initiated
 MCP requests. RPC ids are scoped per launch, including concurrent calls from two
 agents using the same JSON-RPC id.
 
@@ -210,7 +222,7 @@ scan callbacks cannot navigate another tab.
 The menu contains the current page's share/copy/edit actions. Focusing the bar shows
 locally saved recent searches. Tap a search to run it with the current engine,
 tap its arrow to edit it, or hold it to remove it. Rust maintains up to 50 unique
-queries, newest first, with case-insensitive matching; AsyncStorage persists the
+queries, newest first, with case-insensitive matching; the Rust Turso app-data store persists the
 snapshot. Direct addresses, QR scans, and agent navigation do not populate search
 history. The search panel's Clear action and browser Settings → Clear All remove
 saved queries. Back dismisses the search panel before hiding the browser.
@@ -252,11 +264,15 @@ The same authenticated MCP server also exposes phone tools to opted-in launches:
 Device calls return structured `{kind: "device.<tool>", value: ...}` content and
 use the existing authorization, request quotas, 20-second deadline and MCP
 cancellation path. They do not require a browser tab. Rust validates arguments
-and results; React Native dispatches native operations. Android and iOS adapters
-read battery/device metadata and obtain location using platform APIs. Haptics use
-the existing Expo adapter. Clipboard and notifications reuse existing packages;
-speech, networking and raw sensor sampling use platform APIs. DeviceMotion uses
-the SDK-compatible `expo-sensors` package.
+and results; React Native dispatches native operations. Device metadata uses
+`expo-device`, with the existing `expo-application` and `expo-localization`
+packages supplying app version, locale and time zone. The adapter preserves the
+JSON field names and uses the iOS hardware model identifier for `model`. Battery
+status uses the SDK-compatible `expo-battery` package. Location uses platform
+APIs. Haptics use the existing Expo adapter.
+Clipboard and notifications reuse existing packages; speech and networking use
+platform APIs. Raw sensor snapshots and DeviceMotion share a TypeScript adapter
+over the SDK-compatible `expo-sensors` package.
 
 Shizuku commands run on the Android phone as shell/root through a UserService.
 See [Shizuku integration](shizuku.md#privileged-reverse-control-tools) for
@@ -289,8 +305,12 @@ out after five seconds. Backgrounding, cancellation and session closure remove
 listeners. Missing hardware returns `sensor_unavailable`; denied permissions
 return `permission_denied`. Vector readings contain `x`, `y`, `z`: accelerometer
 specific force includes gravity in `m/s2`, gyroscope uses `rad/s`, and magnetometer
-uses `uT`. Barometer readings contain `pressure` in `hPa`. iOS normalizes native
-acceleration and pressure units and declares the motion usage description.
+uses `uT`. Barometer readings contain `pressure` in `hPa`. The adapter converts
+Expo acceleration from g and preserves the existing iOS axis signs; Expo already
+normalizes pressure to hPa. iOS uses Expo's uncalibrated magnetometer to preserve
+the former native measurement and checks motion permission before sampling
+pressure. `timestamp_ms` is the Unix capture time. Each request removes only its
+own listener and leaves shared sensor update intervals unchanged.
 
 DeviceMotion uses `expo-sensors` and checks availability and OS motion permission
 before subscribing. It waits for gravity and attitude fields to be populated, then
@@ -449,8 +469,10 @@ refs fail closed instead of reidentifying a replacement write target.
 
 ## Lifetime and settings
 
-Rust revokes authorization on authenticated MCP DELETE, explicit terminal close,
-pane removal/agent disappearance, launch failure, or explicit host disconnect.
+Rust revokes authorization on explicit terminal close, pane removal/agent
+disappearance, launch failure, or explicit host disconnect. Authenticated MCP
+DELETE additionally revokes Claude Code and OpenCode launches; Codex client
+shutdown keeps the launch available for `/new`, `/clear`, and `/resume`.
 Pane close also revokes that pane's session. Outstanding requests are cancelled
 and WebViews removed. An ordinary HTTP connection closing does not end a browser
 session or cancel a tool call; MCP cancellation notifications cancel calls.

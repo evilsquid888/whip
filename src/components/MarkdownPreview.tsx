@@ -1,4 +1,3 @@
-import { File } from 'expo-file-system';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Alert, Linking, Platform, type NativeScrollEvent, type NativeSyntheticEvent } from 'react-native';
 import { useTranslation } from 'react-i18next';
@@ -10,11 +9,11 @@ import { resolveRemoteMarkdownPath } from '@/src/lib/markdownRemoteLinks';
 import { parentRemotePath, remoteEntryName, remotePreviewKind } from '@/src/lib/remoteFiles';
 import { reportBackgroundFailure } from '@/src/services/backgroundOperations';
 import type { HerdrClient } from '@/src/services/HerdrClient';
-import { rasterizeCachedMarkdownSvg } from '@/src/services/markdownImages';
 import type { RemoteContentIdentity } from '@/src/services/remoteContentProgress';
 import { cacheRemoteFile, type CachedRemoteFile } from '@/src/services/remoteFileTransfer';
 import { IOS_TERMINAL_ASSETS } from '@/src/services/terminalAssets';
-import { useTheme } from '@/src/theme';
+import { colorWithAlpha, useTheme } from '@/src/theme';
+import { useAppGlassEnabled } from '@/src/lib/glassContext';
 
 interface Props {
   client: HerdrClient;
@@ -34,7 +33,7 @@ const MARKDOWN_SOURCE = Platform.select({
 });
 const IMAGE_MIME_TYPES: Record<string, string> = {
   png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif',
-  webp: 'image/webp', bmp: 'image/bmp',
+  webp: 'image/webp', bmp: 'image/bmp', svg: 'image/svg+xml',
 };
 interface PreviewMessage {
   type?: string;
@@ -50,6 +49,7 @@ interface PreviewMessage {
 export function MarkdownPreview({ client, content, remotePath, onOpenRemotePath, progressIdentity }: Props) {
   const { t } = useTranslation();
   const { colors, scheme } = useTheme();
+  const appGlassEnabled = useAppGlassEnabled();
   const webView = useRef<WebView>(null);
   const ready = useRef(false);
   const requestId = useRef(0);
@@ -62,13 +62,13 @@ export function MarkdownPreview({ client, content, remotePath, onOpenRemotePath,
   const render = useCallback(() => {
     if (!ready.current) return;
     const theme = { scheme, colors: {
-      canvas: colors.canvas, foreground: colors.text, muted: colors.textSecondary,
-      link: colors.link, border: colors.divider, surface: colors.surface,
+      canvas: appGlassEnabled ? 'transparent' : colors.canvas, foreground: colors.text, muted: colors.textSecondary,
+      link: colors.link, border: colors.divider, surface: appGlassEnabled ? colorWithAlpha(colors.surface, '60') : colors.surface,
     } };
     webView.current?.injectJavaScript(
       `window.herdrRenderMarkdown(${JSON.stringify(content)}, ${JSON.stringify(theme)}, ${++requestId.current}); true;`,
     );
-  }, [content, colors, scheme]);
+  }, [appGlassEnabled, content, colors, scheme]);
   useEffect(render, [render]);
 
   useEffect(() => {
@@ -100,11 +100,9 @@ export function MarkdownPreview({ client, content, remotePath, onOpenRemotePath,
           const cached = await cacheRemoteFile(client, path);
           if (disposed) { cached.dispose(); return; }
           cachedFiles.push(cached);
-          const uri = kind === 'svg' ? await rasterizeCachedMarkdownSvg(cached) : cached.uri;
-          if (disposed) return;
-          const mime = kind === 'svg' ? 'image/png' : IMAGE_MIME_TYPES[filename.split('.').pop()!.toLowerCase()];
+          const mime = IMAGE_MIME_TYPES[filename.split('.').pop()!.toLowerCase()];
           if (!mime) continue;
-          const data = `data:${mime};base64,${await new File(uri).base64()}`;
+          const data = `data:${mime};base64,${await cached.file.base64()}`;
           if (disposed || imageRequest.id !== requestId.current) return;
           webView.current?.injectJavaScript(
             `window.herdrSetMarkdownImage(${imageRequest.id}, ${JSON.stringify(target)}, ${JSON.stringify(data)}); true;`,
@@ -149,7 +147,7 @@ export function MarkdownPreview({ client, content, remotePath, onOpenRemotePath,
     <WebView
       ref={webView}
       source={MARKDOWN_SOURCE}
-      style={{ flex: 1, backgroundColor: colors.canvas }}
+      style={{ flex: 1, backgroundColor: appGlassEnabled ? 'transparent' : colors.canvas }}
       allowFileAccess
       allowFileAccessFromFileURLs
       allowingReadAccessToURL={Platform.OS === 'ios' ? IOS_ASSET_DIRECTORY : undefined}
@@ -162,6 +160,7 @@ export function MarkdownPreview({ client, content, remotePath, onOpenRemotePath,
       textZoom={100}
       thirdPartyCookiesEnabled={false}
       onLoadStart={() => { ready.current = false; }}
+      onLayout={scrollProgress.onLayout}
       onMessage={handleMessage}
       onShouldStartLoadWithRequest={request => request.url === MARKDOWN_SOURCE?.uri || request.url === 'about:blank'}
     />

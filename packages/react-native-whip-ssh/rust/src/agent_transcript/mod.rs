@@ -2,12 +2,16 @@
 
 mod claude;
 mod codex;
+mod content;
+mod file_session;
 mod history_gate;
 mod jsonl;
 mod metadata;
 mod model;
 mod opencode;
+mod pi;
 mod projection;
+mod title;
 
 pub use claude::*;
 pub use codex::*;
@@ -15,7 +19,8 @@ pub use jsonl::*;
 pub(crate) use metadata::{CodexUsageTracker, tool_duration, tool_input_json};
 pub use model::*;
 pub use opencode::*;
+pub use pi::*;
 pub(crate) use projection::{
-    command_title, injected_user_context, question_tool_input, questions_from_input,
-    transcript_questions, user_prompt_parts,
+    canonical_tool_name, command_title, injected_user_context, is_question_tool,
+    question_tool_input, questions_from_input, tool_input, transcript_questions, user_prompt_parts,
 };

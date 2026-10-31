@@ -2,18 +2,14 @@ package io.github.kaminarios.whip
 
 import android.Manifest
 import android.content.Context
-import android.content.Intent
-import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
-import android.os.BatteryManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.os.PowerManager
 import android.os.SystemClock
 import android.util.Log
 import com.facebook.react.bridge.Arguments
@@ -29,8 +25,6 @@ import com.google.android.gms.location.CurrentLocationRequest
 import com.google.android.gms.location.LocationServices
 import com.google.android.gms.location.Priority
 import com.google.android.gms.tasks.CancellationTokenSource
-import java.util.Locale
-import java.util.TimeZone
 
 class WhipDeviceModule(private val context: ReactApplicationContext) : ReactContextBaseJavaModule(context), LifecycleEventListener {
   private val handler = Handler(Looper.getMainLooper())
@@ -43,49 +37,16 @@ class WhipDeviceModule(private val context: ReactApplicationContext) : ReactCont
   override fun onHostPause() { cancelAll() }
   override fun onHostDestroy() { cancelAll() }
   private fun cancelAll() {
-    tools.cancelSamples()
     handler.post { requests.values.toList().forEach { it.fail("cancelled", "Location request cancelled") } }
   }
 
   override fun getName(): String = "WhipDevice"
 
   @ReactMethod fun network(requestId: String, promise: Promise) { tools.network(promise) }
-  @ReactMethod fun sensorSnapshot(requestId: String, sensor: String, promise: Promise) { tools.sensorSnapshot(requestId, sensor, promise) }
   @ReactMethod fun speak(sessionId: String, requestId: String, text: String, language: String?, rate: Double, promise: Promise) { tools.speak(sessionId, requestId, text, language, rate, promise) }
   @ReactMethod fun stopSpeaking(sessionId: String, promise: Promise) { tools.stopSpeaking(sessionId, promise) }
   @ReactMethod fun cancelRequest(requestId: String) { tools.cancelRequest(requestId) }
   @ReactMethod fun releaseSession(sessionId: String) { tools.releaseSession(sessionId) }
-
-  @ReactMethod
-  fun info(promise: Promise) {
-    promise.resolve(Arguments.createMap().apply {
-      putString("platform", "android")
-      putString("os_version", Build.VERSION.RELEASE)
-      putString("model", Build.MODEL)
-      putString("manufacturer", Build.MANUFACTURER)
-      putString("app_version", context.packageManager.getPackageInfo(context.packageName, 0).versionName)
-      putString("locale", Locale.getDefault().toLanguageTag())
-      putString("time_zone", TimeZone.getDefault().id)
-    })
-  }
-
-  @ReactMethod
-  fun battery(promise: Promise) {
-    val battery = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
-    val level = battery?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
-    val scale = battery?.getIntExtra(BatteryManager.EXTRA_SCALE, -1) ?: -1
-    val state = when (battery?.getIntExtra(BatteryManager.EXTRA_STATUS, -1)) {
-      BatteryManager.BATTERY_STATUS_CHARGING -> "charging"
-      BatteryManager.BATTERY_STATUS_FULL -> "full"
-      BatteryManager.BATTERY_STATUS_DISCHARGING, BatteryManager.BATTERY_STATUS_NOT_CHARGING -> "unplugged"
-      else -> "unknown"
-    }
-    promise.resolve(Arguments.createMap().apply {
-      if (level >= 0 && scale > 0) putDouble("level", level.toDouble() / scale) else putNull("level")
-      putString("state", state)
-      putBoolean("low_power_mode", (context.getSystemService(Context.POWER_SERVICE) as PowerManager).isPowerSaveMode)
-    })
-  }
 
   @ReactMethod
   fun location(requestId: String, promise: Promise) {
@@ -213,7 +174,8 @@ class WhipDeviceModule(private val context: ReactApplicationContext) : ReactCont
 
   private companion object {
     const val LOG_TAG = "WhipDevice"
-    const val LOCATION_TIMEOUT_MS = 10_000L
+    // Give GPS time to acquire a fix when network location has no recent sample.
+    const val LOCATION_TIMEOUT_MS = 30_000L
     const val LOCATION_MAX_AGE_MS = 10_000L
   }
 }

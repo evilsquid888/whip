@@ -8,6 +8,7 @@ pub enum AgentTranscriptKind {
     Claude,
     Codex,
     OpenCode,
+    Pi,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Enum)]
@@ -286,7 +287,7 @@ pub enum AgentTranscriptPart {
 }
 
 impl AgentTranscriptPart {
-    pub(super) fn id(&self) -> &str {
+    pub(crate) fn id(&self) -> &str {
         match self {
             Self::Text { id, .. }
             | Self::Image { id, .. }
@@ -348,6 +349,24 @@ pub struct AgentTranscriptState {
     pub messages: Vec<AgentTranscriptMessage>,
     pub turns: Vec<AgentTranscriptTurn>,
     pub error: Option<String>,
+}
+
+/// Rust-only input for row projection, borrowed while the session is locked.
+#[derive(Clone, Copy)]
+pub(crate) struct AgentTranscriptView<'a> {
+    pub revision: u64,
+    pub messages: &'a [AgentTranscriptMessage],
+    pub turns: &'a [AgentTranscriptTurn],
+}
+
+impl<'a> From<&'a AgentTranscriptState> for AgentTranscriptView<'a> {
+    fn from(state: &'a AgentTranscriptState) -> Self {
+        Self {
+            revision: state.revision,
+            messages: &state.messages,
+            turns: &state.turns,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, uniffi::Enum)]

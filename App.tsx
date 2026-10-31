@@ -1,14 +1,16 @@
 import './global.css';
 
 import { useEffect, useRef, useState } from 'react';
+import { QueryClientProvider } from '@tanstack/react-query';
 import { useFonts } from 'expo-font';
 import { PortalHost } from '@rn-primitives/portal';
-import { NativeModules, Platform, View } from 'react-native';
+import { NativeModules, View } from 'react-native';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
+import { KeyboardProvider } from 'react-native-keyboard-controller';
 import { useTranslation } from 'react-i18next';
 
 import { AppShell } from './src/components/AppShell';
-import { ReducedMotionProvider, WhipMark } from './src/components/app-ui';
+import { ReducedMotionProvider } from './src/components/app-ui';
 import { chatCjkFontFamily, guiFontFamilies } from './src/lib/guiFonts';
 import { bundledAsset } from './src/lib/bundledAsset';
 import { chatCjkFontAsset } from './src/services/chatFontAsset';
@@ -19,6 +21,8 @@ import { useUsageTracking } from './src/hooks/useUsageTracking';
 import { useAppNavigation } from './src/hooks/useAppNavigation';
 import { useApplicationSecurity } from './src/hooks/useApplicationSecurity';
 import { useDevicePreferences } from './src/hooks/useDevicePreferences';
+import { AppFontScaleContext } from './src/hooks/useAppFontScale';
+import { DEFAULT_APP_FONT_SIZE_PERCENT } from './src/lib/appFontSize';
 import { useHostManagement } from './src/hooks/useHostManagement';
 import { useLiveHostTelemetry } from './src/hooks/useLiveHostTelemetry';
 import { useRemoteFilesController } from './src/hooks/useRemoteFilesController';
@@ -30,8 +34,12 @@ import {
 import { useStartupStorage } from './src/hooks/useStartupStorage';
 import { useTerminalHistory } from './src/hooks/useTerminalHistory';
 import { useTerminalSessions } from './src/hooks/useTerminalSessions';
-import { getBillingRolloutPolicy } from './src/billing/rollout';
 import { useWhipEntitlements } from './src/billing/useWhipEntitlements';
+import { LAUNCH_BACKGROUND_COLOR } from './src/lib/launchScreen.cjs';
+import { appQueryClient } from './src/services/appQueryClient';
+import { useAppQueryLifecycle } from './src/hooks/useAppQueryLifecycle';
+
+const appLoadingStyle = { backgroundColor: LAUNCH_BACKGROUND_COLOR };
 
 const guiFontAssets = {
   [chatCjkFontFamily]: chatCjkFontAsset,
@@ -45,30 +53,37 @@ const guiFontAssets = {
 };
 
 function hideLaunchScreen() {
-  if (Platform.OS === 'ios') {
-    (NativeModules.WhipLaunchScreen as { hide(): void } | undefined)?.hide();
-  }
+  (NativeModules.WhipLaunchScreen as { hide(): void } | undefined)?.hide();
 }
 
 function App() {
   const [guiFontsLoaded, guiFontError] = useFonts(guiFontAssets);
+  useAppQueryLifecycle();
 
   return (
     <SafeAreaProvider>
-      <ReducedMotionProvider>
-        {guiFontsLoaded || guiFontError ? <AppContent /> : <AppLoadingScreen />}
-        <PortalHost />
-      </ReducedMotionProvider>
+      <KeyboardProvider statusBarTranslucent navigationBarTranslucent preserveEdgeToEdge preload={false}>
+        <QueryClientProvider client={appQueryClient}>
+          <ReducedMotionProvider>
+            {guiFontsLoaded || guiFontError ? <AppContent /> : <AppLoadingScreen />}
+          </ReducedMotionProvider>
+        </QueryClientProvider>
+      </KeyboardProvider>
     </SafeAreaProvider>
   );
 }
 
 function AppLoadingScreen() {
   const { t } = useTranslation();
+  // Both native platforms retain the launch artwork until hideLaunchScreen.
+  // Rebuilding its SVG here would create thousands of hidden native views.
   return (
-    <View className="flex-1 items-center justify-center bg-background">
-      <WhipMark accessibilityLabel={t('app.loading')} size={64} />
-    </View>
+    <View
+      className="flex-1"
+      style={appLoadingStyle}
+      accessible
+      accessibilityLabel={t('app.loading')}
+    />
   );
 }
 
@@ -78,10 +93,11 @@ function AppContent() {
   const startupStorage = useStartupStorage();
   const preferences = useDevicePreferences(startupStorage);
   const preferencesLoaded = preferences.hydration.status !== 'loading';
-  const { billingEnabled } = getBillingRolloutPolicy(
+  const entitlements = useWhipEntitlements(
+    preferencesLoaded,
     preferences.value.developerOptionsEnabled,
+    preferences.value.developerMembershipState,
   );
-  const entitlements = useWhipEntitlements(preferencesLoaded && billingEnabled);
   const terminals = useTerminalSessions();
   const telemetry = useLiveHostTelemetry();
   const notifications = useAgentNotifications();
@@ -171,20 +187,23 @@ function AppContent() {
   }
 
   return (
-    <View className="flex-1" onLayout={hideLaunchScreen}>
-      <AppShell
-        preferences={preferences}
-        entitlements={entitlements}
-        hosts={hosts}
-        sessions={sessions}
-        navigation={navigation}
-        remoteFiles={remoteFiles}
-        security={security}
-        terminals={terminals}
-        telemetry={telemetry}
-        history={history}
-      />
-    </View>
+    <AppFontScaleContext.Provider value={preferences.value.appFontSizePercent / DEFAULT_APP_FONT_SIZE_PERCENT}>
+      <View className="flex-1" onLayout={hideLaunchScreen}>
+        <AppShell
+          preferences={preferences}
+          entitlements={entitlements}
+          hosts={hosts}
+          sessions={sessions}
+          navigation={navigation}
+          remoteFiles={remoteFiles}
+          security={security}
+          terminals={terminals}
+          telemetry={telemetry}
+          history={history}
+        />
+      </View>
+      <PortalHost />
+    </AppFontScaleContext.Provider>
   );
 }
 

@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState } from 'react';
+import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp } from 'lucide-react-native';
+import { useEffect, useReducer, useRef } from 'react';
 import { ActivityIndicator, ScrollView, View } from 'react-native';
 import type {
   NativeAgentInteractionPrompt,
@@ -6,6 +7,7 @@ import type {
 } from 'react-native-whip-ssh';
 import { NativeAgentInteractionKind } from 'react-native-whip-ssh/src/agentInteraction';
 import { Button } from './ui/button';
+import { Icon } from './ui/icon';
 import { Input } from './ui/input';
 import { Text } from './ui/text';
 import { cn } from '../lib/utils';
@@ -21,13 +23,64 @@ export interface AgentInteractionTarget {
 
 const PROMPT_POLL_MS = 1200;
 const NAVIGATION_CONTROLS = [
-  ['↑', 'up', 'Previous option'],
-  ['↓', 'down', 'Next option'],
-  ['←', 'left', 'Previous question'],
-  ['→', 'right', 'Next question'],
+  [ArrowUp, 'up', 'Previous option'],
+  [ArrowDown, 'down', 'Next option'],
+  [ArrowLeft, 'left', 'Previous question'],
+  [ArrowRight, 'right', 'Next question'],
   ['Tab', 'tab', 'Next field'],
   ['Space', 'space', 'Toggle option'],
 ] as const;
+
+interface InteractionState {
+  prompt?: NativeAgentInteractionPrompt;
+  answer: string;
+  error?: string;
+  responseError?: string;
+  loaded: boolean;
+  busy: boolean;
+  submittedToken?: string;
+  showTerminalControls: boolean;
+}
+
+type InteractionAction =
+  | { type: 'reset' }
+  | { type: 'prompt-loaded'; prompt?: NativeAgentInteractionPrompt }
+  | { type: 'prompt-failed'; error: string }
+  | { type: 'answer-changed'; answer: string }
+  | { type: 'controls-toggled' }
+  | { type: 'response-started'; submittedToken?: string }
+  | { type: 'answer-sent' }
+  | { type: 'response-failed'; error: string; retryable: boolean }
+  | { type: 'response-finished' };
+
+const INITIAL_INTERACTION: InteractionState = {
+  answer: '', loaded: false, busy: false, showTerminalControls: false,
+};
+
+function interactionReducer(state: InteractionState, action: InteractionAction): InteractionState {
+  switch (action.type) {
+    case 'reset':
+      return INITIAL_INTERACTION;
+    case 'prompt-loaded':
+      return { ...state, prompt: action.prompt, error: undefined, loaded: true };
+    case 'prompt-failed':
+      return { ...state, prompt: undefined, error: action.error };
+    case 'answer-changed':
+      return { ...state, answer: action.answer };
+    case 'controls-toggled':
+      return { ...state, showTerminalControls: !state.showTerminalControls };
+    case 'response-started':
+      return { ...state, busy: true, error: undefined, responseError: undefined,
+        submittedToken: action.submittedToken ?? state.submittedToken };
+    case 'answer-sent':
+      return { ...state, answer: '' };
+    case 'response-failed':
+      return { ...state, prompt: undefined, responseError: action.error,
+        submittedToken: action.retryable ? undefined : state.submittedToken };
+    case 'response-finished':
+      return { ...state, busy: false };
+  }
+}
 
 export function AgentInteractionControls({
   target,
@@ -39,14 +92,8 @@ export function AgentInteractionControls({
   onOpenTerminal?: () => void;
 }) {
   const { native, terminalId, bindingToken } = target;
-  const [prompt, setPrompt] = useState<NativeAgentInteractionPrompt>();
-  const [answer, setAnswer] = useState('');
-  const [error, setError] = useState<string>();
-  const [responseError, setResponseError] = useState<string>();
-  const [loaded, setLoaded] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [submittedToken, setSubmittedToken] = useState<string>();
-  const [showTerminalControls, setShowTerminalControls] = useState(false);
+  const [{ prompt, answer, error, responseError, loaded, busy, submittedToken, showTerminalControls }, dispatch] =
+    useReducer(interactionReducer, INITIAL_INTERACTION);
   const generation = useRef(0);
   const sending = useRef(false);
   const refreshRef = useRef<() => Promise<void>>(() => Promise.resolve());
@@ -55,14 +102,7 @@ export function AgentInteractionControls({
     const current = ++generation.current;
     let timer: ReturnType<typeof setTimeout> | undefined;
     let reading = false;
-    setPrompt(undefined);
-    setError(undefined);
-    setResponseError(undefined);
-    setLoaded(false);
-    setAnswer('');
-    setBusy(false);
-    setSubmittedToken(undefined);
-    setShowTerminalControls(false);
+    dispatch({ type: 'reset' });
     sending.current = false;
     if (!enabled) return;
     const refresh = async () => {
@@ -74,13 +114,10 @@ export function AgentInteractionControls({
           bindingToken,
         );
         if (current !== generation.current) return;
-        setPrompt(next);
-        setError(undefined);
-        setLoaded(true);
+        dispatch({ type: 'prompt-loaded', prompt: next });
       } catch (reason) {
         if (current !== generation.current) return;
-        setPrompt(undefined);
-        setError(String(reason));
+        dispatch({ type: 'prompt-failed', error: String(reason) });
       } finally {
         reading = false;
       }
@@ -111,12 +148,9 @@ export function AgentInteractionControls({
       action === 'esc' ||
       action === 'answer';
     sending.current = true;
-    setBusy(true);
-    setError(undefined);
-    setResponseError(undefined);
     // A lost response acknowledgement is ambiguous. Keep this prompt disabled
     // until the native reader supplies a new token, including after errors.
-    if (submitting) setSubmittedToken(prompt.token);
+    dispatch({ type: 'response-started', submittedToken: submitting ? prompt.token : undefined });
     try {
       await native.respondAgentInteraction(
         terminalId,
@@ -125,24 +159,17 @@ export function AgentInteractionControls({
         action,
         action === 'answer' ? answer : '',
       );
-      if (current === generation.current && action === 'answer') setAnswer('');
+      if (current === generation.current && action === 'answer') dispatch({ type: 'answer-sent' });
     } catch (reason) {
       if (current === generation.current) {
-        setPrompt(undefined);
-        setResponseError(String(reason));
-        if (
-          reason &&
-          typeof reason === 'object' &&
-          'code' in reason &&
-          reason.code === 'InvalidField'
-        ) {
-          setSubmittedToken(undefined);
-        }
+        dispatch({ type: 'response-failed', error: String(reason), retryable: Boolean(
+          reason && typeof reason === 'object' && 'code' in reason && reason.code === 'InvalidField',
+        ) });
       }
     } finally {
       if (current === generation.current) {
         sending.current = false;
-        setBusy(false);
+        dispatch({ type: 'response-finished' });
         void refreshRef.current();
       }
     }
@@ -237,7 +264,7 @@ export function AgentInteractionControls({
                   </ScrollView>
                   <View className="flex-row flex-wrap gap-1">
                     {NAVIGATION_CONTROLS.map(
-                      ([label, action, accessibilityLabel]) => (
+                      ([face, action, accessibilityLabel]) => (
                         <Button
                           key={action}
                           variant="secondary"
@@ -248,7 +275,11 @@ export function AgentInteractionControls({
                             void respond(action);
                           }}
                         >
-                          <Text className="text-xs">{label}</Text>
+                          {typeof face === 'string' ? (
+                            <Text className="text-xs">{face}</Text>
+                          ) : (
+                            <Icon as={face} size={18} />
+                          )}
                         </Button>
                       ),
                     )}
@@ -289,7 +320,7 @@ export function AgentInteractionControls({
                     accessibilityLabel="Answer the agent"
                     placeholder="Type an answer…"
                     value={answer}
-                    onChangeText={setAnswer}
+                    onChangeText={value => dispatch({ type: 'answer-changed', answer: value })}
                     editable={!disabled}
                     maxLength={4096}
                     returnKeyType="send"
@@ -315,7 +346,7 @@ export function AgentInteractionControls({
                 accessibilityLabel="Toggle terminal controls"
                 accessibilityState={{ expanded: showTerminalControls }}
                 onPress={() => {
-                  setShowTerminalControls(value => !value);
+                  dispatch({ type: 'controls-toggled' });
                 }}
               >
                 <Text className="text-xs text-muted-foreground">

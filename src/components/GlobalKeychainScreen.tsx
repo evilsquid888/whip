@@ -1,8 +1,9 @@
+import { KeyboardAwareScrollView as ScrollView } from 'react-native-keyboard-controller';
 import { generateKeyPair, getKeyDetails } from 'react-native-whip-ssh';
 import { ChevronLeft, ClipboardPaste, FileUp, KeyRound, Plus, ShieldCheck, Sparkles, Trash2, X } from 'lucide-react-native';
 import { useEffect, useState } from 'react';
 import Clipboard from '@react-native-clipboard/clipboard';
-import { Alert, NativeModules, Pressable, ScrollView, View } from 'react-native';
+import { Alert, Pressable, View } from 'react-native';
 import { useTranslation } from 'react-i18next';
 import { reportBackgroundFailure } from '../services/backgroundOperations';
 
@@ -11,6 +12,7 @@ import { normalizePrivateKey } from '@/src/lib/privateKey';
 import { cn } from '@/src/lib/utils';
 import { deleteGlobalSshKey, saveGlobalSshKey } from '@/src/services/globalSshKeychain';
 import { copyTextWithHaptic } from '@/src/services/interactionFeedback';
+import { pickPrivateKeyFile } from '@/src/services/privateKeyFilePicker';
 import { appGlassControlStyle, useTheme } from '@/src/theme';
 import type { GlobalSshKeyMaterial } from '@/src/types';
 import { hapticPress, IconButton, ScreenHeader } from './app-ui';
@@ -27,12 +29,6 @@ interface Props {
   onClose: () => void;
   onChanged: (keys: GlobalSshKeyMaterial[]) => void;
 }
-
-type PrivateKeyFilePickerModule = {
-  pickPrivateKey(): Promise<string | null>;
-};
-
-const privateKeyFilePicker = NativeModules.PrivateKeyFilePicker as PrivateKeyFilePickerModule | undefined;
 
 export function GlobalKeychainScreen({ initialKeys, onClose, onChanged }: Props) {
   const { colors } = useTheme();
@@ -75,12 +71,8 @@ export function GlobalKeychainScreen({ initialKeys, onClose, onChanged }: Props)
     }
   };
   const selectPrivateKeyFile = async () => {
-    if (!privateKeyFilePicker) {
-      Alert.alert(t('connection.fileUnavailableTitle'), t('connection.fileUnavailableCopy'));
-      return;
-    }
     try {
-      const value = await privateKeyFilePicker.pickPrivateKey();
+      const value = await pickPrivateKeyFile();
       if (value != null) applyPrivateKey(value);
     } catch (error) {
       Alert.alert(t('connection.readKeyError'), String(error));
@@ -229,6 +221,7 @@ export function GlobalKeychainScreen({ initialKeys, onClose, onChanged }: Props)
                     accessibilityRole="button"
                     className="min-h-11 min-w-0 flex-1 flex-row items-center"
                     disabled={busy}
+                    onLongPress={hapticPress(() => setCopyTarget(key))}
                     onPress={hapticPress(() => setCopyTarget(key))}>
                     <View className="size-10 items-center justify-center rounded-full bg-primary/10"><Icon as={KeyRound} className="text-primary" size={18} /></View>
                     <View className="ml-3 min-w-0 flex-1">
@@ -249,6 +242,7 @@ export function GlobalKeychainScreen({ initialKeys, onClose, onChanged }: Props)
         onClose={() => setCopyTarget(null)}
         onCopyPrivate={copyPrivateKey}
         onCopyPublic={copyPublicKey}
+        onGetPublicKey={() => copyTarget ? getKeyDetails(normalizePrivateKey(copyTarget.secret), copyTarget.passphrase || undefined).publicKey : ''}
       />
       <ConfirmationPopup
         busy={busy}

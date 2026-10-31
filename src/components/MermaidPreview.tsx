@@ -7,6 +7,7 @@ import { useTranslation } from 'react-i18next';
 
 import { IOS_TERMINAL_ASSETS } from '@/src/services/terminalAssets';
 import { useTheme } from '@/src/theme';
+import { useAppGlassEnabled } from '@/src/lib/glassContext';
 import { Text } from './ui/text';
 
 interface Props {
@@ -38,6 +39,8 @@ const MERMAID_SOURCE = Platform.select({
 
 export function MermaidPreview({ content, filename, inline = false, fallback }: Props) {
   const { colors, scheme } = useTheme();
+  const appGlassEnabled = useAppGlassEnabled();
+  const backgroundColor = appGlassEnabled ? 'transparent' : colors.canvas;
   const { t } = useTranslation();
   const webView = useRef<WebViewHandle | null>(null);
   const ready = useRef(false);
@@ -65,6 +68,7 @@ export function MermaidPreview({ content, filename, inline = false, fallback }: 
     );
     timeout.current = setTimeout(() => {
       if (renderRequest.current !== requestId) return;
+      renderRequest.current += 1;
       setLoading(false);
       setError(t('files.mermaidTimedOut'));
     }, RENDER_TIMEOUT_MS);
@@ -105,7 +109,7 @@ export function MermaidPreview({ content, filename, inline = false, fallback }: 
     <View
       accessibilityLabel={t('files.mermaidPreview', { name: filename })}
       className={inline ? 'mb-3 overflow-hidden rounded-lg' : 'flex-1'}
-      style={{ backgroundColor: colors.canvas, ...(inline && !showFallback ? { height: INLINE_HEIGHT } : {}) }}
+      style={{ backgroundColor, ...(inline && !showFallback ? { height: INLINE_HEIGHT } : {}) }}
     >
       <WebView
         ref={value => {
@@ -128,12 +132,14 @@ export function MermaidPreview({ content, filename, inline = false, fallback }: 
         textZoom={100}
         thirdPartyCookiesEnabled={false}
         onError={event => {
+          renderRequest.current += 1;
           clearRenderTimeout();
           setLoading(false);
           setError(event.nativeEvent.description || t('files.mermaidInvalid'));
         }}
         onLoadStart={() => {
           ready.current = false;
+          renderRequest.current += 1;
           clearRenderTimeout();
           setLoading(true);
           setError(null);
@@ -144,7 +150,7 @@ export function MermaidPreview({ content, filename, inline = false, fallback }: 
         )}
       />
       {loading ? (
-        <View className="absolute inset-0 items-center justify-center gap-3" style={{ backgroundColor: colors.canvas }}>
+        <View className="absolute inset-0 items-center justify-center gap-3" style={{ backgroundColor }}>
           <ActivityIndicator color={colors.primary} />
           <Text className="text-[12px] text-muted-foreground">{t('files.renderingMermaid')}</Text>
         </View>
@@ -155,7 +161,7 @@ export function MermaidPreview({ content, filename, inline = false, fallback }: 
           {fallback}
         </View>
       ) : error ? (
-        <View className="absolute inset-0 items-center justify-center p-8" style={{ backgroundColor: colors.canvas }}>
+        <View className="absolute inset-0 items-center justify-center p-8" style={{ backgroundColor }}>
           <FileWarning color={colors.textSecondary} size={30} />
           <Text className="mt-4 text-center text-[15px] font-semibold text-foreground">
             {t('files.mermaidInvalid')}

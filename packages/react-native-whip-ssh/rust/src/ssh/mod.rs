@@ -9,6 +9,7 @@ mod browser_proxy;
 mod known_hosts;
 mod reverse_forward;
 mod session;
+pub(crate) mod tailcat;
 
 pub(crate) use reverse_forward::RemoteForward;
 
@@ -108,11 +109,11 @@ const HOST_LATENCY_DISCONNECTED: &CStr = c"Whip SSH latency transport disconnect
 const HOST_LATENCY_TIMEOUT: &CStr = c"Whip SSH latency timeout";
 
 #[cfg(target_os = "android")]
-struct AndroidTraceSlice(bool);
+pub(crate) struct AndroidTraceSlice(bool);
 
 #[cfg(target_os = "android")]
 impl AndroidTraceSlice {
-    fn begin(name: &CStr) -> Self {
+    pub(crate) fn begin(name: &CStr) -> Self {
         // Checking first avoids CString work and kernel trace writes when the
         // app is not part of an active Perfetto/atrace capture.
         // SAFETY: This Android-only FFI call has no parameters or preconditions.
@@ -162,11 +163,11 @@ unsafe extern "C" {
 }
 
 #[cfg(not(target_os = "android"))]
-struct AndroidTraceSlice;
+pub(crate) struct AndroidTraceSlice;
 
 #[cfg(not(target_os = "android"))]
 impl AndroidTraceSlice {
-    fn begin(_name: &CStr) -> Self {
+    pub(crate) fn begin(_name: &CStr) -> Self {
         Self
     }
 }
@@ -424,6 +425,7 @@ pub trait WhipSshEventSink: Send + Sync {
 
 struct Session {
     handle: client::Handle<RusshHandler>,
+    builtin_tailcat_ssh: bool,
     agent: Arc<AgentState>,
     lifecycle: Arc<ConnectionLifecycle>,
     reverse_forwards: Arc<reverse_forward::Routes>,
@@ -551,6 +553,9 @@ pub(crate) enum SshCredential {
 
 #[derive(Clone, Debug)]
 pub(crate) struct SshConnectionConfig {
+    pub tailcat_address: Option<String>,
+    pub tailcat_private_key: Option<String>,
+    pub tailcat_ssh_server: bool,
     pub host: String,
     pub port: u16,
     pub username: String,
@@ -983,6 +988,9 @@ async fn connect_compatibility_session(
         },
     };
     let config = SshConnectionConfig {
+        tailcat_address: None,
+        tailcat_private_key: None,
+        tailcat_ssh_server: false,
         host,
         port,
         username,
@@ -1009,12 +1017,25 @@ async fn connect_compatibility_session(
     Ok(())
 }
 
+fn ssh_host_identity(connection: &SshConnectionConfig) -> (String, u16) {
+    let host = connection.host.trim();
+    if connection.tailcat_address.is_some() && connection.tailcat_ssh_server {
+        (format!("tailcat-ssh:{host}"), 22)
+    } else {
+        (host.to_owned(), connection.port)
+    }
+}
+
 async fn connect_inner(
     connection: &SshConnectionConfig,
     jump: Option<&Session>,
 ) -> Result<Arc<Session>, TransportError> {
-    let host = connection.host.trim().to_owned();
-    let port = connection.port;
+    if connection.tailcat_ssh_server && connection.tailcat_address.is_none() {
+        return Err(TransportError::InvalidRequest(
+            "Tailcat's SSH server requires Tailcat mode".into(),
+        ));
+    }
+    let (host, port) = ssh_host_identity(connection);
     let username = connection.username.trim().to_owned();
     let config = Arc::new(client::Config {
         inactivity_timeout: Some(Duration::from_secs(30)),
@@ -1035,11 +1056,31 @@ async fn connect_inner(
         #[cfg(test)]
         fixture_key: None,
     };
-    let mut handle = if let Some(jump) = jump {
-        let channel = jump
-            .handle
-            .channel_open_direct_tcpip(host.clone(), u32::from(port), "127.0.0.1", 0)
-            .await?;
+    let mut handle = if let Some(address) = &connection.tailcat_address {
+        if jump.is_some() {
+            return Err(TransportError::InvalidRequest(
+                "Tailcat cannot be combined with an incoming jump host".into(),
+            ));
+        }
+        if connection.tailcat_ssh_server
+            && !matches!(connection.credential, SshCredential::Key { .. })
+        {
+            return Err(TransportError::InvalidRequest(
+                "Tailcat's SSH server requires an SSH private key".into(),
+            ));
+        }
+        let stream = tailcat::connect(
+            address,
+            port,
+            connection
+                .tailcat_private_key
+                .as_deref()
+                .unwrap_or_default(),
+        )
+        .await?;
+        client::connect_stream(config, stream, handler).await?
+    } else if let Some(jump) = jump {
+        let channel = jump.open_tcpip(&host, port, 0).await?;
         client::connect_stream(config, channel.into_stream(), handler).await?
     } else {
         client::connect(config, (host.as_str(), port), handler)
@@ -1080,6 +1121,7 @@ async fn connect_inner(
     }
     let session = Arc::new(Session {
         handle,
+        builtin_tailcat_ssh: connection.tailcat_ssh_server,
         agent,
         lifecycle,
         reverse_forwards,
@@ -1174,10 +1216,22 @@ pub(crate) struct CommandOutput {
 }
 
 async fn execute_on(session: &Session, command: &str) -> Result<CommandOutput, TransportError> {
+    execute_with_input_on(session, command, None).await
+}
+
+async fn execute_with_input_on(
+    session: &Session,
+    command: &str,
+    input: Option<&[u8]>,
+) -> Result<CommandOutput, TransportError> {
     session.ensure_alive()?;
     let mut channel = session.handle.channel_open_session().await?;
     request_agent_forwarding(session, &channel).await?;
     channel.exec(true, command).await?;
+    if let Some(input) = input {
+        channel.data(input).await?;
+        channel.eof().await?;
+    }
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     let mut stdout_truncated = false;
@@ -1312,6 +1366,7 @@ async fn start_shell_on(
     columns: u32,
     rows: u32,
     delivery: ShellDelivery,
+    initial_command: Option<&str>,
 ) -> Result<(), TransportError> {
     session.ensure_alive()?;
     if shells().read().contains(&key, &shell_id) {
@@ -1324,7 +1379,11 @@ async fn start_shell_on(
         .request_pty(false, &pty_type, columns, rows, 0, 0, &[])
         .await?;
     request_agent_forwarding(&session, &channel).await?;
-    channel.request_shell(true).await?;
+    if let Some(command) = initial_command {
+        channel.exec(true, command).await?;
+    } else {
+        channel.request_shell(true).await?;
+    }
     let (sender, mut receiver) = mpsc::channel(CONTROL_QUEUE_CAPACITY);
     {
         let mut shells = shells().write();
@@ -1353,7 +1412,19 @@ async fn start_shell_on(
                             "key": read_key,
                             "value": String::from_utf8_lossy(&data),
                         })),
-                        ShellDelivery::Rust { data: deliver, .. } => deliver(data.to_vec()),
+                        ShellDelivery::Rust { data: deliver, .. } => {
+                            // A renderer may backpressure delivery. Keep both
+                            // the runtime executor and the independent input
+                            // writer runnable while its mailbox is full.
+                            let deliver = Arc::clone(deliver);
+                            let bytes = data.to_vec();
+                            if tokio::task::spawn_blocking(move || deliver(bytes))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
                     },
                     Some(russh::ChannelMsg::ExitStatus { exit_status }) => {
                         close_reason = format!("remote shell exited with status {exit_status}");
@@ -1920,10 +1991,7 @@ async fn request_unix_socket_bytes_on(
     max_response_bytes: usize,
 ) -> Result<Vec<u8>, TransportError> {
     session.ensure_alive()?;
-    let channel = session
-        .handle
-        .channel_open_direct_streamlocal(socket_path)
-        .await?;
+    let channel = session.open_unix_stream(socket_path).await?;
     let mut stream = BufReader::new(channel.into_stream());
     stream.write_all(request).await?;
     let mut reader = stream.take(max_response_bytes as u64 + 1);
@@ -2254,10 +2322,7 @@ async fn open_unix_socket_channel_with_framing(
         )));
     }
 
-    let channel = session
-        .handle
-        .channel_open_direct_streamlocal(socket_path)
-        .await?;
+    let channel = session.open_unix_stream(&socket_path).await?;
     let (sender, receiver) = mpsc::channel(CONTROL_QUEUE_CAPACITY);
     {
         let mut channels = unix_socket_channels().write();
@@ -2432,7 +2497,7 @@ async fn open_local_forward_on(
                 },
                 accepted = listener.accept() => {
                     let Ok((mut local, _)) = accepted else { break };
-                    let Ok(channel) = session.handle.channel_open_direct_tcpip(remote_host.clone(), u32::from(remote_port), "127.0.0.1", u32::from(local_port)).await else { continue };
+                    let Ok(channel) = session.open_tcpip(&remote_host, remote_port, local_port).await else { continue };
                     let mut tunnel_cancel = cancel_rx.clone();
                     tokio::spawn(async move {
                         let mut remote = channel.into_stream();
@@ -2500,9 +2565,15 @@ fn parse_sftp_http_request(bytes: &[u8]) -> Result<SftpHttpRequest, TransportErr
     })
 }
 
-fn parse_sftp_http_range(value: Option<&str>, size: u64) -> Result<(u64, u64, bool), ()> {
+#[derive(Debug, PartialEq, Eq)]
+enum SftpHttpRange {
+    Full,
+    Partial { start: u64, end: u64 },
+}
+
+fn parse_sftp_http_range(value: Option<&str>, size: u64) -> Result<SftpHttpRange, ()> {
     let Some(value) = value else {
-        return Ok((0, size.saturating_sub(1), false));
+        return Ok(SftpHttpRange::Full);
     };
     let range = value.strip_prefix("bytes=").ok_or(())?;
     if size == 0 || range.contains(',') {
@@ -2527,7 +2598,7 @@ fn parse_sftp_http_range(value: Option<&str>, size: u64) -> Result<(u64, u64, bo
     if start >= size || end < start {
         return Err(());
     }
-    Ok((start, end, true))
+    Ok(SftpHttpRange::Partial { start, end })
 }
 
 fn sftp_http_content_type(remote_path: &str) -> &'static str {
@@ -2653,7 +2724,7 @@ async fn serve_sftp_http_connection(
         write_sftp_http_error(&mut stream, "404 Not Found", "").await?;
         return Ok(());
     }
-    let Ok((start, end, partial)) = parse_sftp_http_range(request.range.as_deref(), size) else {
+    let Ok(range) = parse_sftp_http_range(request.range.as_deref(), size) else {
         write_sftp_http_error(
             &mut stream,
             "416 Range Not Satisfiable",
@@ -2662,16 +2733,14 @@ async fn serve_sftp_http_connection(
         .await?;
         return Ok(());
     };
-    let content_length = if size == 0 { 0 } else { end - start + 1 };
-    let range_header = if partial {
-        format!("Content-Range: bytes {start}-{end}/{size}\r\n")
-    } else {
-        String::new()
-    };
-    let status = if partial {
-        "206 Partial Content"
-    } else {
-        "200 OK"
+    let (status, start, content_length, range_header) = match range {
+        SftpHttpRange::Full => ("200 OK", 0, size, String::new()),
+        SftpHttpRange::Partial { start, end } => (
+            "206 Partial Content",
+            start,
+            end - start + 1,
+            format!("Content-Range: bytes {start}-{end}/{size}\r\n"),
+        ),
     };
     let headers = format!(
         "HTTP/1.1 {status}\r\nContent-Type: {}\r\nContent-Length: {content_length}\r\nAccept-Ranges: bytes\r\n{range_header}Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n",
@@ -2679,6 +2748,7 @@ async fn serve_sftp_http_connection(
     );
     stream.write_all(headers.as_bytes()).await?;
     if !request.head && content_length > 0 {
+        let end = start + content_length - 1;
         stream_sftp_http_range(&mut stream, sftp, &remote_path, start, end).await?;
     }
     Ok(())
@@ -3109,6 +3179,7 @@ pub async fn start_ssh_shell(key: String, pty_type: String) -> Result<(), SshErr
             80,
             24,
             ShellDelivery::ReactNative,
+            None,
         )
         .await
     })

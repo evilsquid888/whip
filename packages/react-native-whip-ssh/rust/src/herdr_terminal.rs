@@ -12,14 +12,16 @@ use parking_lot::{Mutex, RwLock};
 use tokio::sync::oneshot;
 
 use crate::herdr_codec::{
-    self, CodecError, HerdrTerminalEncoding, MAX_FRAME_BYTES, ServerMessage, decode,
-    validate_protocol,
+    self, CodecError, HerdrTerminalEncoding, MAX_FRAME_BYTES, ScrollDirection, ServerMessage,
+    decode, validate_protocol,
 };
 use crate::herdr_connection::{HerdrConnection, HerdrStream, HerdrStreamFraming, HerdrStreamKind};
 
 pub use crate::herdr_codec::{HerdrTerminalAttachLaunchMode, HerdrTerminalNotificationKind};
 
 const WELCOME_TIMEOUT: Duration = Duration::from_secs(15);
+const TERMINAL_TAKEN_OVER_REASON: &str = "terminal attach taken over";
+const DEFAULT_CLOSE_REASON: &str = "Herdr remote-client-bridge closed";
 
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum HerdrTerminalControlEvent {
@@ -244,14 +246,24 @@ impl Bridge {
     }
 
     fn handle_frame(&self, bytes: &[u8]) {
-        let message = match decode(bytes, self.protocol) {
+        let state = self.state.lock().clone();
+        let delivery_generation = match &state {
+            ProtocolState::Attached(terminal) => {
+                crate::terminal_delivery::generation(&self.client_key, terminal)
+            }
+            _ => 0,
+        };
+        let decoded = {
+            let _trace = crate::ssh::AndroidTraceSlice::begin(c"Whip terminal Rust frame decode");
+            decode(bytes, self.protocol)
+        };
+        let message = match decoded {
             Ok(message) => message,
             Err(error) => {
                 self.protocol_failure(error.into());
                 return;
             }
         };
-        let state = self.state.lock().clone();
         match state {
             ProtocolState::AwaitingWelcome => self.handle_welcome(message),
             ProtocolState::Ready | ProtocolState::Closing | ProtocolState::Closed => {
@@ -260,7 +272,7 @@ impl Bridge {
             }
             ProtocolState::Attached(terminal_id) => {
                 if !matches!(message, ServerMessage::Welcome { .. }) {
-                    self.dispatch(&terminal_id, message);
+                    self.dispatch(&terminal_id, message, delivery_generation);
                 }
             }
         }
@@ -305,7 +317,10 @@ impl Bridge {
         }
     }
 
-    fn dispatch(&self, terminal_id: &str, message: ServerMessage) {
+    fn dispatch(&self, terminal_id: &str, message: ServerMessage, delivery_generation: u64) {
+        if active_herdr_terminal_bridge_id(&self.client_key, terminal_id) != Some(self.id) {
+            return;
+        }
         if let ServerMessage::KittyKeyboardReportAll { enabled } = &message {
             crate::host_runtime::terminal_kitty_keyboard_report_all_changed(
                 &self.client_key,
@@ -318,12 +333,13 @@ impl Bridge {
         let sink = event_sink().read().clone();
         let Some(sink) = sink else {
             EVENT_SINK_INFLIGHT.fetch_sub(1, Ordering::SeqCst);
-            if matches!(message, ServerMessage::Closed { .. }) {
+            if let ServerMessage::Closed { reason } = message {
+                self.emit_closed_to(terminal_id, reason, None);
                 self.close_transport();
             }
             return;
         };
-        self.dispatch_to(terminal_id, message, sink.as_ref());
+        self.dispatch_to(terminal_id, message, sink.as_ref(), delivery_generation);
         EVENT_SINK_INFLIGHT.fetch_sub(1, Ordering::SeqCst);
     }
 
@@ -332,6 +348,7 @@ impl Bridge {
         terminal_id: &str,
         message: ServerMessage,
         sink: &dyn HerdrTerminalEventSink,
+        delivery_generation: u64,
     ) {
         match message {
             ServerMessage::Terminal {
@@ -340,24 +357,42 @@ impl Bridge {
                 height,
                 full,
                 bytes,
-            } => sink.terminal_frame(
-                self.client_key.clone(),
-                terminal_id.to_owned(),
-                sequence,
-                width,
-                height,
-                full,
-                STANDARD.encode(bytes),
-            ),
+            } => {
+                if crate::terminal_delivery::deliver_bytes(
+                    &self.client_key,
+                    terminal_id,
+                    &bytes,
+                    Some((sequence, full)),
+                    delivery_generation,
+                    (self.id, 0),
+                ) {
+                    return;
+                }
+                sink.terminal_frame(
+                    self.client_key.clone(),
+                    terminal_id.to_owned(),
+                    sequence,
+                    width,
+                    height,
+                    full,
+                    STANDARD.encode(bytes),
+                );
+            }
             ServerMessage::Graphics { bytes } => {
+                if crate::terminal_delivery::deliver_bytes(
+                    &self.client_key,
+                    terminal_id,
+                    &bytes,
+                    None,
+                    delivery_generation,
+                    (self.id, 0),
+                ) {
+                    return;
+                }
                 sink.graphics_frame(self.client_key.clone(), terminal_id.to_owned(), bytes);
             }
             ServerMessage::Closed { reason } => {
-                self.emit_control(
-                    sink,
-                    terminal_id,
-                    HerdrTerminalControlEvent::Closed { reason },
-                );
+                self.emit_closed_to(terminal_id, reason, Some(sink));
                 self.close_transport();
             }
             ServerMessage::Notify { kind, text, body } => self.emit_control(
@@ -395,11 +430,22 @@ impl Bridge {
                 terminal_id,
                 HerdrTerminalControlEvent::PrefixInputSource { enabled },
             ),
-            ServerMessage::TerminalBell { count } => self.emit_control(
-                sink,
-                terminal_id,
-                HerdrTerminalControlEvent::TerminalBell { count },
-            ),
+            ServerMessage::TerminalBell { count } => {
+                if !crate::terminal_delivery::deliver_bytes(
+                    &self.client_key,
+                    terminal_id,
+                    &vec![7; usize::from(count)],
+                    None,
+                    delivery_generation,
+                    (self.id, 0),
+                ) {
+                    self.emit_control(
+                        sink,
+                        terminal_id,
+                        HerdrTerminalControlEvent::TerminalBell { count },
+                    );
+                }
+            }
             ServerMessage::EndpointControl { .. } | ServerMessage::Ignored { .. } => {
                 self.emit_control(sink, terminal_id, HerdrTerminalControlEvent::Ignored);
             }
@@ -420,25 +466,41 @@ impl Bridge {
         let Some(terminal_id) = self.terminal_id() else {
             return;
         };
-        if crate::host_runtime::terminal_bridge_closed(
-            &self.client_key,
-            &terminal_id,
-            self.id,
-            reason.clone(),
-        ) {
+        EVENT_SINK_INFLIGHT.fetch_add(1, Ordering::SeqCst);
+        let sink = event_sink().read().clone();
+        self.emit_closed_to(&terminal_id, Some(reason), sink.as_deref());
+        EVENT_SINK_INFLIGHT.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    fn emit_closed_to(
+        &self,
+        terminal_id: &str,
+        reason: Option<String>,
+        sink: Option<&dyn HerdrTerminalEventSink>,
+    ) {
+        // An explicit server close must enter the same Rust recovery path as
+        // channel EOF, including while React is detached. A deliberate takeover
+        // still belongs to client arbitration so two clients cannot fight over
+        // the same terminal by automatically reclaiming it.
+        if reason.as_deref() != Some(TERMINAL_TAKEN_OVER_REASON)
+            && crate::host_runtime::terminal_bridge_closed(
+                &self.client_key,
+                terminal_id,
+                self.id,
+                reason
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_CLOSE_REASON.to_owned()),
+            )
+        {
             return;
         }
-        EVENT_SINK_INFLIGHT.fetch_add(1, Ordering::SeqCst);
-        if let Some(sink) = event_sink().read().clone() {
+        if let Some(sink) = sink {
             self.emit_control(
-                sink.as_ref(),
-                &terminal_id,
-                HerdrTerminalControlEvent::Closed {
-                    reason: Some(reason),
-                },
+                sink,
+                terminal_id,
+                HerdrTerminalControlEvent::Closed { reason },
             );
         }
-        EVENT_SINK_INFLIGHT.fetch_sub(1, Ordering::SeqCst);
     }
 
     fn protocol_failure(&self, error: HerdrBridgeError) {
@@ -804,7 +866,12 @@ pub fn herdr_terminal_scroll(
     modifiers: u8,
 ) -> Result<(), HerdrBridgeError> {
     let bridge = require_active_bridge(&client_key, &terminal_id)?;
-    let payload = herdr_codec::scroll(up, lines, column, row, modifiers)?;
+    let direction = if up {
+        ScrollDirection::Up
+    } else {
+        ScrollDirection::Down
+    };
+    let payload = herdr_codec::scroll(direction, lines, column, row, modifiers)?;
     bridge
         .stream()?
         .write(payload)
@@ -1031,6 +1098,7 @@ mod tests {
                 bytes: vec![0, 255, 16, 32, 127],
             },
             &sink,
+            0,
         );
 
         assert_eq!(*sink.terminal_frames.lock(), ["AP8QIH8="]);
@@ -1100,7 +1168,7 @@ mod tests {
             ),
         ];
         for (message, _) in &cases {
-            bridge.dispatch_to("term1", message.clone(), &sink);
+            bridge.dispatch_to("term1", message.clone(), &sink, 0);
         }
         let events = sink.controls.lock();
         assert_eq!(events.len(), cases.len());

@@ -8,8 +8,8 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
 
-const CONTROL_TIMEOUT_MS: u64 = 15_000;
-const MAX_CONTROL_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const CONTROL_TIMEOUT_MS: u64 = 15_000;
+pub(crate) const MAX_CONTROL_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Enum)]
 #[serde(rename_all = "snake_case")]
@@ -41,6 +41,7 @@ pub enum HerdrAgentKind {
     Codex,
     #[serde(rename = "opencode")]
     OpenCode,
+    Pi,
 }
 
 impl HerdrAgentKind {
@@ -49,6 +50,7 @@ impl HerdrAgentKind {
             Self::Claude => "claude",
             Self::Codex => "codex",
             Self::OpenCode => "opencode",
+            Self::Pi => "pi",
         }
     }
 }
@@ -91,6 +93,7 @@ pub enum HerdrIntegrationState {
     NotInstalled,
     Current,
     Outdated,
+    NeedsRepair,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, uniffi::Record)]
@@ -222,6 +225,9 @@ pub struct HerdrTabInfo {
     pub workspace_id: String,
     pub number: f64,
     pub label: String,
+    /// None on older servers until an explicit create/rename establishes origin.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label_is_custom: Option<bool>,
     pub focused: bool,
     pub pane_count: f64,
     pub agent_status: HerdrAgentStatus,
@@ -995,6 +1001,9 @@ fn next_request_id(client_key: &str) -> String {
 }
 
 fn transport_error(error: HerdrConnectionError) -> HerdrControlError {
+    if matches!(error, HerdrConnectionError::Disabled) {
+        return HerdrControlError::InvalidField(error.to_string());
+    }
     let timed_out = error.is_timeout();
     let message = error.to_string();
     if timed_out {
@@ -1609,6 +1618,11 @@ pub(crate) fn tab(value: &Value, label: &str) -> Result<HerdrTabInfo, String> {
             &format!("{label}.number"),
         )?,
         label: required_string(item, "label", &format!("{label}.label"))?,
+        label_is_custom: optional_bool(
+            item,
+            "label_is_custom",
+            &format!("{label}.label_is_custom"),
+        )?,
         focused: bool_value(
             required(item, "focused", &format!("{label}.focused"))?,
             &format!("{label}.focused"),
@@ -2212,7 +2226,7 @@ mod tests {
         );
         let response = parse_response(
             &request,
-            br#"{"id":"android_8","result":{"type":"integration_list","integrations":[{"target":"codex","label":"Codex","command":"codex","available":true,"state":"current"},{"target":"opencode","label":"OpenCode","command":"opencode","available":true,"state":"outdated"}]}}"#,
+            br#"{"id":"android_8","result":{"type":"integration_list","integrations":[{"target":"codex","label":"Codex","command":"codex","available":true,"state":"current"},{"target":"opencode","label":"OpenCode","command":"opencode","available":true,"state":"outdated"},{"target":"claude","label":"Claude","command":"claude","available":true,"state":"needs_repair"}]}}"#,
         )
         .unwrap();
         assert_eq!(
@@ -2232,6 +2246,13 @@ mod tests {
                         command: "opencode".to_owned(),
                         available: true,
                         state: HerdrIntegrationState::Outdated,
+                    },
+                    HerdrIntegrationInfo {
+                        target: "claude".to_owned(),
+                        label: "Claude".to_owned(),
+                        command: "claude".to_owned(),
+                        available: true,
+                        state: HerdrIntegrationState::NeedsRepair,
                     },
                 ],
             }

@@ -1,4 +1,4 @@
-import AsyncStorage from '@react-native-async-storage/async-storage';
+import { appStorage } from './appStorage';
 import type { RuntimeRemoteTextAnchor } from 'react-native-whip-ssh';
 
 import {
@@ -34,6 +34,8 @@ export interface RemotePagedTextProgress {
   kind: 'paged-text';
   anchor: RuntimeRemoteTextAnchor;
   offsetY: number;
+  /** The saved page must be located again because its byte offset is stale. */
+  reanchor?: boolean;
 }
 
 export type RemoteContentProgress = RemoteMediaProgress | RemoteTextProgress | RemotePagedTextProgress;
@@ -50,7 +52,7 @@ export async function loadRemoteContentProgress(
 ): Promise<RemoteContentProgress | null> {
   let value: string | null;
   try {
-    value = await AsyncStorage.getItem(remoteContentProgressKey(identity));
+    value = await appStorage.getItem(remoteContentProgressKey(identity));
   } catch (error) {
     recordProgressStorageFailure('storage-read-failed', 'getItem', error);
     return null;
@@ -58,14 +60,23 @@ export async function loadRemoteContentProgress(
   if (value === null) return null;
   try {
     const stored = JSON.parse(value) as Partial<StoredRemoteContentProgress>;
-    if (
-      stored.fileSize !== identity.fileSize
-      || stored.modificationDate !== identity.modificationDate
-    ) {
-      return null;
-    }
-    if (!isRemoteContentProgress(stored.progress)) {
+    if (!isFiniteNonNegative(stored.fileSize)
+      || typeof stored.modificationDate !== 'string'
+      || !isRemoteContentProgress(stored.progress)) {
       throw new TypeError('Stored remote content progress is malformed');
+    }
+    const changed = stored.fileSize !== identity.fileSize
+      || stored.modificationDate !== identity.modificationDate;
+    if (changed) {
+      switch (stored.progress.kind) {
+        case 'text':
+          // Keep the same offset rather than scaling it with the edited file.
+          return { ...stored.progress, contentWidth: 0, contentHeight: 0 };
+        case 'paged-text':
+          return { ...stored.progress, reanchor: true };
+        case 'media':
+          return null;
+      }
     }
     if (stored.progress.kind === 'paged-text'
       && stored.progress.anchor.byteOffset >= Math.max(1, identity.fileSize)) {
@@ -95,7 +106,7 @@ export async function saveRemoteContentProgress(
     progress,
   };
   try {
-    await AsyncStorage.setItem(remoteContentProgressKey(identity), JSON.stringify(stored));
+    await appStorage.setItem(remoteContentProgressKey(identity), JSON.stringify(stored));
   } catch (error) {
     recordProgressStorageFailure('storage-write-failed', 'setItem', error);
     throw error;
@@ -106,7 +117,7 @@ export async function clearRemoteContentProgress(
   identity: RemoteContentIdentity,
 ): Promise<void> {
   try {
-    await AsyncStorage.removeItem(remoteContentProgressKey(identity));
+    await appStorage.removeItem(remoteContentProgressKey(identity));
   } catch (error) {
     recordProgressStorageFailure('storage-remove-failed', 'removeItem', error);
     throw error;

@@ -25,9 +25,10 @@ function eventTarget() {
 type ElementStub = ReturnType<typeof eventTarget> & {
   textContent: string;
   style: { display: string; setProperty: ReturnType<typeof jest.fn> };
-  classList: { contains: (name: string) => boolean; remove: (name: string) => boolean };
+  classList: { contains: (name: string) => boolean; remove: (name: string) => boolean; toggle: (name: string, enabled: boolean) => void };
   closest: () => ElementStub;
   querySelector: (selector: string) => ElementStub;
+  querySelectorAll: (selector: string) => ElementStub[];
   getBoundingClientRect: () => { width: number; height: number; top: number; bottom: number };
 };
 
@@ -46,12 +47,14 @@ async function runtime(asset: string, userAgent: string) {
       classList: {
         contains: (name: string) => classNames.has(name),
         remove: (name: string) => classNames.delete(name),
+        toggle: (name: string, enabled: boolean) => { if (enabled) classNames.add(name); else classNames.delete(name); },
       },
       closest: () => root,
       querySelector: (selector: string): ElementStub => {
         if (!nodes.has(selector)) nodes.set(selector, element());
         return nodes.get(selector)!;
       },
+      querySelectorAll: () => [],
       getBoundingClientRect: () => ({ ...geometry, left: 0, top: 0, bottom: geometry.height }),
     };
   }
@@ -78,7 +81,7 @@ async function runtime(asset: string, userAgent: string) {
     cols: 0,
     rows: 0,
     buffer: { active: { type: 'normal', baseY: 0, viewportY: 0 }, onBufferChange: jest.fn() },
-    modes: { mouseTrackingMode: 'none' },
+    modes: { mouseTrackingMode: 'none', applicationCursorKeysMode: false },
     parser: { registerOscHandler: jest.fn() },
     loadAddon: (addon: { activate?: (term: Terminal) => void }) => addon.activate?.(terminal as unknown as Terminal),
     open: jest.fn(),
@@ -97,6 +100,7 @@ async function runtime(asset: string, userAgent: string) {
     scrollToBottom: jest.fn(),
     attachCustomKeyEventHandler: jest.fn(),
     onData: jest.fn(),
+    onWriteParsed: jest.fn(),
     onCursorMove: jest.fn(),
     onRender: jest.fn(),
     onResize: (listener: typeof resizeListener) => { resizeListener = listener; },
@@ -163,6 +167,20 @@ describe.each([
   beforeEach(() => jest.useFakeTimers());
   afterEach(() => jest.useRealTimers());
   const setup = () => runtime(asset, platform);
+
+  test('reports application cursor mode only when it changes', async () => {
+    const state = await setup();
+    const written = state.terminal.onWriteParsed.mock.calls[0][0];
+    state.report.mockClear();
+    written();
+    written();
+    state.terminal.modes.applicationCursorKeysMode = true;
+    written();
+    expect(state.report.mock.calls.map(([message]) => message)).toEqual([
+      { type: 'keyboard-modes', applicationCursorKeys: false },
+      { type: 'keyboard-modes', applicationCursorKeys: true },
+    ]);
+  });
   const greeting = 'Hi! What would you like to work on?';
   const wrappedGreeting = 'Hi! What would you like to\n  work on?';
   const selectGreeting = (state: Awaited<ReturnType<typeof setup>>) => {
@@ -235,6 +253,85 @@ describe.each([
     expect(state.report).toHaveBeenLastCalledWith({
       type: 'clipboard-write', text: greeting,
     });
+  });
+
+  test.each(['normal', 'alternate'])('mouse-tracking TUIs accept taps automatically in the %s buffer', async bufferType => {
+    const state = await setup();
+    state.terminal.buffer.active.type = bufferType;
+    state.terminal.modes.mouseTrackingMode = 'drag';
+    state.report.mockClear();
+
+    state.touch('touchstart', 200);
+    state.touch('touchend', 200);
+
+    expect(state.wheelEvents).toEqual([
+      expect.objectContaining({ type: 'mousedown', buttons: 1, clientX: 44, clientY: 200 }),
+      expect.objectContaining({ type: 'mouseup', buttons: 0, clientX: 44, clientY: 200 }),
+    ]);
+    expect(state.terminal.focus).not.toHaveBeenCalled();
+    expect(state.report.mock.calls.filter(([message]) => message.type === 'input')).toEqual([]);
+  });
+
+  test('Herdr mouse capture translates taps to press and release at terminal cell coordinates', async () => {
+    const state = await setup();
+    state.api.herdrSetApplicationMouseCapture(true);
+    state.terminal.cols = 80;
+    state.terminal.rows = 24;
+    Object.assign(state.terminal.element.querySelector('.xterm-screen'), {
+      getBoundingClientRect: () => ({ left: 20, top: 80, width: 800, height: 480 }),
+    });
+    state.report.mockClear();
+
+    state.touch('touchstart', 200);
+    state.touch('touchend', 200);
+
+    expect(state.terminal.modes.mouseTrackingMode).toBe('none');
+    expect(state.wheelEvents).toEqual([]);
+    expect(state.report.mock.calls.filter(([message]) => message.type === 'input')).toEqual([
+      [{ type: 'input', data: '\u001b[<0;3;7M' }],
+      [{ type: 'input', data: '\u001b[<0;3;7m' }],
+    ]);
+    expect(state.terminal.focus).not.toHaveBeenCalled();
+  });
+
+  test('tap handling follows changes to xterm tracking and Herdr capture', async () => {
+    const state = await setup();
+    const tap = () => {
+      state.touch('touchstart', 200);
+      state.touch('touchend', 200);
+    };
+    state.terminal.modes.mouseTrackingMode = 'drag';
+    tap();
+    expect(state.wheelEvents).toHaveLength(2);
+
+    state.terminal.modes.mouseTrackingMode = 'none';
+    tap();
+    expect(state.wheelEvents).toHaveLength(2);
+
+    state.api.herdrSetApplicationMouseCapture(true);
+    state.report.mockClear();
+    tap();
+    expect(state.report.mock.calls.filter(([message]) => message.type === 'input')).toHaveLength(2);
+
+    state.api.herdrSetApplicationMouseCapture(false);
+    state.report.mockClear();
+    tap();
+    expect(state.wheelEvents).toHaveLength(2);
+    expect(state.report.mock.calls.filter(([message]) => message.type === 'input')).toEqual([]);
+  });
+
+  test.each(['xterm', 'Herdr'])('offline taps do not reach a mouse-capturing %s application', async source => {
+    const state = await setup();
+    state.api.herdrConfigure({ offlineScrollback: true });
+    if (source === 'xterm') state.terminal.modes.mouseTrackingMode = 'drag';
+    else state.api.herdrSetApplicationMouseCapture(true);
+    state.report.mockClear();
+
+    state.touch('touchstart', 200);
+    state.touch('touchend', 200);
+
+    expect(state.wheelEvents).toEqual([]);
+    expect(state.report.mock.calls.filter(([message]) => message.type === 'input')).toEqual([]);
   });
 
   test.each([false, true])('local selection stays available for ordinary and offline terminals: offline=%s', async offlineScrollback => {
@@ -508,9 +605,9 @@ describe.each([
     expect(state.wheelEvents.map(event => event.deltaY)).toEqual([-1, -1]);
   });
 
-  test('forced mouse mode sends swipe wheel input at the touched cell', async () => {
+  test('Herdr application mouse capture sends swipe wheel input at the touched cell', async () => {
     const state = await setup();
-    state.api.herdrSetForcedMouseInput(true);
+    state.api.herdrSetApplicationMouseCapture(true);
     state.api.herdrSetVisualInsets({ top: 80, bottom: 140 });
     state.report.mockClear();
     state.touch('touchstart', 200);
@@ -525,7 +622,7 @@ describe.each([
     state.api.herdrConfigure({ localScrollback: true, offlineScrollback });
     if (offlineScrollback) {
       state.terminal.modes.mouseTrackingMode = 'any';
-      state.api.herdrSetForcedMouseInput(true);
+      state.api.herdrSetApplicationMouseCapture(true);
     }
     state.api.herdrSetVisualInsets({ top: 80, bottom: 140 });
     Object.assign(state.terminal.buffer.active, { baseY: 10, viewportY: 5 });

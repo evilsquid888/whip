@@ -7,7 +7,6 @@ import type {
 
 import { useAgentChatOpen } from '../src/hooks/useAgentChatOpen';
 import { agentTranscriptService } from '../src/services/NativeTranscriptService';
-import { agentChatCache } from '../src/services/agentChatCache';
 import type { HerdrClient } from '../src/services/HerdrClient';
 import type { HerdrSnapshot, PaneInfo } from '../src/types';
 import type { ChatAgent } from '../src/lib/agentChatSession';
@@ -102,7 +101,6 @@ function mount(host: ReturnType<typeof remote>) {
 
 beforeEach(() => {
   jest.spyOn(console, 'info').mockImplementation(() => {});
-  jest.spyOn(agentChatCache, 'loadNative').mockResolvedValue(null);
 });
 afterEach(() => {
   act(() => renderer?.unmount());
@@ -110,7 +108,7 @@ afterEach(() => {
   jest.restoreAllMocks();
 });
 
-describe.each(['codex', 'opencode'] as const)(
+describe.each(['codex', 'opencode', 'pi'] as const)(
   '%s shared explicit Chat open',
   agent => {
     test('persistent native no-chat with valid-looking JS identity shows remediation and settles loading', async () => {

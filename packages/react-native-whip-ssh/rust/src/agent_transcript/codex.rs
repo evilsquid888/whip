@@ -5,6 +5,29 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use super::history_gate::{
+    InitialHistoryGate, advance_revision, next_status_update, status_update,
+};
+use super::jsonl::{
+    CodexBindResult, CodexIngestResult, CodexSourceIdentity, FileSourceCursor,
+    TranscriptJsonlFramer, TranscriptParseError,
+};
+use super::metadata::{CodexUsageTracker, tool_duration, tool_input_json};
+use super::model::{
+    AgentCacheError, AgentField, AgentFileDiff, AgentMessageRole, AgentNoticeLevel,
+    AgentScalarValue, AgentTokenUsage, AgentToolState, AgentToolStatus, AgentTranscriptDelta,
+    AgentTranscriptDetails, AgentTranscriptInfo, AgentTranscriptKind, AgentTranscriptMessage,
+    AgentTranscriptPart, AgentTranscriptState, AgentTranscriptStatus, AgentTranscriptTurn,
+    AgentTranscriptUpdate, AgentTranscriptView, AgentTurnOutcome,
+};
+#[cfg(test)]
+use super::opencode::OpenCodeSessionCore;
+use super::projection::{
+    ParsedToolResult, canonical_tool_input, command_title, detail, fields, fields_with_cwd,
+    format_plan, injected_user_context, legacy_change_files, nonempty, object, parse_tool_status,
+    project_turns, put_field, questions_from_input, scalar_fields, text_content, timestamp_ms,
+    tool_result, translate_tool, unified_diff_files, user_content, user_prompt_parts,
+};
 use crate::codex::rollout_reducer::CodexProjectionChanges;
 use crate::codex::rollout_wire::{
     CodexHistoryMode, Event as CodexEvent, ResponseItem as CodexResponseItem, TurnContext,
@@ -12,18 +35,13 @@ use crate::codex::rollout_wire::{
 };
 use crate::codex::{CodexRolloutReducer, RolloutRecord, decode_rollout_record};
 
-use super::history_gate::{
-    InitialHistoryGate, advance_revision, next_status_update, status_update,
-};
-use super::jsonl::*;
-use super::metadata::{CodexUsageTracker, tool_duration, tool_input_json};
-use super::model::*;
-#[cfg(test)]
-use super::opencode::OpenCodeSessionCore;
-use super::projection::*;
-
 const UNSUPPORTED_HISTORY_MODE: &str = "Unsupported Codex SessionMeta.history_mode";
 const CODEX_CACHE_SCHEMA_VERSION: u32 = 4;
+
+#[cfg(test)]
+mod benchmark;
+#[cfg(test)]
+mod metadata_tests;
 
 #[derive(Clone, Debug)]
 struct ToolLocation {
@@ -46,6 +64,8 @@ pub struct CodexTranscriptAdapter {
     usage_tracker: CodexUsageTracker,
     session_id: String,
     directory: Option<String>,
+    prompt_title: Option<String>,
+    native_title: Option<String>,
     messages: Vec<AgentTranscriptMessage>,
     message_indexes: HashMap<String, usize>,
     tools: HashMap<String, ToolLocation>,
@@ -68,6 +88,8 @@ impl CodexTranscriptAdapter {
             usage_tracker: CodexUsageTracker::default(),
             session_id,
             directory: None,
+            prompt_title: None,
+            native_title: None,
             messages: Vec::new(),
             message_indexes: HashMap::new(),
             tools: HashMap::new(),
@@ -87,8 +109,9 @@ impl CodexTranscriptAdapter {
     }
 
     fn accept_incremental(&mut self, value: &Value) -> CodexAdapterUpdate {
-        let previous_session_id = self.session_id.clone();
-        let previous_directory = self.directory.clone();
+        // Compare metadata where it changes; ordinary content records must not
+        // copy session identity, directory, or title just to detect a change.
+        let mut info_changed = false;
         self.sequence = self.sequence.saturating_add(1);
         let decoded = decode_rollout_record(value);
         let record = value.as_object();
@@ -116,15 +139,14 @@ impl CodexTranscriptAdapter {
             RolloutRecord::SessionMeta(payload) if selecting_mode => {
                 self.provider.clone_from(&payload.model_provider);
                 if let Some(id) = payload.id.as_ref().filter(|id| !id.is_empty()) {
+                    info_changed |= self.session_id != *id;
                     self.session_id.clone_from(id);
                 }
-                if let Some(cwd) = payload.cwd.as_ref().filter(|cwd| !cwd.is_empty()) {
-                    self.directory = Some(cwd.clone());
-                }
+                info_changed |= self.update_directory(payload.cwd.as_deref());
                 true
             }
             RolloutRecord::TurnContext(context) => {
-                self.accept_context(context, legacy);
+                info_changed |= self.accept_context(context, legacy);
                 true
             }
             RolloutRecord::Event(CodexEvent::ItemCompleted(completed)) => {
@@ -212,6 +234,7 @@ impl CodexTranscriptAdapter {
                                 object(record.get("thread"))
                                     .and_then(|thread| nonempty(thread.get("id")))
                             }) {
+                                info_changed |= self.session_id != id;
                                 id.clone_into(&mut self.session_id);
                             }
                             true
@@ -241,9 +264,20 @@ impl CodexTranscriptAdapter {
         };
         let handled =
             handled || (selecting_mode && self.history_mode != CodexHistoryMode::Unselected);
+        // Native custom thread names live in session_index.jsonl / SQLite, not
+        // SessionMeta. Derive only from the history we already project. Revisit
+        // the first prompt after rollback; a source reset creates a fresh adapter.
+        if self.prompt_title.is_none()
+            || matches!(
+                decoded,
+                RolloutRecord::Event(CodexEvent::ThreadRolledBack(_))
+            )
+        {
+            let prompt_title = super::title::first_prompt_title(self.projected_messages());
+            info_changed |= self.native_title.is_none() && self.prompt_title != prompt_title;
+            self.prompt_title = prompt_title;
+        }
         let mut deltas = Vec::new();
-        let info_changed =
-            previous_session_id != self.session_id || previous_directory != self.directory;
         if info_changed {
             deltas.push(AgentTranscriptDelta::InfoChanged {
                 info: Some(self.info()),
@@ -291,11 +325,17 @@ impl CodexTranscriptAdapter {
     fn info(&self) -> AgentTranscriptInfo {
         AgentTranscriptInfo {
             id: self.session_id.clone(),
-            title: None,
+            title: self.title().map(str::to_owned),
             directory: self.directory.clone(),
             created_at_ms: None,
             updated_at_ms: None,
         }
+    }
+
+    fn title(&self) -> Option<&str> {
+        self.native_title
+            .as_deref()
+            .or(self.prompt_title.as_deref())
     }
 
     fn projected_messages(&self) -> &[AgentTranscriptMessage] {
@@ -315,19 +355,24 @@ impl CodexTranscriptAdapter {
         self.rollout_reducer.unsupported_counts()
     }
 
+    fn effective_status(&self, status: AgentTranscriptStatus) -> AgentTranscriptStatus {
+        if self.history_mode == CodexHistoryMode::Unsupported {
+            AgentTranscriptStatus::Unavailable
+        } else {
+            status
+        }
+    }
+
     pub fn snapshot(
         &self,
         revision: u64,
         status: AgentTranscriptStatus,
         error: Option<String>,
     ) -> AgentTranscriptState {
-        let (status, error) = if self.history_mode == CodexHistoryMode::Unsupported {
-            (
-                AgentTranscriptStatus::Unavailable,
-                Some(UNSUPPORTED_HISTORY_MODE.to_owned()),
-            )
+        let error = if self.history_mode == CodexHistoryMode::Unsupported {
+            Some(UNSUPPORTED_HISTORY_MODE.to_owned())
         } else {
-            (status, error)
+            error
         };
         let messages = self.projected_messages().to_vec();
         let turns = self
@@ -338,7 +383,7 @@ impl CodexTranscriptAdapter {
             session_id: self.session_id.clone(),
             agent: AgentTranscriptKind::Codex,
             revision,
-            status,
+            status: self.effective_status(status),
             info: Some(self.info()),
             messages,
             turns,
@@ -378,11 +423,20 @@ impl CodexTranscriptAdapter {
         self.active_assistant_message_id = None;
     }
 
-    fn accept_context(&mut self, context: &TurnContext, legacy: bool) {
-        self.model.clone_from(&context.model);
-        if let Some(cwd) = context.cwd.as_ref().filter(|cwd| !cwd.is_empty()) {
-            self.directory = Some(cwd.clone());
+    fn update_directory(&mut self, directory: Option<&str>) -> bool {
+        let Some(directory) = directory.filter(|directory| !directory.is_empty()) else {
+            return false;
+        };
+        if self.directory.as_deref() == Some(directory) {
+            return false;
         }
+        directory.clone_into(self.directory.get_or_insert_default());
+        true
+    }
+
+    fn accept_context(&mut self, context: &TurnContext, legacy: bool) -> bool {
+        self.model.clone_from(&context.model);
+        let directory_changed = self.update_directory(context.cwd.as_deref());
         if legacy {
             let model = self.model.clone();
             let provider = self.provider.clone();
@@ -396,6 +450,7 @@ impl CodexTranscriptAdapter {
                 details.provider = provider;
             }
         }
+        directory_changed
     }
 
     fn complete_message(&mut self, id: &str, error: Option<String>, at: Option<u64>) {
@@ -1421,7 +1476,13 @@ fn legacy_projection_matches(replay: &AgentTranscriptState, cached: &AgentTransc
     for turn in &mut cached_turns {
         turn.details = None;
     }
-    replay.info == cached.info
+    // Version-one caches predate derived titles; their raw replay owns the title.
+    let mut replay_info = replay.info.clone();
+    if let Some(info) = &mut replay_info {
+        info.title
+            .clone_from(&cached.info.as_ref().and_then(|info| info.title.clone()));
+    }
+    replay_info == cached.info
         && replay_messages == cached_messages
         && project_turns(&replay_messages) == cached_turns
 }
@@ -1531,14 +1592,49 @@ impl CodexSessionCore {
         self.revision
     }
 
+    /// Optional session-index metadata is transient and never added to raw caches.
+    pub(crate) fn update_native_title(
+        &mut self,
+        session_id: &str,
+        title: Option<&str>,
+    ) -> Option<AgentTranscriptUpdate> {
+        if session_id != self.requested_session_id {
+            return None;
+        }
+        let previous = self.adapter.title().map(str::to_owned);
+        self.adapter.native_title = title.and_then(super::title::session_title);
+        if previous.as_deref() == self.adapter.title() {
+            return None;
+        }
+        self.bump_revision();
+        Some(AgentTranscriptUpdate {
+            revision: self.revision,
+            deltas: vec![AgentTranscriptDelta::InfoChanged {
+                info: Some(self.adapter.info()),
+            }],
+        })
+    }
+
     pub fn received_offset(&self) -> u64 {
         self.cursor.framer.received_offset()
+    }
+
+    pub fn status(&self) -> AgentTranscriptStatus {
+        self.adapter.effective_status(self.history_gate.status())
+    }
+
+    pub(crate) fn projection_view(&self) -> Option<AgentTranscriptView<'_>> {
+        Some(AgentTranscriptView {
+            revision: self.revision,
+            messages: self.adapter.projected_messages(),
+            turns: self.adapter.projected_turns()?,
+        })
     }
 
     pub fn state(&self) -> AgentTranscriptState {
         self.adapter.snapshot(
             self.revision,
-            self.history_gate.status(),
+            self.status(),
             self.history_gate.error().map(str::to_owned),
         )
     }
@@ -1859,13 +1955,14 @@ impl CodexSessionCore {
     }
 
     fn status_delta(&self) -> AgentTranscriptDelta {
-        if self.adapter.history_mode == CodexHistoryMode::Unsupported {
-            AgentTranscriptDelta::StatusChanged {
-                status: AgentTranscriptStatus::Unavailable,
-                error: Some(UNSUPPORTED_HISTORY_MODE.to_owned()),
-            }
+        let error = if self.adapter.history_mode == CodexHistoryMode::Unsupported {
+            Some(UNSUPPORTED_HISTORY_MODE.to_owned())
         } else {
-            self.history_gate.status_delta()
+            self.history_gate.error().map(str::to_owned)
+        };
+        AgentTranscriptDelta::StatusChanged {
+            status: self.status(),
+            error,
         }
     }
 
@@ -1877,6 +1974,51 @@ impl CodexSessionCore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{AgentTurnStatus, MAX_TRANSCRIPT_LINE_BYTES};
+
+    #[test]
+    fn status_agrees_with_snapshot_without_allocating() {
+        fn assert_status(core: &CodexSessionCore, expected: AgentTranscriptStatus) {
+            let (status, _, allocations, bytes) =
+                crate::test_allocations::measured(|| std::hint::black_box(core).status());
+            assert_eq!(status, expected);
+            let snapshot = core.state();
+            assert_eq!(status, snapshot.status);
+            assert_eq!(
+                core.status_delta(),
+                AgentTranscriptDelta::StatusChanged {
+                    status,
+                    error: snapshot.error,
+                }
+            );
+            assert_eq!((allocations, bytes), (0, 0));
+        }
+
+        for mode in ["legacy", "paginated", "future"] {
+            let mut core = CodexSessionCore::new("thread");
+            assert_status(&core, AgentTranscriptStatus::Loading);
+
+            let header = history_header(Some(serde_json::json!(mode)));
+            let binding = core.bind_source("/rollout".into(), "1:2".into(), header.len() as u64);
+            core.ingest(binding.source_generation, &header).unwrap();
+            let supported = mode != "future";
+            let expected = |status| {
+                if supported {
+                    status
+                } else {
+                    AgentTranscriptStatus::Unavailable
+                }
+            };
+            assert_status(&core, expected(AgentTranscriptStatus::Live));
+
+            core.mark_stale_update("offline");
+            assert_status(&core, expected(AgentTranscriptStatus::Stale));
+            core.mark_restarting_update("retrying");
+            assert_status(&core, expected(AgentTranscriptStatus::Stale));
+            core.close_update();
+            assert_status(&core, expected(AgentTranscriptStatus::Closed));
+        }
+    }
 
     #[test]
     fn usage_model_outcomes_and_nested_inputs_survive_both_history_modes_and_cache() {
@@ -2346,7 +2488,7 @@ mod tests {
         assert_eq!(reasoning, ["Checked the failure."]);
     }
 
-    fn history_header(mode: Option<Value>) -> Vec<u8> {
+    pub(super) fn history_header(mode: Option<Value>) -> Vec<u8> {
         let mut payload = serde_json::json!({"id":"thread","cwd":"/repo"});
         if let Some(mode) = mode {
             payload["history_mode"] = mode;
@@ -2364,7 +2506,7 @@ mod tests {
         )
     }
 
-    fn history_turn(turn: usize, mode: CodexHistoryMode) -> Vec<u8> {
+    pub(super) fn history_turn(turn: usize, mode: CodexHistoryMode) -> Vec<u8> {
         let mut bytes = record(
             "event_msg",
             serde_json::json!({
@@ -2804,6 +2946,163 @@ mod tests {
     }
 
     #[test]
+    fn paginated_raw_calls_supply_live_activity_without_duplicating_completed_history() {
+        for (call, output_kind, expected_tool) in [
+            (
+                serde_json::json!({"type":"custom_tool_call", "call_id":"call", "name":"exec",
+                "status":"completed", "input":"await Promise.all([tools.exec_command({cmd: 'cargo test'}), tools.apply_patch(patch)]);"}),
+                "custom_tool_call_output",
+                "exec",
+            ),
+            (
+                serde_json::json!({"type":"function_call", "call_id":"call", "name":"exec_command",
+                "arguments":"{\"cmd\":\"cargo test\",\"workdir\":\"/repo\"}"}),
+                "function_call_output",
+                "shell",
+            ),
+            (
+                serde_json::json!({"type":"tool_search_call", "call_id":"call", "execution":"search_tools",
+                "arguments":{"query":"calendar"}}),
+                "tool_search_output",
+                "search_tools",
+            ),
+        ] {
+            let mut prefix = [
+                history_header(Some(serde_json::json!("paginated"))),
+                record(
+                    "event_msg",
+                    serde_json::json!({"type":"task_started","turn_id":"turn"}),
+                ),
+            ]
+            .concat();
+            let mut core = CodexSessionCore::new("thread");
+            let binding = core.bind_source("/rollout".into(), "1:2".into(), prefix.len() as u64);
+            core.ingest(binding.source_generation, &prefix).unwrap();
+            let call = record("response_item", call);
+            let update = core
+                .ingest(binding.source_generation, &call)
+                .unwrap()
+                .update
+                .unwrap();
+            prefix.extend(call);
+            let pending = core.state();
+            let tools = tool_parts(&pending);
+            assert_eq!(tools.len(), 1);
+            assert_eq!((tools[0].0, tools[0].1), ("call", expected_tool));
+            assert_eq!(tools[0].2.status, AgentToolStatus::Running);
+            assert!(tools[0].2.completed_at_ms.is_none());
+            assert!(update.deltas.iter().any(|delta| matches!(delta,
+                AgentTranscriptDelta::MessageUpserted { message, .. }
+                    if matches!(&message.parts[0], AgentTranscriptPart::Tool { state, .. }
+                        if state.status == AgentToolStatus::Running))));
+            if expected_tool == "exec" {
+                assert!(tools[0].2.input.is_empty());
+                assert!(
+                    tools[0]
+                        .2
+                        .input_json
+                        .as_ref()
+                        .unwrap()
+                        .contains("Promise.all")
+                );
+            } else if expected_tool == "shell" {
+                assert!(tools[0].2.input.iter().any(|field| field.key == "command"
+                    && field.value
+                        == AgentScalarValue::String {
+                            value: "cargo test".into()
+                        }));
+            }
+            // Existing raw-only checkpoints reconstruct pending activity on reopen.
+            let mut restored = CodexSessionCore::new("thread");
+            restored.restore_cache(&core.cache_blob().unwrap()).unwrap();
+            assert_eq!(restored.state().messages, pending.messages);
+            assert_eq!(restored.state().turns, pending.turns);
+            let rebound =
+                restored.bind_source("/rollout".into(), "1:2".into(), prefix.len() as u64);
+            let suffix = [
+                record("event_msg", lifecycle_event("item_completed", serde_json::json!({
+                    "type":"CommandExecution", "id":"exec-child", "command":["cargo","test"],
+                    "status":"completed", "aggregated_output":"passed", "exit_code":0,
+                }))),
+                record("response_item", serde_json::json!({"type":output_kind,"call_id":"call","output":"done"})),
+            ].concat();
+            restored.ingest(rebound.source_generation, &suffix).unwrap();
+            let finished = restored.state();
+            let tools = tool_parts(&finished);
+            assert_eq!(tools.len(), 1);
+            assert_eq!((tools[0].0, tools[0].1), ("exec-child", "shell"));
+            assert_eq!(tools[0].2.status, AgentToolStatus::Completed);
+            assert_eq!(finished.turns[0].status, AgentTurnStatus::Working);
+            let replay = parse_codex_chunks(&[prefix, suffix].concat(), 11);
+            assert_eq!(finished.messages, replay.messages);
+            assert_eq!(finished.turns, replay.turns);
+        }
+    }
+
+    #[test]
+    fn paginated_raw_activity_is_scoped_to_call_and_turn_lifecycles() {
+        for terminal_event in [
+            serde_json::json!({"type":"task_complete","turn_id":"turn"}),
+            serde_json::json!({"type":"turn_aborted","turn_id":"turn"}),
+            serde_json::json!({"type":"task_started","turn_id":"next-turn"}),
+            serde_json::json!({"type":"thread_rolled_back","num_turns":1}),
+        ] {
+            let mut adapter = adapter_with_mode(CodexHistoryMode::Paginated);
+            let call = |id| {
+                serde_json::json!({"type":"response_item","payload":{
+                    "type":"function_call","name":"exec_command","call_id":id,"arguments":{"cmd":"sleep 5"}
+                }})
+            };
+            // A call without an active turn cannot create an orphan activity.
+            adapter.accept(&call("orphan"));
+            assert!(adapter.projected_messages().is_empty());
+            adapter.accept(&serde_json::json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"turn"}}));
+            adapter.accept(&call("first"));
+            adapter.accept(&call("second"));
+            adapter.accept(&call("second"));
+            assert_eq!(
+                tool_parts(&adapter.snapshot(1, AgentTranscriptStatus::Live, None)).len(),
+                2
+            );
+            adapter.accept(&serde_json::json!({"type":"response_item","payload":{
+                "type":"function_call_output","call_id":"first","output":"done"
+            }}));
+            let state = adapter.snapshot(1, AgentTranscriptStatus::Live, None);
+            assert_eq!(tool_parts(&state).len(), 1);
+            assert_eq!(tool_parts(&state)[0].0, "second");
+            adapter.accept(&serde_json::json!({"type":"event_msg","payload":terminal_event}));
+            assert!(tool_parts(&adapter.snapshot(1, AgentTranscriptStatus::Live, None)).is_empty());
+        }
+    }
+
+    #[test]
+    fn paginated_native_item_replaces_matching_raw_activity() {
+        let mut adapter = adapter_with_mode(CodexHistoryMode::Paginated);
+        adapter.accept(&serde_json::json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"turn"}}));
+        adapter.accept(&serde_json::json!({"type":"response_item","payload":{
+            "type":"function_call","call_id":"shell","name":"exec_command","arguments":{"cmd":"sleep 5"}
+        }}));
+        let command = serde_json::json!({"type":"CommandExecution","id":"shell","command":["sleep","5"],"status":"in_progress"});
+        adapter.accept(&serde_json::json!({"type":"event_msg","payload":lifecycle_event("item_started", command.clone())}));
+        // Repeated raw starts cannot duplicate an identified native item.
+        adapter.accept(&serde_json::json!({"type":"response_item","payload":{
+            "type":"function_call","call_id":"shell","name":"exec_command","arguments":{"cmd":"sleep 5"}
+        }}));
+        let state = adapter.snapshot(1, AgentTranscriptStatus::Live, None);
+        assert_eq!(tool_parts(&state).len(), 1);
+        assert_eq!(tool_parts(&state)[0].2.status, AgentToolStatus::Running);
+        adapter.accept(&serde_json::json!({"type":"response_item","payload":{
+            "type":"function_call_output","call_id":"shell","output":"done"
+        }}));
+        let mut completed = command;
+        completed["status"] = serde_json::json!("completed");
+        adapter.accept(&serde_json::json!({"type":"event_msg","payload":lifecycle_event("item_completed", completed)}));
+        let state = adapter.snapshot(1, AgentTranscriptStatus::Live, None);
+        assert_eq!(tool_parts(&state).len(), 1);
+        assert_eq!(tool_parts(&state)[0].2.status, AgentToolStatus::Completed);
+    }
+
+    #[test]
     fn paginated_tool_start_is_published_and_completion_updates_in_place() {
         let mut core = CodexSessionCore::new("thread");
         let binding = core.bind_source("/rollout".into(), "1:2".into(), 0);
@@ -3109,7 +3408,15 @@ mod tests {
         let binding = core.bind_source("/rollout".into(), "1:2".into(), 0);
         core.ingest(binding.source_generation, &lines[..5].concat())
             .unwrap();
-        assert!(tool_parts(&core.state()).is_empty());
+        let state = core.state();
+        let tools = tool_parts(&state);
+        assert_eq!(tools.len(), 1);
+        assert_eq!(
+            (tools[0].0, tools[0].1),
+            ("call-fruit", "request_user_input_async")
+        );
+        assert_eq!(tools[0].2.status, AgentToolStatus::Running);
+        assert_eq!(tools[0].2.questions[0].question, "Orange or apple?");
         let update = core
             .ingest(binding.source_generation, lines[5])
             .unwrap()
@@ -3227,9 +3534,14 @@ mod tests {
         core.ingest(binding.source_generation, &lines[..4].concat())
             .unwrap();
         // Upstream rollout policy does not persist item_started or web_search_begin.
-        // An opaque exec script cannot establish the nested search's identity.
-        assert!(tool_parts(&core.state()).is_empty());
-        for (index, line) in lines[4..].iter().enumerate() {
+        // The outer call supplies activity without guessing a nested search ID.
+        let state = core.state();
+        let tools = tool_parts(&state);
+        assert_eq!(tools.len(), 1);
+        assert_eq!((tools[0].0, tools[0].1), ("outer-call", "exec"));
+        assert_eq!(tools[0].2.status, AgentToolStatus::Running);
+        assert!(tools[0].2.input.is_empty());
+        for (index, line) in lines[4..6].iter().enumerate() {
             let update = core
                 .ingest(binding.source_generation, line)
                 .unwrap()
@@ -3237,9 +3549,10 @@ mod tests {
                 .unwrap();
             assert!(update.deltas.iter().any(|delta| matches!(delta,
                 AgentTranscriptDelta::MessageUpserted { message, .. }
-                    if message.parts.len() == index + 2
+                    if message.parts.len() == index + 3
             )));
         }
+        core.ingest(binding.source_generation, lines[6]).unwrap();
         let state = core.state();
         let tools = tool_parts(&state);
         assert_eq!(tools.len(), 2);
@@ -4276,5 +4589,127 @@ mod tests {
         let state = core.state();
         assert_eq!(state.status, AgentTranscriptStatus::Loading);
         assert_eq!(state.error, None);
+    }
+
+    #[test]
+    fn prompt_titles_follow_legacy_and_paginated_history_and_survive_replay() {
+        for mode in [CodexHistoryMode::Legacy, CodexHistoryMode::Paginated] {
+            let mut bytes = history_header(Some(serde_json::json!(mode)));
+            let mut core = CodexSessionCore::new("thread");
+            let source = core.bind_source("/rollout".into(), "1:2".into(), 0);
+            core.ingest(source.source_generation, &bytes).unwrap();
+            assert_eq!(core.state().info.unwrap().title, None);
+
+            let user = |text: &str, index| match mode {
+                CodexHistoryMode::Legacy => record(
+                    "response_item",
+                    serde_json::json!({
+                        "type":"message", "role":"user", "id":format!("user-{index}"),
+                        "content":[{"type":"input_text", "text":text}]
+                    }),
+                ),
+                _ => completed_item(
+                    index,
+                    serde_json::json!({
+                        "type":"UserMessage", "id":format!("user-{index}"),
+                        "content":[{"type":"text", "text":text}]
+                    }),
+                ),
+            };
+            for (index, text) in [
+                "  ",
+                "# AGENTS.md instructions for /repo\n<INSTRUCTIONS>rules</INSTRUCTIONS>",
+                "<environment_context>cwd</environment_context>",
+                "/resume old-thread",
+                "  Fix the\n login\t flow  ",
+                "A later prompt must not replace the first",
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let chunk = user(text, index);
+                let update = core
+                    .ingest(source.source_generation, &chunk)
+                    .unwrap()
+                    .update;
+                if index == 4 {
+                    assert!(update.unwrap().deltas.iter().any(|delta| matches!(delta,
+                        AgentTranscriptDelta::Reset { state } if state.info.as_ref().and_then(|info| info.title.as_deref()) == Some("Fix the login flow")
+                    ) || matches!(delta,
+                        AgentTranscriptDelta::InfoChanged { info: Some(info) } if info.title.as_deref() == Some("Fix the login flow")
+                    )));
+                }
+                bytes.extend(chunk);
+            }
+            assert_eq!(
+                core.state().info.unwrap().title.as_deref(),
+                Some("Fix the login flow")
+            );
+            let mut restored = CodexSessionCore::new("thread");
+            restored.restore_cache(&core.cache_blob().unwrap()).unwrap();
+            assert_eq!(restored.state().info, core.state().info);
+
+            // Rotation / clear cannot carry the prior conversation's title.
+            core.bind_source("/rollout".into(), "2:3".into(), 0);
+            assert_eq!(core.state().info.unwrap().title, None);
+        }
+    }
+
+    #[test]
+    fn native_name_wins_until_cleared_and_updates_without_changing_history() {
+        let mut core = CodexSessionCore::new("thread");
+        let source = core.bind_source("/rollout".into(), "1:2".into(), 0);
+        core.ingest(
+            source.source_generation,
+            &legacy_prefix(
+                "event_msg",
+                serde_json::json!({"type":"user_message","message":"First prompt"}),
+            ),
+        )
+        .unwrap();
+        let before = core.state().messages;
+        let update = core
+            .update_native_title("thread", Some("  My\n native title "))
+            .unwrap();
+        assert!(
+            matches!(&update.deltas[..], [AgentTranscriptDelta::InfoChanged { info: Some(info) }]
+            if info.title.as_deref() == Some("My native title"))
+        );
+        let revision = core.revision();
+        assert!(
+            core.update_native_title("thread", Some("My native title"))
+                .is_none()
+        );
+        assert!(
+            core.update_native_title("other-thread", Some("Wrong session"))
+                .is_none()
+        );
+        assert_eq!(core.revision(), revision);
+        core.ingest(
+            source.source_generation,
+            &record(
+                "event_msg",
+                serde_json::json!({"type":"user_message","message":"Later prompt"}),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            core.state().info.unwrap().title.as_deref(),
+            Some("My native title")
+        );
+
+        // Remote name metadata is a memory-only override, outside the raw cache.
+        let mut restored = CodexSessionCore::new("thread");
+        restored.restore_cache(&core.cache_blob().unwrap()).unwrap();
+        assert_eq!(
+            restored.state().info.unwrap().title.as_deref(),
+            Some("First prompt")
+        );
+        core.update_native_title("thread", Some(" \t ")).unwrap();
+        assert_eq!(
+            core.state().info.unwrap().title.as_deref(),
+            Some("First prompt")
+        );
+        assert_eq!(core.state().messages[0], before[0]);
     }
 }

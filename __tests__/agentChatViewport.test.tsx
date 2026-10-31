@@ -2,12 +2,14 @@ import { ChatSearchBar, CHAT_SEARCH_BAR_HEIGHT } from '../src/components/ChatSea
 import { SearchText } from '../src/components/SearchText';
 import { NativeCodeBlock } from '../src/components/NativeCodeBlock';
 import { JsonOutputViewer } from '../src/components/JsonOutputViewer';
+import { ChatFileDiff } from '../src/components/ChatFileDiff';
 import * as toolOutput from '../src/lib/toolOutput';
 import { Fragment, useState, type ReactElement } from 'react';
 import Clipboard from '@react-native-clipboard/clipboard';
 import * as Haptics from 'expo-haptics';
 import { Linking } from 'react-native';
 import { COPY_FEEDBACK_MS } from '../src/hooks/useCopyFeedback';
+import type { ChatReadAloudControl } from '../src/hooks/useChatReadAloud';
 import {
   act,
   create,
@@ -23,30 +25,35 @@ import {
   type TranscriptTurn,
 } from '../src/agentChat';
 import { AgentChatView } from '../src/components/AgentChatView';
+import { useNativeChatRows } from '../src/hooks/useNativeChatRows';
+import { ChatRowStore } from '../src/lib/nativeChatRows';
+import { mockChatRows } from '../test-support/mockChatRows';
 import { ChatComposerSelection } from '../src/components/ChatComposerSelection';
-import type { ChatBlock } from '../src/lib/agentChatBlocks';
+import type { ChatRow as ChatBlock } from '../src/lib/nativeChatRows';
 import type { ChatViewportState } from '../src/lib/chatViewportState';
-import type { ChatSearchDocument, ChatSearchResults } from 'react-native-whip-ssh/src/chatSearch';
+import type { ChatSearchResults } from 'react-native-whip-ssh/src/chatSearch';
 import { CHAT_SEARCH_DELAY_MS } from '../src/hooks/useChatSearch';
 import { SCROLL_IDLE_MS } from '../src/hooks/useScrollActivity';
 
-const mockSearchDocuments = jest.fn((_documents: ChatSearchDocument[]) => undefined);
 const mockSearch = jest.fn<ChatSearchResults, [string]>();
 const mockSearchNavigate = jest.fn<ChatSearchResults, [boolean]>();
 const mockSearchSelect = jest.fn<ChatSearchResults, [number]>();
 const mockSearchDispose = jest.fn();
+jest.mock('../src/hooks/useNativeChatRows', () => ({
+  useNativeChatRows: jest.fn(jest.requireActual('../test-support/mockChatRows').mockChatRows),
+}));
 jest.mock('react-native-whip-ssh/src/chatSearch', () => ({
   NativeChatSearchIndex: jest.fn().mockImplementation(() => ({
-    setDocuments: mockSearchDocuments, search: mockSearch, navigate: mockSearchNavigate, select: mockSearchSelect, dispose: mockSearchDispose,
+    search: mockSearch, navigate: mockSearchNavigate, select: mockSearchSelect, dispose: mockSearchDispose,
   })),
 }));
 
 beforeEach(() => {
+  jest.mocked(useNativeChatRows).mockImplementation(mockChatRows);
   jest.mocked(Haptics.selectionAsync).mockClear();
   jest.mocked(Haptics.notificationAsync).mockClear();
   mockSearch.mockReset().mockImplementation(query => ({ query, matches: [], selected: undefined, truncated: false }));
   mockSearchNavigate.mockReset();
-  mockSearchDocuments.mockClear();
   mockSearchDispose.mockClear();
 });
 
@@ -61,7 +68,7 @@ jest.mock('@shopify/flash-list', () => {
       props: Record<string, unknown>,
       ref: React.ForwardedRef<unknown>,
     ) {
-      return React.createElement('FlashList', { ...props, ref });
+      return React.createElement('FlashList', { ...props, ref }, props.ListFooterComponent as React.ReactNode);
     }),
   };
 });
@@ -71,6 +78,7 @@ jest.mock('react-native-css-interop/jsx-runtime', () =>
 jest.mock('react-native', () => ({
   ActivityIndicator: 'ActivityIndicator',
   Keyboard: { dismiss: jest.fn() },
+  Platform: { OS: 'android' },
   Linking: { openURL: jest.fn(async () => undefined) },
   Pressable: 'Pressable',
   ScrollView: 'ScrollView',
@@ -92,6 +100,7 @@ jest.mock('react-native-reanimated', () => ({
 }));
 jest.mock('../src/components/app-ui', () => ({
   useReducedMotion: () => true,
+  hapticPress: (callback: () => void) => callback,
 }));
 jest.mock('../src/components/GlassSurface', () => ({
   GlassSurface: 'GlassSurface',
@@ -100,15 +109,10 @@ jest.mock('../src/components/GlassSurface', () => ({
 jest.mock('../src/components/MarkdownText', () => ({
   MarkdownText: 'MarkdownText',
 }));
+jest.mock('../src/components/ChatFileDiff', () => ({ ChatFileDiff: 'ChatFileDiff' }));
 jest.mock('../src/components/SelectableChatText', () => ({ SelectableChatText: 'SelectableChatText' }));
 jest.mock('../src/services/remoteFileTransfer', () => ({ cacheRemoteFile: jest.fn() }));
 jest.mock('react-native-safe-area-context', () => ({ SafeAreaView: 'SafeAreaView' }));
-jest.mock('react-syntax-highlighter/dist/esm/styles/hljs', () =>
-  jest.requireActual('react-syntax-highlighter/dist/cjs/styles/hljs'),
-);
-jest.mock('react-syntax-highlighter/dist/esm/default-highlight', () =>
-  jest.requireActual('react-syntax-highlighter/dist/cjs/default-highlight'),
-);
 jest.mock('../src/components/OverlayScrollbar', () => ({
   OverlayScrollbar: 'OverlayScrollbar',
 }));
@@ -138,15 +142,17 @@ const CONTENT_INSETS = { top: 0, bottom: 186 };
 function chatState(turns: TranscriptTurn[]): AgentChatState {
   return {
     sessionId: 'session-1',
-    transcript: { ...emptyTranscript('session-1'), turns },
+    transcript: { ...emptyTranscript('session-1'), turns,
+      messages: turns.flatMap(turn => turn.messages ?? [...(turn.user ? [turn.user] : []), ...turn.assistants]) },
     status: 'live',
   };
 }
 
-function chatView(state: AgentChatState, active = true, onReady?: () => void) {
+function chatView(state: AgentChatState, active = true, onReady?: () => void, readAloud?: ChatReadAloudControl) {
   return (
     <AgentChatView
       agent="codex"
+      savedSearchNamespace="test-host"
       active={active}
       agentStatus="working"
       contentInsets={CONTENT_INSETS}
@@ -154,6 +160,7 @@ function chatView(state: AgentChatState, active = true, onReady?: () => void) {
       onOpenFile={jest.fn()}
       onInitialViewportReady={onReady}
       state={state}
+      readAloud={readAloud}
     />
   );
 }
@@ -177,6 +184,11 @@ function finalBlock(renderer: ReactTestRenderer, turn: TranscriptTurn): ChatBloc
 
 function chatViewport(renderer: ReactTestRenderer): ReactTestInstance {
   return renderer.root.find(node => node.props.testID === 'agent-chat-viewport');
+}
+
+function floatingControlBottom(renderer: ReactTestRenderer, bottom: number): number {
+  const chrome = renderer.root.findByProps({ testID: 'chat-floating-chrome' });
+  return bottom - chrome.props.style.transform[0].translateY;
 }
 
 function scrollEvent(offset: number, contentHeight: number, viewportHeight = 400) {
@@ -272,6 +284,67 @@ test.each([
   }
 });
 
+test('each response footer places its read-aloud icon next to copy and selects that response', () => {
+  const turns: TranscriptTurn[] = ['older', 'newer'].map(id => ({
+    ...TURN,
+    id,
+    status: 'idle',
+    assistants: [{
+      id: `${id}-message`, role: 'assistant', completedAt: 1, diffs: [],
+      parts: [{ id: `${id}-text`, type: 'text', text: `${id} response` }],
+    }],
+  }));
+  const state = chatState(turns);
+  const readAloud: ChatReadAloudControl = { readingTurnId: null, canRead: jest.fn(() => true), toggle: jest.fn() };
+  let renderer!: ReactTestRenderer;
+  let rows!: ReactTestRenderer;
+  try {
+    act(() => { renderer = create(chatView(state, true, undefined, readAloud)); });
+    act(() => { rows = create(renderedBlocks(renderer)); });
+    const buttons = () => rows.root.findAll(node => String(node.type) === 'Button' && node.props.testID?.startsWith('chat-response-read-aloud-'));
+    expect(buttons()).toHaveLength(2);
+    for (const [index, button] of buttons().entries()) {
+      expect(button.parent!.findAll(node => String(node.type) === 'Button' && node.props.accessibilityLabel === 'Copy response')).toHaveLength(1);
+      expect(button.findAll(node => String(node.type) === 'Text')).toHaveLength(0);
+      expect(button.findAll(node => String(node.type) === 'Volume2')).toHaveLength(1);
+      act(() => { button.props.onPress(); });
+      expect(readAloud.toggle).toHaveBeenLastCalledWith(turns[index]);
+    }
+    act(() => renderer.update(chatView(state, true, undefined, { ...readAloud, readingTurnId: 'older' })));
+    act(() => rows.update(renderedBlocks(renderer)));
+    expect(buttons()[0].props.accessibilityState.selected).toBe(true);
+    expect(buttons()[0].findAll(node => String(node.type) === 'VolumeX')).toHaveLength(1);
+    expect(buttons()[1].findAll(node => String(node.type) === 'Volume2')).toHaveLength(1);
+  } finally {
+    act(() => { rows?.unmount(); renderer?.unmount(); });
+  }
+});
+
+test('response read-aloud controls are disabled during dictation and absent from hidden chats or reasoning-only turns', () => {
+  const turn: TranscriptTurn = {
+    ...TURN, status: 'idle',
+    assistants: [{ id: 'reply', role: 'assistant', diffs: [], parts: [{ id: 'text', type: 'text', text: 'Response' }] }],
+  };
+  const readAloud: ChatReadAloudControl = { readingTurnId: null, canRead: () => false, toggle: jest.fn() };
+  let renderer!: ReactTestRenderer;
+  let rows!: ReactTestRenderer;
+  const buttons = () => rows.root.findAll(node => String(node.type) === 'Button' && node.props.testID?.startsWith('chat-response-read-aloud-'));
+  try {
+    act(() => { renderer = create(chatView(chatState([turn]), true, undefined, readAloud)); });
+    act(() => { rows = create(renderedBlocks(renderer)); });
+    expect(buttons()[0].props.disabled).toBe(true);
+    act(() => renderer.update(chatView(chatState([turn]), false, undefined, readAloud)));
+    act(() => rows.update(renderedBlocks(renderer)));
+    expect(buttons()).toHaveLength(0);
+    const reasoning = { ...turn, assistants: [{ ...turn.assistants[0], parts: [{ id: 'reasoning', type: 'reasoning' as const, text: 'Internal reasoning' }] }] };
+    act(() => renderer.update(chatView(chatState([reasoning]), true, undefined, readAloud)));
+    act(() => rows.update(renderedBlocks(renderer)));
+    expect(buttons()).toHaveLength(0);
+  } finally {
+    act(() => { rows?.unmount(); renderer?.unmount(); });
+  }
+});
+
 test('renders a user message containing only an image', () => {
   const turn: TranscriptTurn = { ...TURN, user: { id: 'user-image', role: 'user', diffs: [], parts: [{ id: 'image', type: 'image', source: '/home/me/.whip/uploads/cat.png' }] } };
   let renderer!: ReactTestRenderer;
@@ -320,6 +393,49 @@ function toolTurn(part: TranscriptPart): TranscriptTurn {
     status: 'idle',
   };
 }
+
+test('changed-files summaries reveal a file list with independently expandable diffs', () => {
+  const file = { file: 'src/demo.ts', patch: '@@ -1 +1 @@\n-old\n+new', additions: 1, deletions: 1 };
+  const otherFile = { ...file, file: 'src/other.ts' };
+  const part = SHELL_TURN.assistants[0].parts[0] as TranscriptToolPart;
+  const turn = { ...toolTurn({ ...part, tool: 'patch', state: { ...part.state, files: [file], output: undefined } }), diffs: [file, otherFile] };
+  const state = chatState([turn]);
+  state.transcript.info = { id: state.sessionId, directory: '/work/project' };
+  let renderer!: ReactTestRenderer;
+  let rows!: ReactTestRenderer;
+  try {
+    act(() => { renderer = create(chatView(state)); });
+    act(() => { rows = create(renderedBlocks(renderer)); });
+    act(() => { rows.root.find(isToolToggle).props.onPress(); });
+    act(() => { rows.update(renderedBlocks(renderer)); });
+    expect(rows.root.findAllByType(ChatFileDiff).map(node => node.props.file)).toEqual([file]);
+    const changes = () => rows.root.find(node => String(node.type) === 'Pressable' && node.findAll(child => String(child.type) === 'Text')
+      .some(child => child.children.some(value => typeof value === 'string' && value.startsWith('Changed '))));
+    act(() => { changes().props.onPress(); });
+    act(() => { rows.update(renderedBlocks(renderer)); });
+    const diffs = () => rows.root.findAllByType(ChatFileDiff);
+    expect(diffs().map(node => node.props.file)).toEqual([file, file, otherFile]);
+    expect(diffs().map(node => node.props.directory)).toEqual(Array(3).fill('/work/project'));
+    expect(diffs().slice(1).map(node => node.props.expanded)).toEqual([false, false]);
+    act(() => { diffs()[1].props.onToggle(); });
+    act(() => { rows.update(renderedBlocks(renderer)); });
+    expect(diffs().slice(1).map(node => node.props.expanded)).toEqual([true, false]);
+    act(() => { diffs()[2].props.onToggle(); });
+    act(() => { rows.update(renderedBlocks(renderer)); });
+    expect(diffs().slice(1).map(node => node.props.expanded)).toEqual([true, true]);
+    act(() => { diffs()[1].props.onToggle(); });
+    act(() => { rows.update(renderedBlocks(renderer)); });
+    expect(diffs().slice(1).map(node => node.props.expanded)).toEqual([false, true]);
+    act(() => { changes().props.onPress(); });
+    act(() => { rows.update(renderedBlocks(renderer)); });
+    expect(diffs().map(node => node.props.file)).toEqual([file]);
+    act(() => { changes().props.onPress(); });
+    act(() => { rows.update(renderedBlocks(renderer)); });
+    expect(diffs().slice(1).map(node => node.props.expanded)).toEqual([false, true]);
+  } finally {
+    act(() => { rows?.unmount(); renderer?.unmount(); });
+  }
+});
 
 function failedTool(tool: 'shell' | 'write'): TranscriptToolPart {
   return {
@@ -409,7 +525,7 @@ describe('AgentChatView viewport insets', () => {
     const latestButton = renderer.root.find(
       node => node.props.accessibilityLabel === 'Jump to latest',
     );
-    expect(latestButton.props.style[0]).toEqual({ bottom: 297 });
+    expect(floatingControlBottom(renderer, latestButton.props.style[0].bottom)).toBe(297);
     expect(latestButton.props.className.split(' ')).toContain('self-center');
     expect(latestButton.props.size).toBe('icon');
     expect(latestButton.findAll(node => String(node.type) === 'ArrowDown')).toHaveLength(1);
@@ -537,7 +653,7 @@ describe('AgentChatView tool output', () => {
     jest.restoreAllMocks();
   });
 
-  test.each(['single line', 'heredoc'])('bounds a large %s command header while retaining expanded content, copy and search', shape => {
+  test.each(['single line', 'heredoc'])('bounds a large %s command header while retaining expanded content, copy and search', async shape => {
     jest.useFakeTimers();
     const body = '正文 mixed text '.repeat(1500);
     const command = shape === 'heredoc' ? `cat > chapter.txt <<'EOF'\n${body}\nEOF` : `printf '${body}'`;
@@ -547,7 +663,7 @@ describe('AgentChatView tool output', () => {
     act(() => { renderer = create(<AgentChatView {...chatView(chatState([toolTurn(tool)])).props} searchOpen />); });
     act(() => { turnRenderer = create(renderedBlocks(renderer)); });
     act(() => { renderer.root.findByType(ChatSearchBar).props.search.setQuery('正文'); });
-    act(() => { jest.advanceTimersByTime(CHAT_SEARCH_DELAY_MS); });
+    await act(async () => { jest.advanceTimersByTime(CHAT_SEARCH_DELAY_MS); });
     const toggle = () => turnRenderer.root.find(node => isToolToggle(node) && node.props.accessibilityState);
     const header = () => toggle().findAllByType(SearchText).map(node => node.props.text).join('');
     expect(header()).toContain(shape === 'heredoc' ? "cat > chapter.txt <<'EOF'…" : 'printf');
@@ -555,7 +671,7 @@ describe('AgentChatView tool output', () => {
     expect(toggle().props.accessibilityLabel.length).toBeLessThan(200);
     expect(turnRenderer.root.findAllByType(NativeCodeBlock)).toHaveLength(0);
     expect(turnRenderer.root.findAllByType(SearchText).some(node => node.props.text === output)).toBe(false);
-    expect(mockSearchDocuments.mock.calls.at(-1)![0].some(document => document.text.includes(command) && document.text.includes(output))).toBe(true);
+    expect(mockSearch).toHaveBeenLastCalledWith('正文');
 
     act(() => { toggle().props.onPress(); });
     act(() => { turnRenderer.update(renderedBlocks(renderer)); });
@@ -624,7 +740,7 @@ describe('AgentChatView tool output', () => {
     const toggle = turnRenderer.root.find(node => isToolToggle(node) && node.props.accessibilityState?.expanded === false);
     act(() => { toggle.props.onPress(); });
     act(() => { renderer.root.findByType(ChatSearchBar).props.search.setQuery('"count": 42'); });
-    act(() => { jest.advanceTimersByTime(CHAT_SEARCH_DELAY_MS); });
+    await act(async () => { jest.advanceTimersByTime(CHAT_SEARCH_DELAY_MS); });
     await act(async () => { turnRenderer.update(renderedBlocks(renderer)); });
 
     const json = turnRenderer.root.findByType(JsonOutputViewer.type);
@@ -942,7 +1058,7 @@ describe('AgentChatView activity presentation', () => {
   });
 
   test.each(['text', 'reasoning'] as const)(
-    'streams unfinished %s, then shows thinking after completion while the turn works',
+    'streams unfinished %s without adding a generic placeholder on completion',
     type => {
       const message = {
         id: 'assistant', role: 'assistant' as const, diffs: [],
@@ -955,7 +1071,7 @@ describe('AgentChatView activity presentation', () => {
 
       renderTurn({ ...turn, assistants: [{ ...message, completedAt: 2 }] });
       expect(turnRenderer.root.find(node => String(node.type) === 'MarkdownText').props.streaming).toBe(false);
-      expect(thinkingIndicators()).toHaveLength(1);
+      expect(thinkingIndicators()).toHaveLength(0);
 
       // A new, unfinished message can stream even after earlier text completed.
       renderTurn({ ...turn, assistants: [
@@ -990,7 +1106,7 @@ describe('AgentChatView activity presentation', () => {
         { ...tool, state: { ...tool.state, status: 'completed' } },
       ] }] });
       expect(turnRenderer.root.findAll(node => String(node.type) === 'ActivityIndicator')).toHaveLength(0);
-      expect(thinkingIndicators()).toHaveLength(1);
+      expect(thinkingIndicators()).toHaveLength(0);
     },
   );
 
@@ -1007,7 +1123,7 @@ describe('AgentChatView activity presentation', () => {
     expect(turnRenderer.root.find(node => String(node.type) === 'Search')).toBeDefined();
     expect(turnRenderer.root.findAll(node => node.props?.text === 'Web search')).toHaveLength(0);
     expect(turnRenderer.root.find(node => node.props?.text === 'weather history')).toBeDefined();
-    expect(thinkingIndicators()).toHaveLength(1);
+    expect(thinkingIndicators()).toHaveLength(0);
     const toggle = turnRenderer.root.find(node => isToolToggle(node)
       && node.props.accessibilityState?.expanded === false);
     expect(toggle.props.accessibilityLabel).toBe('Web search, weather history');
@@ -1050,6 +1166,8 @@ describe('AgentChatView pinned context', () => {
     { y: 600, height: 300 }, { y: 900, height: 400 }, { y: 1300, height: 1 },
   ];
   const pinnedPrompts = () => renderer.root.findAllByProps({ testID: 'chat-pinned-prompt' });
+  const activityStrips = () => renderer.root.findAllByProps({ testID: 'chat-pinned-activity' });
+  const workingLabel = (): string => renderer.root.findByProps({ testID: 'chat-working-status' }).props.accessibilityLabel;
   const activityButton = () => renderer.root.find(node => String(node.type) === 'Pressable'
     && node.props.accessibilityLabel?.startsWith('Current activity:'));
   const view = (options: Partial<React.ComponentProps<typeof AgentChatView>> = {}) => (
@@ -1061,8 +1179,8 @@ describe('AgentChatView pinned context', () => {
     list.props.onScroll(scrollEvent(offset, 2000));
     list.props.onScrollEndDrag(scrollEvent(offset, 2000));
   });
-  const setParts = (parts: TranscriptPart[]) => {
-    const latest = { ...turn.assistants[1], parts };
+  const setParts = (parts: TranscriptPart[], completedAt?: number) => {
+    const latest = { ...turn.assistants[1], parts, completedAt };
     turn = { ...turn, assistants: [earlierAnswer, latest], messages: [firstPrompt, earlierAnswer, followup, latest] };
     act(() => { renderer.update(view()); });
   };
@@ -1154,10 +1272,11 @@ describe('AgentChatView pinned context', () => {
   });
 
   test('keeps the latest running activity visible during scrolling and updates it without moving the reader', () => {
-    expect(activityButton().props.accessibilityLabel).toBe('Current activity: Shell, echo active');
+    expect(activityStrips()).toHaveLength(0);
+    expect(flatList(renderer).findByProps({ testID: 'chat-inline-working' })).toBeDefined();
     scrollTo(180);
     // The activity stays visible during the drag and the scroll-idle delay.
-    expect(activityButton().props.accessibilityLabel).toContain('echo active');
+    expect(activityButton().props.accessibilityLabel).toBe('Current activity: Shell, echo active');
     const tool = turn.assistants[1].parts[0] as TranscriptToolPart;
     setParts([tool, { ...tool, id: 'read', callId: 'read', tool: 'read', state: { ...tool.state, input: { path: '/repo/src/main.rs' } } }]);
     expect(activityButton().props.accessibilityLabel).toBe('Current activity: Read, main.rs');
@@ -1166,11 +1285,255 @@ describe('AgentChatView pinned context', () => {
     expect(scrollToIndex).not.toHaveBeenCalled();
     expect(scrollToOffset).not.toHaveBeenCalled();
     setParts([{ id: 'stream', type: 'text', text: 'Here is the current answer' }]);
-    expect(activityButton().props.accessibilityLabel).toBe('Current activity: Responding, Here is the current answer');
+    expect(activityButton().props.accessibilityLabel).toBe('Current activity: Read, main.rs');
+    act(() => { jest.advanceTimersByTime(3_000); });
+    expect(activityButton().props.accessibilityLabel).toBe('Current activity: Here is the current answer');
     setParts([{ id: 'reasoning', type: 'reasoning', text: 'Checking the result' }]);
-    expect(activityButton().props.accessibilityLabel).toBe('Current activity: Thinking, Checking the result');
+    expect(activityButton().props.accessibilityLabel).toBe('Current activity: Checking the result');
     setParts([{ ...tool, state: { ...tool.state, status: 'completed' } }]);
-    expect(activityButton().props.accessibilityLabel).toBe('Current activity: Thinking');
+    expect(activityStrips()).toHaveLength(0);
+  });
+
+  test.each(['tool', 'response', 'summary'] as const)(
+    'pins %s activity only away from the latest output and keeps Working inline',
+    kind => {
+      if (kind === 'response') setParts([{ id: 'stream', type: 'text', text: 'Answer in progress' }]);
+      if (kind === 'summary') setParts([{ id: 'summary', type: 'reasoning', text: 'Checking the result' }], 2);
+      const activity = () => renderer.root.findAllByProps({ testID: 'chat-pinned-activity' });
+      const footerHeight = () => flatList(renderer).props.ListFooterComponent.props.children.at(-1).props.height;
+      const initialFooterHeight = footerHeight();
+      expect(activity()).toHaveLength(0);
+      expect(flatList(renderer).findByProps({ testID: 'chat-inline-working' })).toBeDefined();
+      scrollTo(180);
+      expect(activity()).toHaveLength(1);
+      expect(footerHeight()).toBe(initialFooterHeight);
+      // Returning to the bottom hides floating chrome without changing the scroll range.
+      act(() => {
+        flatList(renderer).props.onMomentumScrollBegin();
+        flatList(renderer).props.onScroll(scrollEvent(1540, 2000));
+      });
+      expect(activity()).toHaveLength(0);
+      act(() => { flatList(renderer).props.onMomentumScrollEnd(scrollEvent(1600, 2000)); });
+      expect(activity()).toHaveLength(0);
+      // A small drag inside the bottom threshold leaves only the inline status.
+      scrollTo(1580);
+      expect(activity()).toHaveLength(0);
+      scrollTo(180);
+      expect(activity()).toHaveLength(1);
+      expect(flatList(renderer).findByProps({ testID: 'chat-inline-working' })).toBeDefined();
+      act(() => { activityButton().props.onPress(); });
+      expect(activity()).toHaveLength(0);
+      expect(footerHeight()).toBe(initialFooterHeight);
+      expect(scrollToEnd).toHaveBeenCalledWith({ animated: true });
+    },
+  );
+
+  test('shows tools immediately, holds short calls for three seconds, then restores the newest reasoning summary', () => {
+    const tool = turn.assistants[1].parts[0] as TranscriptToolPart;
+    const summary: TranscriptPart = { id: 'summary', type: 'reasoning', text: 'Checking the network path' };
+    const nextSummary: TranscriptPart = { id: 'next-summary', type: 'reasoning', text: 'Verifying the connection result' };
+    setParts([summary], 2);
+    scrollTo(180);
+    expect(activityButton().props.accessibilityLabel).toBe('Current activity: Checking the network path');
+    setParts([summary, tool], 2);
+    expect(activityButton().props.accessibilityLabel).toBe('Current activity: Shell, echo active');
+    act(() => { jest.advanceTimersByTime(250); });
+    setParts([summary, { ...tool, state: { ...tool.state, status: 'completed' } }, nextSummary], 3);
+    expect(activityButton().props.accessibilityLabel).toBe('Current activity: Shell, echo active');
+    act(() => { jest.advanceTimersByTime(2_749); });
+    expect(activityButton().props.accessibilityLabel).toBe('Current activity: Shell, echo active');
+    act(() => { jest.advanceTimersByTime(1); });
+    expect(activityButton().props.accessibilityLabel).toBe('Current activity: Verifying the connection result');
+    setParts([summary, nextSummary, { id: 'response', type: 'text', text: 'Here is the answer' }]);
+    expect(activityButton().props.accessibilityLabel).toBe('Current activity: Verifying the connection result');
+    expect(scrollToEnd).not.toHaveBeenCalled();
+    expect(scrollToIndex).not.toHaveBeenCalled();
+    expect(scrollToOffset).not.toHaveBeenCalled();
+  });
+
+  test('uses Codex’s latest usable summary line and keeps it through incomplete headings', () => {
+    const summary: TranscriptPart = { id: 'summary', type: 'reasoning', text: '**Checking files**' };
+    setParts([summary], 2);
+    scrollTo(180);
+    expect(activityButton().props.accessibilityLabel).toBe('Current activity: Checking files');
+    setParts([{ ...summary, text: '**Checking files**\n\n<!-- internal marker -->\n**Verifying' }]);
+    expect(activityButton().props.accessibilityLabel).toBe('Current activity: Checking files');
+    setParts([{ ...summary, text: '**Checking files**\n\n## Verifying connections\n\n<!-- internal marker -->' }], 3);
+    expect(activityButton().props.accessibilityLabel).toBe('Current activity: Verifying connections');
+    const completed = { ...summary, text: '**Checking files**\n**Verifying connections**: running suite' };
+    setParts([completed, { id: 'next-summary', type: 'reasoning', text: '**New incomplete heading' }], 4);
+    expect(activityButton().props.accessibilityLabel).toBe('Current activity: Verifying connections: running suite');
+  });
+
+  test('tool metadata and new summaries do not restart the minimum display time', () => {
+    const tool = turn.assistants[1].parts[0] as TranscriptToolPart;
+    const summary: TranscriptPart = { id: 'summary', type: 'reasoning', text: 'Checking files' };
+    setParts([summary, tool], 2);
+    scrollTo(180);
+    act(() => { jest.advanceTimersByTime(1_000); });
+    const updatedTool = { ...tool, state: { ...tool.state, input: { command: 'echo updated' } } };
+    setParts([summary, updatedTool], 2);
+    expect(activityButton().props.accessibilityLabel).toBe('Current activity: Shell, echo updated');
+    act(() => { jest.advanceTimersByTime(1_000); });
+    const nextSummary = { ...summary, text: 'Verifying the result' };
+    setParts([nextSummary, { ...updatedTool, state: { ...updatedTool.state, status: 'completed' } }], 3);
+    act(() => { jest.advanceTimersByTime(999); });
+    expect(activityButton().props.accessibilityLabel).toBe('Current activity: Shell, echo updated');
+    act(() => { jest.advanceTimersByTime(1); });
+    expect(activityButton().props.accessibilityLabel).toBe('Current activity: Verifying the result');
+  });
+
+  test('a long-running tool stays visible until completion and a newer call gets its own display window', () => {
+    const tool = turn.assistants[1].parts[0] as TranscriptToolPart;
+    const summary: TranscriptPart = { id: 'summary', type: 'reasoning', text: 'Checking files' };
+    setParts([summary, tool], 2);
+    scrollTo(180);
+    act(() => { jest.advanceTimersByTime(4_000); });
+    expect(activityButton().props.accessibilityLabel).toBe('Current activity: Shell, echo active');
+    const completed = { ...tool, state: { ...tool.state, status: 'completed' as const } };
+    setParts([summary, completed], 3);
+    expect(activityButton().props.accessibilityLabel).toBe('Current activity: Checking files');
+    const read = { ...tool, id: 'read', callId: 'read', tool: 'read', state: { ...tool.state, input: { path: 'README.md' } } };
+    setParts([summary, completed, read], 3);
+    act(() => { jest.advanceTimersByTime(100); });
+    setParts([summary, completed, { ...read, state: { ...read.state, status: 'completed' } }], 4);
+    act(() => { jest.advanceTimersByTime(2_899); });
+    expect(activityButton().props.accessibilityLabel).toBe('Current activity: Read, README.md');
+    act(() => { jest.advanceTimersByTime(1); });
+    expect(activityButton().props.accessibilityLabel).toBe('Current activity: Checking files');
+  });
+
+  test('finishing a turn cancels the held tool and cannot carry it into the next turn', () => {
+    const tool = turn.assistants[1].parts[0] as TranscriptToolPart;
+    scrollTo(180);
+    setParts([{ ...tool, state: { ...tool.state, status: 'completed' } }], 2);
+    expect(activityStrips()).toHaveLength(1);
+    act(() => { renderer.update(view({ agentStatus: 'idle', state: chatState([{ ...turn, status: 'idle' }]) })); });
+    expect(activityStrips()).toHaveLength(0);
+    expect(renderer.root.findAllByProps({ testID: 'chat-inline-working' })).toHaveLength(0);
+    act(() => { jest.advanceTimersByTime(SCROLL_IDLE_MS); });
+    expect(jest.getTimerCount()).toBe(0);
+    turn = { ...turn, id: 'new-turn' };
+    setParts([{ id: 'new-summary', type: 'reasoning', text: 'Checking the new request' }], 3);
+    expect(activityButton().props.accessibilityLabel).toBe('Current activity: Checking the new request');
+  });
+
+  test('a pending question takes priority over earlier progress', () => {
+    scrollTo(180);
+    const tool = turn.assistants[1].parts[0] as TranscriptToolPart;
+    setParts([
+      { id: 'summary', type: 'reasoning', text: 'Checking the result' },
+      { ...tool, tool: 'request_user_input', state: { ...tool.state, input: {} } },
+    ], 2);
+    expect(activityButton().props.accessibilityLabel).toBe('Current activity: Question requested');
+  });
+
+  test('keeps Working inline and omits the floating bar without a useful summary or tool', () => {
+    setParts([]);
+    scrollTo(180);
+    const footerHeight = () => flatList(renderer).props.ListFooterComponent.props.children.at(-1).props.height;
+    const initialFooterHeight = footerHeight();
+    setParts([]);
+    expect(activityStrips()).toHaveLength(0);
+    expect(workingLabel()).toBe('Working (0s)');
+    expect(footerHeight()).toBe(initialFooterHeight);
+    setParts([{ id: 'summary', type: 'reasoning', text: '   \n<!-- hidden marker -->\n**Incomplete' }], 2);
+    expect(activityStrips()).toHaveLength(0);
+    setParts([{ id: 'summary', type: 'reasoning', text: 'Inspecting the result' }], 3);
+    expect(activityStrips()).toHaveLength(1);
+    expect(footerHeight()).toBe(initialFooterHeight);
+  });
+
+  test('a follow-up clears earlier thinking summaries while retaining outstanding tool activity', () => {
+    const tool = turn.assistants[1].parts[0] as TranscriptToolPart;
+    const summary: TranscriptPart = { id: 'summary', type: 'reasoning', text: 'Checking the previous request' };
+    const appendPrompt = () => {
+      turn = { ...turn, messages: [firstPrompt, earlierAnswer, turn.assistants[1], followup] };
+      act(() => { renderer.update(view()); });
+    };
+    setParts([summary], 2);
+    scrollTo(180);
+    expect(activityButton().props.accessibilityLabel).toContain(summary.text);
+    appendPrompt();
+    expect(activityStrips()).toHaveLength(0);
+    setParts([summary, tool], 2);
+    appendPrompt();
+    expect(activityButton().props.accessibilityLabel).toBe('Current activity: Shell, echo active');
+    setParts([summary, { ...tool, state: { ...tool.state, status: 'completed' } }], 3);
+    appendPrompt();
+    act(() => { jest.advanceTimersByTime(3_000); });
+    expect(activityStrips()).toHaveLength(0);
+  });
+
+  test.each(['exec', 'wait'])('retains recorded assistant progress through Codex %s calls with empty reasoning summaries', toolName => {
+    const tool = turn.assistants[1].parts[0] as TranscriptToolPart;
+    const progress: TranscriptPart = { id: 'progress', type: 'text', text: 'I found the cause. I’m checking the fix.' };
+    const emptyReasoning: TranscriptPart = { id: 'reasoning', type: 'reasoning', text: '' };
+    const raw: TranscriptToolPart = { ...tool, id: 'raw-tool:call', callId: 'call', tool: toolName,
+      state: { ...tool.state, input: {}, inputJson: 'original tool arguments' } };
+    setParts([progress, emptyReasoning], 2);
+    scrollTo(180);
+    expect(activityButton().props.accessibilityLabel).toBe(`Current activity: ${progress.text}`);
+    setParts([progress, emptyReasoning, raw], 2);
+    expect(activityButton().props.accessibilityLabel).toBe(`Current activity: ${progress.text}`);
+    expect(flatList(renderer).props.data.some((block: ChatBlock) => block.type === 'part' && block.partId === raw.id)).toBe(false);
+    // Raw output removes temporary activity; retained command history is already completed.
+    setParts([progress, emptyReasoning, { ...tool, state: { ...tool.state, status: 'completed' } }], 2);
+    expect(activityButton().props.accessibilityLabel).toBe(`Current activity: ${progress.text}`);
+    const nextProgress = { ...progress, id: 'next-progress', text: 'The fix passes. I’m checking scrolling.' };
+    setParts([progress, tool, nextProgress], 3);
+    expect(activityButton().props.accessibilityLabel).toBe('Current activity: Shell, echo active');
+    setParts([progress, { ...tool, state: { ...tool.state, status: 'completed' } }, nextProgress], 3);
+    act(() => { jest.advanceTimersByTime(3_000); });
+    expect(activityButton().props.accessibilityLabel).toBe(`Current activity: ${nextProgress.text}`);
+    expect(scrollToEnd).not.toHaveBeenCalled();
+    expect(scrollToIndex).not.toHaveBeenCalled();
+    expect(scrollToOffset).not.toHaveBeenCalled();
+  });
+
+  test('counts from the recorded turn start through tool changes and time spent at the bottom', () => {
+    turn = { ...turn, startedAt: Date.now() - 5_000 };
+    act(() => { renderer.update(view()); });
+    expect(workingLabel()).toBe('Working (5s)');
+    act(() => { jest.advanceTimersByTime(1_000); });
+    expect(workingLabel()).toBe('Working (6s)');
+    setParts([]);
+    expect(workingLabel()).toBe('Working (6s)');
+    scrollTo(1600);
+    expect(activityStrips()).toHaveLength(0);
+    act(() => { jest.advanceTimersByTime(54_000); });
+    expect(workingLabel()).toBe('Working (1m 0s)');
+    scrollTo(180);
+    expect(workingLabel()).toBe('Working (1m 0s)');
+    act(() => { renderer.update(view({ agentStatus: 'idle', state: chatState([{ ...turn, status: 'idle' }]) })); });
+    expect(activityStrips()).toHaveLength(0);
+    expect(renderer.root.findAllByProps({ testID: 'chat-inline-working' })).toHaveLength(0);
+    act(() => { jest.advanceTimersByTime(SCROLL_IDLE_MS); });
+    expect(jest.getTimerCount()).toBe(0);
+  });
+
+  test('reduced motion keeps the letters static and the timer outside the shimmer', () => {
+    const status = renderer.root.findByProps({ testID: 'chat-working-status' });
+    const letters = status.findAll(node => String(node.type) === 'AnimatedView');
+    expect(letters).toHaveLength('Working'.length);
+    expect(letters.every(letter => letter.props.style.opacity === 1)).toBe(true);
+    expect(status.findAll(node => String(node.type) === 'Text' && node.props.children === ' (0s)')).toHaveLength(1);
+  });
+
+  test('preserves the fallback timer when following the latest output and resets it for a new turn', () => {
+    act(() => { jest.advanceTimersByTime(5_000); });
+    scrollTo(180);
+    expect(workingLabel()).toBe('Working (5s)');
+    act(() => { activityButton().props.onPress(); });
+    act(() => { jest.advanceTimersByTime(3_000); });
+    scrollTo(180);
+    expect(workingLabel()).toBe('Working (8s)');
+    turn = { ...turn, id: 'next-turn' };
+    act(() => { renderer.update(view()); });
+    expect(workingLabel()).toBe('Working (0s)');
+    act(() => { jest.advanceTimersByTime(1_000); });
+    scrollTo(1600);
+    expect(workingLabel()).toBe('Working (1s)');
   });
 
   test('the activity strip clears for finished, interrupted, stale, and hidden chats, and a tap resumes follow', () => {
@@ -1191,17 +1554,25 @@ describe('AgentChatView pinned context', () => {
     expect(pinnedPrompts()).toHaveLength(0);
   });
 
-  test('keeps activity and the latest button above the controls when keyboard insets change', () => {
+  test('keeps activity above the controls and hides the latest button until activity ends', () => {
     scrollTo(180);
     act(() => { jest.advanceTimersByTime(SCROLL_IDLE_MS); });
     act(() => { renderer.update(view({ latestButtonBottom: 198 })); });
     const activity = () => renderer.root.findByProps({ testID: 'chat-pinned-activity' });
-    const latest = () => renderer.root.find(node => node.props.accessibilityLabel === 'Jump to latest');
-    expect(activity().props.style).toEqual({ bottom: 194, height: 44 });
-    expect(latest().props.style[0].bottom).toBeGreaterThanOrEqual(194 + 44);
+    const latest = () => renderer.root.findAll(node => node.props.accessibilityLabel === 'Jump to latest');
+    expect(activity().props.style.height).toBe(44);
+    expect(floatingControlBottom(renderer, activity().props.style.bottom)).toBe(194);
+    expect(latest()).toHaveLength(0);
     act(() => { renderer.update(view({ contentInsets: { top: 24, bottom: 486 }, latestButtonBottom: 498 })); });
-    expect(activity().props.style.bottom).toBe(494);
-    expect(latest().props.style[0].bottom).toBeGreaterThanOrEqual(494 + 44);
+    expect(floatingControlBottom(renderer, activity().props.style.bottom)).toBe(494);
+    expect(latest()).toHaveLength(0);
+    act(() => { renderer.update(view({
+      contentInsets: { top: 24, bottom: 486 }, latestButtonBottom: 498,
+      state: chatState([{ ...turn, status: 'idle' }]), agentStatus: 'idle',
+    })); });
+    expect(activityStrips()).toHaveLength(0);
+    expect(latest()).toHaveLength(1);
+    expect(floatingControlBottom(renderer, latest()[0].props.style[0].bottom)).toBe(498);
     expect(scrollToEnd).not.toHaveBeenCalled();
   });
 });
@@ -1934,7 +2305,7 @@ describe.each(['opencode', 'codex', 'claude'] as const)('chat search navigation 
   }]);
   const button = (label: string) => renderer.root.find(node => String(node.type) === 'Button' && node.props.accessibilityLabel === label);
   const input = () => renderer.root.find(node => String(node.type) === 'Input');
-  const hit = (documentId: string, offset = 0n) => ({ documentId, offset, before: 'before ', matched: 'needle', after: ' after', leading: false, trailing: false });
+  const hit = (documentId: string, offset = 0n) => ({ documentId, reveal: [documentId], offset, before: 'before ', matched: 'needle', after: ' after', leading: false, trailing: false });
   let result: ChatSearchResults;
   let toolId: string;
   beforeEach(() => {
@@ -1956,9 +2327,9 @@ describe.each(['opencode', 'codex', 'claude'] as const)('chat search navigation 
     });
     mockSearch.mockImplementation(query => {
       if (!query) return { query, matches: [], selected: undefined, truncated: false };
-      const documents = mockSearchDocuments.mock.calls.at(-1)![0];
-      toolId = documents.find(document => document.text.includes('printf'))!.id;
-      const userId = documents.find(document => document.text === 'Find needle')!.id;
+      const rows: ChatBlock[] = flatList(renderer).props.data;
+      toolId = rows.find(row => row.type === 'part' && row.partKind === 'tool')!.id;
+      const userId = rows.find(row => row.type === 'user')!.id;
       result = { query, matches: [hit(toolId), hit(userId)], selected: 0, truncated: false };
       return result;
     });
@@ -1967,14 +2338,14 @@ describe.each(['opencode', 'codex', 'claude'] as const)('chat search navigation 
     act(() => { renderer.unmount(); });
     jest.useRealTimers();
   });
-  const searchForNeedle = () => {
+  const searchForNeedle = async () => {
     act(() => { input().props.onChangeText('needle'); });
-    act(() => { jest.advanceTimersByTime(CHAT_SEARCH_DELAY_MS); });
+    await act(async () => { jest.advanceTimersByTime(CHAT_SEARCH_DELAY_MS); });
     act(() => { flatList(renderer).props.onCommitLayoutEffect(); });
   };
 
-  test('highlights prompt and tool occurrences, selects a candidate, and clears highlights on close', () => {
-    searchForNeedle();
+  test('highlights prompt and tool occurrences, selects a candidate, and clears highlights on close', async () => {
+    await searchForNeedle();
     let content: ReactTestRenderer;
     act(() => { content = create(renderedBlocks(renderer)); });
     expect(content!.root.findAllByProps({ testID: 'search-highlight' }).map(node => node.props.children)).toEqual(['needle', 'needle']);
@@ -1992,8 +2363,8 @@ describe.each(['opencode', 'codex', 'claude'] as const)('chat search navigation 
     act(() => { content.unmount(); });
   });
 
-  test('reveals cached tool output and navigates both directions', () => {
-    searchForNeedle();
+  test('reveals cached tool output and navigates both directions', async () => {
+    await searchForNeedle();
     const list = flatList(renderer);
     const toolIndex = list.props.data.findIndex((row: ChatBlock) => row.id === toolId);
     expect(toolIndex).toBeGreaterThanOrEqual(0);
@@ -2015,12 +2386,34 @@ describe.each(['opencode', 'codex', 'claude'] as const)('chat search navigation 
     expect(scrollToEnd).not.toHaveBeenCalled();
   });
 
-  test('does not pull the reader back to a match on streaming updates, and closes cleanly', () => {
-    searchForNeedle();
+  test('expands the changes group supplied by the native result before revealing a diff', async () => {
+    const turn = state.transcript.turns[0];
+    const diffId = JSON.stringify([turn.id, 'diff', 'src/main.rs', '0']);
+    const changesId = JSON.stringify([turn.id, 'changes']);
+    const updated = { ...state, transcript: { ...state.transcript, turns: [{
+      ...turn, diffs: [{ file: 'src/main.rs', before: 'old', after: 'needle', additions: 1, deletions: 1 }],
+    }] } };
+    act(() => { renderer.update(<SearchableChat state={updated} />); });
+    mockSearch.mockImplementation(query => ({
+      query, selected: 0, truncated: false,
+      matches: [{ ...hit(diffId), reveal: [changesId, diffId] }],
+    }));
+    await searchForNeedle();
+    const rows: ChatBlock[] = flatList(renderer).props.data;
+    const diffIndex = rows.findIndex(row => row.id === diffId);
+    expect(diffIndex).toBeGreaterThanOrEqual(0);
+    const list = flatList(renderer);
+    const rendered = list.props.renderItem({ item: rows[diffIndex], index: diffIndex });
+    expect(rendered.props.expanded).toBe(true);
+    expect(scrollToIndex).toHaveBeenLastCalledWith({ index: diffIndex, animated: false, viewOffset: CHAT_SEARCH_BAR_HEIGHT });
+  });
+
+  test('does not pull the reader back to a match on streaming updates, and closes cleanly', async () => {
+    await searchForNeedle();
     scrollToIndex.mockClear();
     const updated = { ...state, transcript: { ...state.transcript, turns: [...state.transcript.turns] } };
     act(() => { renderer.update(<SearchableChat state={updated} />); });
-    act(() => { jest.advanceTimersByTime(CHAT_SEARCH_DELAY_MS); });
+    await act(async () => { jest.advanceTimersByTime(CHAT_SEARCH_DELAY_MS); });
     act(() => { flatList(renderer).props.onCommitLayoutEffect(); });
     expect(scrollToIndex).not.toHaveBeenCalled();
     act(() => { input().props.onChangeText(''); });
@@ -2031,8 +2424,8 @@ describe.each(['opencode', 'codex', 'claude'] as const)('chat search navigation 
     expect(flatList(renderer).props.data.some((row: ChatBlock) => row.id === toolId)).toBe(true);
   });
 
-  test('explicit navigation can return to the same occurrence after manually scrolling away', () => {
-    searchForNeedle();
+  test('explicit navigation can return to the same occurrence after manually scrolling away', async () => {
+    await searchForNeedle();
     scrollToIndex.mockClear();
     // A single-result search wraps to the same occurrence, but still means "reveal".
     mockSearchNavigate.mockReturnValue({ ...result, matches: [result.matches[0]], selected: 0 });
@@ -2046,16 +2439,52 @@ describe.each(['opencode', 'codex', 'claude'] as const)('chat search navigation 
     expect(scrollToIndex).toHaveBeenCalledTimes(1);
   });
 
-  test('switching conversations closes the old search without revealing stale hits', () => {
-    searchForNeedle();
+  test('switching conversations closes the old search without revealing stale hits', async () => {
+    await searchForNeedle();
     scrollToIndex.mockClear();
     act(() => {
       renderer.update(<SearchableChat state={{ ...state, sessionId: 'other-session' }} />);
     });
-    act(() => { jest.advanceTimersByTime(CHAT_SEARCH_DELAY_MS); });
+    await act(async () => { jest.advanceTimersByTime(CHAT_SEARCH_DELAY_MS); });
     act(() => { flatList(renderer).props.onCommitLayoutEffect(); });
     expect(mockSearchDispose).toHaveBeenCalledTimes(1);
     expect(renderer.root.findAll(node => String(node.type) === 'Input')).toHaveLength(0);
     expect(scrollToIndex).not.toHaveBeenCalled();
   });
+});
+
+test('waits for native rows before mounting FlashList with the restored anchor index', () => {
+  const state = chatState([SHELL_TURN]);
+  const store = new ChatRowStore();
+  jest.mocked(useNativeChatRows).mockReturnValue(store);
+  const ready = mockChatRows(undefined, state, false, new Set());
+  const anchor = ready.rows.at(-1)!;
+  const savedViewport: ChatViewportState = { offset: 20, followEnd: false, expandedBlocks: new Set(), anchor: { blockId: anchor.id, offset: 3 } };
+  const element = <AgentChatView state={state} agent="codex" agentStatus="idle" contentInsets={CONTENT_INSETS}
+    latestButtonBottom={297} onOpenFile={jest.fn()} savedViewport={savedViewport} />;
+  let renderer!: ReactTestRenderer;
+  act(() => { renderer = create(element); });
+  expect(renderer.root.findAll(node => String(node.type) === 'FlashList')).toHaveLength(0);
+  store.apply({ baseRevision: 0, revision: 1, transcriptRevision: 0, patches: [{ type: 'reset', rows: ready.rows }] });
+  act(() => { renderer.update(<AgentChatView state={{ ...state }} agent="codex" agentStatus="idle" contentInsets={CONTENT_INSETS}
+    latestButtonBottom={297} onOpenFile={jest.fn()} savedViewport={savedViewport} />); });
+  expect(flatList(renderer).props.initialScrollIndex).toBe(ready.indexOf(anchor.id));
+  act(() => renderer.unmount());
+});
+
+test('retains its native source through a host client gap and clears it for a different binding key', () => {
+  const state = chatState([SHELL_TURN]);
+  const runtime = { agentTranscriptSearch: jest.fn(), agentChatRows: jest.fn() };
+  const element = (connected: boolean, key = 'transcript-key') => <AgentChatView state={state} agent="codex" agentStatus="idle"
+    contentInsets={CONTENT_INSETS} latestButtonBottom={297} onOpenFile={jest.fn()}
+    searchRuntime={connected ? runtime : undefined} searchKey={key} />;
+  let renderer!: ReactTestRenderer;
+  act(() => { renderer = create(element(true)); });
+  const first = jest.mocked(useNativeChatRows).mock.calls.at(-1)![0];
+  expect(first?.type).toBe('live');
+  act(() => { renderer.update(element(false)); });
+  expect(jest.mocked(useNativeChatRows).mock.calls.at(-1)![0]).toBe(first);
+  act(() => { renderer.update(element(false, 'replacement-key')); });
+  expect(jest.mocked(useNativeChatRows).mock.calls.at(-1)![0]).toBeUndefined();
+  act(() => renderer.unmount());
 });

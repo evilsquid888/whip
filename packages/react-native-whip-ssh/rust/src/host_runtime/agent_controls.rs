@@ -1,10 +1,18 @@
 //! Persisted agent launch preferences and serialized pane lifecycle operations.
-use super::*;
+use std::sync::Arc;
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
+
+use super::{
+    HostRuntime, RuntimeInner, agents, authoritative_agent_chat_identity, control_request_inner,
+    current_ssh,
+};
 use crate::herdr_api::{
     HerdrAgentKind, HerdrAgentStatus, HerdrControlError, HerdrControlRequest, HerdrControlResult,
-    HerdrSessionSnapshot, HerdrTabLaunch, HerdrTabLaunchResult,
+    HerdrPaneInfo, HerdrSessionSnapshot, HerdrTabLaunch, HerdrTabLaunchResult,
 };
-use serde::{Deserialize, Serialize};
+use crate::host_state::{HostFreshness, HostSyncStatus};
 
 const EXIT_COMMAND: &str = "/exit";
 const POLL_INTERVAL: Duration = Duration::from_millis(150);
@@ -30,6 +38,7 @@ pub struct AgentControlView {
     pub kind: HerdrAgentKind,
     pub session_id: Option<String>,
     pub reverse_control: bool,
+    pub shizuku_access: bool,
     pub connected: bool,
     pub reverse_control_state: crate::reverse_control::ReverseControlState,
 }
@@ -45,6 +54,8 @@ pub(super) struct AgentPreference {
     args: Vec<String>,
     #[serde(default)]
     reverse_control: bool,
+    #[serde(default)]
+    shizuku_access: bool,
     // Projection-inferred defaults must not shadow preferences restored later.
     #[serde(skip)]
     explicit: bool,
@@ -64,6 +75,7 @@ fn kind_for(pane: &HerdrPaneInfo) -> Result<HerdrAgentKind, HerdrControlError> {
     match pane.agent.as_deref() {
         Some("codex") => Ok(HerdrAgentKind::Codex),
         Some("opencode") => Ok(HerdrAgentKind::OpenCode),
+        Some("pi") => Ok(HerdrAgentKind::Pi),
         Some("claude") => Ok(HerdrAgentKind::Claude),
         _ => Err(invalid("This pane has no supported agent")),
     }
@@ -73,7 +85,7 @@ impl AgentPreferences {
     fn for_pane(&mut self, pane: &HerdrPaneInfo) -> Result<AgentPreference, HerdrControlError> {
         let kind = kind_for(pane)?;
         let session_id =
-            authoritative_agent_chat_identity(pane).map(|identity| identity.session_id);
+            authoritative_agent_chat_identity(pane).map(|identity| identity.session_id.into());
         let index = self
             .agents
             .iter()
@@ -98,6 +110,7 @@ impl AgentPreferences {
             session_id,
             args: Vec::new(),
             reverse_control: false,
+            shizuku_access: false,
             explicit: false,
         };
         self.agents.push(agent.clone());
@@ -109,6 +122,7 @@ impl AgentPreferences {
         terminal_id: &str,
         launch: &HerdrTabLaunch,
         reverse_control: bool,
+        shizuku_access: bool,
     ) {
         let Ok(HerdrTabLaunch::Agent { kind, args }) = agents::normalize_tab_launch(launch.clone())
         else {
@@ -120,6 +134,7 @@ impl AgentPreferences {
             kind,
             args: fresh_args(kind, &args),
             reverse_control,
+            shizuku_access: reverse_control && shizuku_access,
             session_id: None,
             explicit: true,
         });
@@ -144,6 +159,7 @@ fn fresh_args(kind: HerdrAgentKind, args: &[String]) -> Vec<String> {
         let takes_id = match kind {
             HerdrAgentKind::Claude => matches!(arg.as_str(), "--resume" | "-r" | "--session-id"),
             HerdrAgentKind::OpenCode => matches!(arg.as_str(), "--session" | "-s"),
+            HerdrAgentKind::Pi => matches!(arg.as_str(), "--session" | "--session-id"),
             HerdrAgentKind::Codex => false,
         };
         if takes_id {
@@ -157,6 +173,7 @@ fn fresh_args(kind: HerdrAgentKind, args: &[String]) -> Vec<String> {
             arg.as_str(),
             "--continue" | "--fork" | "--fork-session" | "--last" | "--all"
         ) || (kind != HerdrAgentKind::Codex && arg == "-c")
+            || (kind == HerdrAgentKind::Pi && matches!(arg.as_str(), "--resume" | "-r"))
             || arg.starts_with("--session=")
             || arg.starts_with("--resume=")
             || arg.starts_with("--session-id=")
@@ -182,7 +199,9 @@ fn resume_launch(preference: &AgentPreference) -> Result<HerdrTabLaunch, HerdrCo
     match preference.kind {
         HerdrAgentKind::Codex => args.extend(["resume".to_owned(), id.clone()]),
         HerdrAgentKind::Claude => args.extend(["--resume".to_owned(), id.clone()]),
-        HerdrAgentKind::OpenCode => args.extend(["--session".to_owned(), id.clone()]),
+        HerdrAgentKind::OpenCode | HerdrAgentKind::Pi => {
+            args.extend(["--session".to_owned(), id.clone()]);
+        }
     }
     Ok(HerdrTabLaunch::Agent {
         kind: preference.kind,
@@ -245,6 +264,7 @@ async fn prepare_launch(
     pane: &HerdrPaneInfo,
     launch: HerdrTabLaunch,
     enabled: bool,
+    shizuku_access: bool,
     conversation: Option<&str>,
 ) -> Result<HerdrTabLaunch, HerdrControlError> {
     check_generation(inner, generation)?;
@@ -259,7 +279,8 @@ async fn prepare_launch(
         .await
         .map_err(invalid)?;
     check_generation(inner, generation)?;
-    let info = crate::reverse_control::new_session(&inner.id, pane).map_err(invalid)?;
+    let mut info = crate::reverse_control::new_session(&inner.id, pane).map_err(invalid)?;
+    info.shizuku_access = shizuku_access;
     let result = match conversation {
         Some(conversation) => {
             inner
@@ -412,7 +433,8 @@ where
             return Ok(());
         }
         if current.agent != pane.agent
-            || authoritative_agent_chat_identity(&current).map(|identity| identity.session_id)
+            || authoritative_agent_chat_identity(&current)
+                .map(|identity| identity.session_id.into())
                 != preference.session_id
         {
             return Err(invalid("The agent conversation changed during restart"));
@@ -463,7 +485,8 @@ where
             return Ok(());
         }
         if current.agent != pane.agent
-            || authoritative_agent_chat_identity(&current).map(|identity| identity.session_id)
+            || authoritative_agent_chat_identity(&current)
+                .map(|identity| identity.session_id.into())
                 != preference.session_id
         {
             return Err(invalid("The agent conversation changed during restart"));
@@ -561,10 +584,9 @@ fn resume_verification(
     report_missing_identity: bool,
 ) -> Result<ResumeVerification, HerdrControlError> {
     let identity = authoritative_agent_chat_identity(pane);
-    if identity
-        .as_ref()
-        .is_some_and(|identity| Some(&identity.session_id) != preference.session_id.as_ref())
-    {
+    if identity.as_ref().is_some_and(|identity| {
+        Some(identity.session_id.as_str()) != preference.session_id.as_deref()
+    }) {
         return Err(invalid(
             "The agent resumed a different conversation. Check it in Terminal.",
         ));
@@ -600,6 +622,7 @@ impl HostRuntime {
                     kind: agent.kind,
                     session_id: agent.session_id.clone(),
                     reverse_control: agent.reverse_control,
+                    shizuku_access: agent.reverse_control && agent.shizuku_access,
                     connected: reverse_control_state
                         == crate::reverse_control::ReverseControlState::Connected,
                     reverse_control_state,
@@ -632,13 +655,14 @@ impl HostRuntime {
         &self,
         terminal_id: String,
         enabled: bool,
+        shizuku_access: bool,
     ) -> Result<(), HerdrControlError> {
         let runtime = Self {
             inner: self.inner.clone(),
         };
         run_control_task(async move {
             runtime
-                .set_agent_reverse_control_inner(terminal_id, enabled)
+                .set_agent_reverse_control_inner(terminal_id, enabled, shizuku_access)
                 .await
         })
         .await
@@ -736,6 +760,7 @@ impl HostRuntime {
         &self,
         terminal_id: String,
         enabled: bool,
+        shizuku_access: bool,
     ) -> Result<(), HerdrControlError> {
         let _operation = self.inner.agent_control_operation.lock().await;
         let generation = self.inner.state.lock().generation;
@@ -748,9 +773,13 @@ impl HostRuntime {
             .find(|agent| agent.terminal_id == terminal_id)
         {
             agent.reverse_control = enabled;
+            agent.shizuku_access = enabled && shizuku_access;
             agent.explicit = true;
         }
         drop(preferences);
+        self.inner
+            .reverse_control
+            .set_terminal_shizuku_access(&terminal_id, enabled && shizuku_access);
         if !enabled {
             self.inner.reverse_control.close_terminal(&terminal_id);
         }
@@ -824,6 +853,7 @@ impl HostRuntime {
                     &pane,
                     resume_launch(&preference)?,
                     true,
+                    preference.shizuku_access,
                     preference.session_id.as_deref(),
                 )
                 .await?
@@ -908,6 +938,7 @@ impl HostRuntime {
                 &root_pane,
                 launch.clone(),
                 preference.reverse_control,
+                false,
                 None,
             )
             .await?;
@@ -916,6 +947,7 @@ impl HostRuntime {
                 &root_pane.terminal_id,
                 &launch,
                 preference.reverse_control,
+                false,
             );
             Ok(())
         }
@@ -1021,6 +1053,7 @@ mod tests {
             HerdrAgentKind::Codex,
             HerdrAgentKind::Claude,
             HerdrAgentKind::OpenCode,
+            HerdrAgentKind::Pi,
         ] {
             let session = "original";
             let model = "model with 'quotes'; $(command)";
@@ -1032,7 +1065,7 @@ mod tests {
             let selector = match kind {
                 HerdrAgentKind::Codex => "resume",
                 HerdrAgentKind::Claude => "--resume",
-                HerdrAgentKind::OpenCode => "--session",
+                HerdrAgentKind::OpenCode | HerdrAgentKind::Pi => "--session",
             };
             let expected = strings(&["--model", model, selector, session]);
             let mut shell = agent_chat_snapshot(None, None);
@@ -1160,6 +1193,24 @@ mod tests {
     fn copies_remove_conversation_selectors_and_preserve_configuration() {
         assert_eq!(
             fresh_args(
+                HerdrAgentKind::Pi,
+                &strings(&[
+                    "--session",
+                    "/custom/old.jsonl",
+                    "--session-id=new",
+                    "--resume",
+                    "-r",
+                    "--continue",
+                    "--session-dir",
+                    "/custom",
+                    "--model",
+                    "test"
+                ])
+            ),
+            strings(&["--session-dir", "/custom", "--model", "test"])
+        );
+        assert_eq!(
+            fresh_args(
                 HerdrAgentKind::Codex,
                 &strings(&["resume", "old", "-c", "model=\"test\""])
             ),
@@ -1197,12 +1248,25 @@ mod tests {
                 args: strings(&["--model", "test"]),
             },
             true,
+            true,
         );
         let serialized = serde_json::to_string(&preferences)?;
         let restored: AgentPreferences = serde_json::from_str(&serialized)?;
         assert!(restored.agents[0].reverse_control);
+        assert!(restored.agents[0].shizuku_access);
         assert_eq!(restored.agents[0].args, strings(&["--model", "test"]));
         assert!(resume_launch(&restored.agents[0]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn existing_reverse_control_preferences_default_shizuku_access_off()
+    -> Result<(), serde_json::Error> {
+        let preferences: AgentPreferences = serde_json::from_value(serde_json::json!({"agents":[{
+            "terminalId":"terminal", "kind":"codex", "reverseControl":true
+        }]}))?;
+        assert!(preferences.agents[0].reverse_control);
+        assert!(!preferences.agents[0].shizuku_access);
         Ok(())
     }
 
@@ -1218,6 +1282,7 @@ mod tests {
                 kind: HerdrAgentKind::Codex,
                 args: strings(&["--model", "current"]),
             },
+            false,
             false,
         );
         preferences.restore(serde_json::from_value(serde_json::json!({"agents": [{
@@ -1243,6 +1308,7 @@ mod tests {
                 args: Vec::new(),
             },
             true,
+            true,
         );
         let preference = preferences.for_pane(&original)?;
         let launch = resume_launch(&preference)?;
@@ -1259,15 +1325,18 @@ mod tests {
                 args: preference.args,
             },
             preference.reverse_control,
+            false,
         );
         restored.agents[0].reverse_control = false;
         assert!(restored.agents[1].reverse_control);
+        assert!(!restored.agents[1].shizuku_access);
         snapshot.panes[0]
             .agent_session
             .as_mut()
             .ok_or("missing session")?
             .value = "replacement".to_owned();
         assert!(!preferences.for_pane(&snapshot.panes[0])?.reverse_control);
+        assert!(!preferences.for_pane(&snapshot.panes[0])?.shizuku_access);
         Ok(())
     }
 

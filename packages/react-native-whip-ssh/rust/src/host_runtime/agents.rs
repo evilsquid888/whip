@@ -1,18 +1,25 @@
 //! Agent launch, paste submission, and integration behavior.
 
 use std::future::Future;
+use std::sync::Arc;
+use std::time::Duration;
 
-use super::*;
+use super::{
+    AgentIntegrationStatus, HostRuntime, HostRuntimeError, RuntimeInner,
+    authoritative_agent_chat_identity, control_request_inner, current_ssh,
+};
+use crate::agent_sessions::ids::TranscriptKey;
 use crate::agent_sessions::{
     AgentChatBinding, AgentChatOpenResult, AgentChatStartResult, AgentChatUnavailableReason,
-    AgentSessionError, AgentTranscriptArchive,
+    AgentSessionError,
 };
 use crate::agent_transcript::AgentTranscriptState;
 use crate::herdr_api::{
     HerdrAgentKind, HerdrControlError, HerdrControlRequest, HerdrControlResult,
-    HerdrIntegrationInstallResult, HerdrIntegrationState, HerdrTabInfo, HerdrTabLaunch,
-    HerdrTabLaunchResult, HerdrTabLaunchStage,
+    HerdrIntegrationInstallResult, HerdrIntegrationState, HerdrPaneInfo, HerdrTabInfo,
+    HerdrTabLaunch, HerdrTabLaunchResult, HerdrTabLaunchStage,
 };
+use crate::host_state::{HostFreshness, HostSyncStatus};
 
 const AGENT_SHELL_READINESS_TIMEOUT: Duration = Duration::from_secs(2);
 const AGENT_SHELL_READINESS_INTERVAL: Duration = Duration::from_millis(100);
@@ -64,6 +71,7 @@ where
                     HerdrIntegrationState::NotInstalled => AgentIntegrationStatus::NotInstalled,
                     HerdrIntegrationState::Current => AgentIntegrationStatus::Current,
                     HerdrIntegrationState::Outdated => AgentIntegrationStatus::Outdated,
+                    HerdrIntegrationState::NeedsRepair => AgentIntegrationStatus::NeedsRepair,
                 },
             )),
         _ => Err(HerdrControlError::UnsupportedResponse(
@@ -151,6 +159,7 @@ pub(super) fn normalize_tab_launch(
         "claude" => HerdrAgentKind::Claude,
         "codex" => HerdrAgentKind::Codex,
         "opencode" => HerdrAgentKind::OpenCode,
+        "pi" => HerdrAgentKind::Pi,
         _ => return Ok(HerdrTabLaunch::Command { command }),
     };
     args.remove(0);
@@ -430,22 +439,26 @@ impl HostRuntime {
             identity
         };
         let binding = self.inner.agents.bind_authoritative(identity)?;
-        Ok(AgentChatOpenResult::Bound { binding })
+        Ok(AgentChatOpenResult::Bound {
+            binding: binding.into(),
+        })
     }
 
-    pub fn start_agent_chat(
+    pub async fn start_agent_chat(
         &self,
         binding_token: String,
-        cache_blob: Option<Vec<u8>>,
     ) -> Result<AgentChatStartResult, AgentSessionError> {
-        self.inner.agents.start_bound(&binding_token, cache_blob)
+        self.inner.agents.start_bound(&binding_token).await
     }
 
     /// Return the current Rust-owned binding without creating or reopening it.
     /// Presentation reconciliation must use this projection rather than the
     /// explicit `open_agent_chat` operation.
     pub fn current_agent_chat(&self, terminal_id: String) -> Option<AgentChatBinding> {
-        self.inner.agents.terminal_binding(&terminal_id)
+        self.inner
+            .agents
+            .terminal_binding(&terminal_id)
+            .map(Into::into)
     }
 
     pub fn agent_chat_binding_is_current(
@@ -456,30 +469,34 @@ impl HostRuntime {
     ) -> bool {
         self.inner
             .agents
-            .terminal_binding_is_current(&terminal_id, &binding_token, revision)
+            .terminal_binding_is_current(&terminal_id.into(), &binding_token, revision)
     }
 
     pub fn agent_transcript(&self, key: String) -> Result<AgentTranscriptState, AgentSessionError> {
+        let key = TranscriptKey::from(key);
         self.inner.agents.state(&key).ok_or_else(|| {
             AgentSessionError::SessionClosed(format!("agent transcript session {key} is closed"))
         })
     }
 
-    pub fn detach_agent_chat(
-        &self,
-        terminal_id: String,
-    ) -> Result<Option<AgentTranscriptArchive>, AgentSessionError> {
-        self.inner.agents.detach_terminal(&terminal_id)
+    pub fn agent_transcript_search(&self, key: String) -> Arc<crate::ChatSearchIndex> {
+        crate::ChatSearchIndex::for_live(self.inner.agents.clone(), key.into())
     }
 
-    pub fn confirm_agent_transcript_cache(&self, confirmation_token: String) -> bool {
-        self.inner.agents.confirm_cache(&confirmation_token)
+    pub fn agent_chat_rows(&self, key: String) -> Arc<crate::AgentChatRows> {
+        crate::AgentChatRows::for_live(self.inner.agents.clone(), key.into())
+    }
+
+    pub fn detach_agent_chat(&self, terminal_id: String) -> Result<(), AgentSessionError> {
+        self.inner.agents.detach_terminal(&terminal_id.into())
     }
 
     /// Recheck after the bridge queue: detached/replaced operations cannot
     /// update a new view or persist an obsolete checkpoint for the same key.
     pub fn accepts_agent_transcript_event(&self, key: String, operation_epoch: u64) -> bool {
-        self.inner.agents.accepts_event(&key, operation_epoch)
+        self.inner
+            .agents
+            .accepts_event(&key.into(), operation_epoch)
     }
 
     pub async fn create_tab_with_launch(
@@ -506,6 +523,7 @@ impl HostRuntime {
             self.inner.agent_preferences.lock().remember(
                 &root_pane.terminal_id,
                 &remembered_launch,
+                false,
                 false,
             );
         }
@@ -552,6 +570,7 @@ impl HostRuntime {
         workspace_id: String,
         label: String,
         launch: HerdrTabLaunch,
+        shizuku_access: bool,
     ) -> Result<HerdrTabLaunchResult, HerdrControlError> {
         let remembered_launch = launch.clone();
         let launch = crate::reverse_control::agent_launch(normalize_tab_launch(launch)?)
@@ -574,8 +593,9 @@ impl HostRuntime {
                         "tab.create returned a non-tab result".to_owned(),
                     ));
                 };
-                let info = crate::reverse_control::new_session(&inner.id, &root_pane)
+                let mut info = crate::reverse_control::new_session(&inner.id, &root_pane)
                     .map_err(HerdrControlError::InvalidField)?;
+                info.shizuku_access = shizuku_access;
                 let session_id = info.session_id.clone();
                 let prepare = async {
                     let ssh = current_ssh(&inner).map_err(|error| {
@@ -603,6 +623,7 @@ impl HostRuntime {
                 &root_pane.terminal_id,
                 &remembered_launch,
                 true,
+                shizuku_access,
             );
         }
         Ok(outcome)

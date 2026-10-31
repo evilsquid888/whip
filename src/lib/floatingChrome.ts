@@ -3,11 +3,6 @@ export interface VisualContentInsets {
   bottom: number;
 }
 
-export interface TerminalSessionChromeLayout {
-  bottom: number;
-  visible: boolean;
-}
-
 export interface TerminalViewportLayout {
   floatingKeyboardInset: number;
   terminalTranslateY: number;
@@ -66,18 +61,11 @@ export function terminalBottomChromeClearance({
   );
 }
 
-export function shouldShowTerminalSessionChrome({
-  keyboardVisible,
-}: {
-  keyboardVisible: boolean;
-}): boolean {
-  return !keyboardVisible;
-}
-
 export function visualContentInsets(
   top: number,
   bottom: number,
 ): VisualContentInsets {
+  'worklet';
   return {
     top: Math.max(0, top),
     bottom: Math.max(0, bottom),
@@ -123,6 +111,14 @@ export function contentInsetsWithSessionChrome({
   };
 }
 
+/** The control bar already contains bottom safe-area padding. Let that padding
+ * sit under the IME instead of adding the same navigation area above it.
+ */
+export function terminalKeyboardOffset(overlap: number, bottomSafeAreaInset: number): number {
+  'worklet';
+  return Math.max(0, overlap - Math.max(0, bottomSafeAreaInset));
+}
+
 export function terminalControlBarInset(bottomSafeAreaInset: number): number {
   return TERMINAL_CONTROL_BAR_BASE_HEIGHT + Math.max(0, bottomSafeAreaInset);
 }
@@ -138,6 +134,7 @@ export function terminalBottomChromeInset({
   controlBarHeight: number;
   keyboardInset: number;
 }): number {
+  'worklet';
   return (
     Math.max(0, keyboardInset) +
     Math.max(0, controlBarHeight) +
@@ -152,6 +149,8 @@ export function terminalViewportLayout({
   controlBarHeight,
   cursorBottom,
   keyboardInset,
+  restingInputClearance = false,
+  sessionChromeInset = 0,
   topInset,
   viewportHeight,
 }: {
@@ -161,13 +160,20 @@ export function terminalViewportLayout({
   controlBarHeight: number;
   cursorBottom?: number | null;
   keyboardInset: number;
+  restingInputClearance?: boolean;
+  sessionChromeInset?: number;
   topInset: number;
   viewportHeight?: number;
 }): TerminalViewportLayout {
+  'worklet';
   const floatingKeyboardInset = Math.max(0, keyboardInset);
-  const occludedBottom = floatingKeyboardInset + Math.max(0, controlBarHeight);
+  // TUIs land above the resting rail before it reappears. Ordinary terminal
+  // history stays full-screen so rows can pass behind the floating controls.
+  const occludedBottom = Math.max(0, controlBarHeight)
+    + Math.max(floatingKeyboardInset, restingInputClearance ? Math.max(0, sessionChromeInset) : 0);
   const cursorShift = !composerVisible
-    && floatingKeyboardInset > 0
+    && (restingInputClearance || floatingKeyboardInset > 0)
+    && occludedBottom > 0
     && typeof cursorBottom === 'number' && Number.isFinite(cursorBottom)
     && typeof viewportHeight === 'number' && viewportHeight > 0
     && Number.isFinite(viewportHeight)

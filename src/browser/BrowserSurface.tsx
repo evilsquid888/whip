@@ -1,3 +1,4 @@
+import { KeyboardAvoidingView, useKeyboardState } from 'react-native-keyboard-controller';
 import {
   memo,
   useCallback,
@@ -12,7 +13,6 @@ import {
   BackHandler,
   findNodeHandle,
   Keyboard,
-  KeyboardAvoidingView,
   Linking,
   Platform,
   Pressable,
@@ -21,7 +21,8 @@ import {
   useWindowDimensions,
   View,
   type ViewStyle,
-  type TextInput,
+  type TextInputInstance,
+  type ViewInstance,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import WebView from 'react-native-webview';
@@ -84,7 +85,6 @@ import { useBrowserDownloads } from './useBrowserDownloads';
 import { BrowserSiteInfo } from './BrowserSiteInfo';
 import { browserDisplayAddress } from './siteInfo';
 import { browserLibrary } from './library';
-import { useKeyboardInset } from '../hooks/useKeyboardInset';
 import { terminalWebLinkTarget } from '../lib/terminalLinks';
 import { useTheme } from '../theme';
 import { Button } from '../components/ui/button';
@@ -124,7 +124,7 @@ const TabRenderer = memo(function BrowserTabRenderer({
     }
   }, []);
   useEffect(() => finishRecovery, [finishRecovery]);
-  const containerRef = useRef<View>(null);
+  const containerRef = useRef<ViewInstance>(null);
   const [nativeTag, setNativeTag] = useState<number | null>(null);
   const initialSource = useRef<{ uri: string } | undefined>({
     uri: tab.source,
@@ -261,7 +261,7 @@ const TabRenderer = memo(function BrowserTabRenderer({
       collapsable={false}
       style={viewportStyle}
       // React effects can run before Fabric mounts the native descendants.
-      onLayout={() => setNativeTag(findNodeHandle(containerRef.current))}
+      onLayout={() => setNativeTag(findNodeHandle(containerRef.current) ?? null)}
     >
       <WebView
         ref={ref}
@@ -374,7 +374,7 @@ export function BrowserSurface({
   const { colors } = useTheme();
   const insets = useSafeAreaInsets();
   const [address, setAddress] = useState('');
-  const addressInput = useRef<TextInput>(null);
+  const addressInput = useRef<TextInputInstance>(null);
   const [panel, setPanel] = useState<BrowserPanel | null>(null);
   const [downloadsVisible, setDownloadsVisible] = useState(false);
   const openDownloads = useCallback(() => {
@@ -447,12 +447,7 @@ export function BrowserSurface({
     panel === BrowserPanel.Settings ||
     panel === BrowserPanel.Bookmarks ||
     panel === BrowserPanel.BrowsingHistory;
-  const surfaceRef = useRef<View>(null);
-  const [keyboardVisible, setKeyboardVisible] = useState(false);
-  const { inset: keyboardInset } = useKeyboardInset(surfaceRef, {
-    enabled: Platform.OS === 'android' && !!entry,
-    onVisibilityChange: setKeyboardVisible,
-  });
+  const keyboardVisible = useKeyboardState(state => state.isVisible);
   useEffect(() => {
     if (entry && browserRegistry.routing)
       void browserRegistry.routing
@@ -637,7 +632,6 @@ export function BrowserSurface({
   };
   return (
     <View
-      ref={surfaceRef}
       collapsable={false}
       pointerEvents={entry || downloadsVisible ? 'auto' : 'none'}
       accessibilityElementsHidden={!entry && !downloadsVisible}
@@ -647,7 +641,6 @@ export function BrowserSurface({
       style={[
         styles.surface,
         !entry && !downloadsVisible && styles.hidden,
-        { paddingBottom: keyboardInset },
       ]}
     >
       <BrowserDownloadsScreen
@@ -656,7 +649,7 @@ export function BrowserSurface({
       />
       <KeyboardAvoidingView
         style={styles.fill}
-        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+        behavior="padding" automaticOffset
       >
         {error && (
           <Text

@@ -15,9 +15,12 @@ import { LocalSvg } from 'react-native-svg/css';
 import { herdrProtocolLabel } from 'react-native-whip-ssh';
 
 import terminalFonts from '@/assets/terminal-fonts/manifest.json';
+import { billingDistributionFromExtra } from '@/src/billing/distribution';
 import { bundledAsset } from '@/src/lib/bundledAsset';
 import { isUnknownRecord } from '@/src/lib/unknown';
+import { HERDR_WEBSITE_URL } from '@/src/lib/herdr';
 import { WHIP_REPOSITORY_URL } from '@/src/services/githubReleases';
+import { GitHubMark } from './GitHubMark';
 import { CheckForUpdates } from './CheckForUpdates';
 import { hapticPress, HerdrMark, WhipMark } from './app-ui';
 import { GlassBackdrop } from './GlassSurface';
@@ -28,7 +31,8 @@ import { Icon } from './ui/icon';
 import { Text } from './ui/text';
 
 export { WHIP_REPOSITORY_URL } from '@/src/services/githubReleases';
-export const HERDR_WEBSITE_URL = 'https://herdr.dev/';
+export { HERDR_WEBSITE_URL } from '@/src/lib/herdr';
+export const GOVUE_REPOSITORY_URL = 'https://github.com/kosumic/GoVue';
 export const X_PROFILE_URL = 'https://x.com/Kosumi1989';
 export const WHIP_INSTALL_URL = 'https://kosumic.github.io/whip/';
 const ABOUT_EXPAND_DURATION = 340;
@@ -69,6 +73,7 @@ export function AboutSection({ onOpenLicenses }: { onOpenLicenses: () => void })
 
   const whipVersion = Application.nativeApplicationVersion || Constants.expoConfig?.version || t('common.unavailable');
   const expoExtra: unknown = Constants.expoConfig?.extra;
+  const { channel } = billingDistributionFromExtra(expoExtra);
   const embeddedCommit = isUnknownRecord(expoExtra) ? expoExtra.gitCommit : undefined;
   const fullWhipCommit = typeof embeddedCommit === 'string' && /^[0-9a-f]{7,64}$/i.test(embeddedCommit)
     ? embeddedCommit
@@ -81,8 +86,8 @@ export function AboutSection({ onOpenLicenses }: { onOpenLicenses: () => void })
       Alert.alert(t('about.commitError'), String(error));
     });
   };
-  const openRepository = () => {
-    Linking.openURL(WHIP_REPOSITORY_URL).catch(error => {
+  const openRepository = (repositoryUrl: string) => {
+    Linking.openURL(repositoryUrl).catch(error => {
       Alert.alert(t('about.githubError'), String(error));
     });
   };
@@ -160,7 +165,7 @@ export function AboutSection({ onOpenLicenses }: { onOpenLicenses: () => void })
               className="min-h-[76px] min-w-0 flex-1 justify-start overflow-hidden rounded-lg border border-white/30 bg-transparent px-4 py-4 dark:border-white/10"
               size="content"
               variant="outline"
-              onPress={hapticPress(openRepository)}>
+              onPress={hapticPress(() => openRepository(WHIP_REPOSITORY_URL))}>
               <GlassBackdrop shapeClassName="rounded-lg" />
               <View className="size-11 items-center justify-center rounded-full bg-black">
                 <GitHubMark size={22} />
@@ -242,7 +247,7 @@ export function AboutSection({ onOpenLicenses }: { onOpenLicenses: () => void })
                 <Icon as={ExternalLink} size={12} />
               </Button>
             ) : null}
-            <CheckForUpdates installedVersion={whipVersion} />
+            {channel === 'github' ? <CheckForUpdates installedVersion={whipVersion} /> : null}
           </View>
 
           <View className="mt-9 items-center">
@@ -300,9 +305,32 @@ export function AboutSection({ onOpenLicenses }: { onOpenLicenses: () => void })
           <View className="border-t border-border">
             <AboutRow label={t('about.terminalTextFont')} value={terminalFonts.text.displayName} />
             <AboutRow label={t('about.terminalCjkFont')} value={terminalFonts.cjk.displayName} divided />
-            <AboutRow label={t('about.terminalSymbolFont')} value={terminalFonts.symbols.displayName} divided />
+            <AboutRow label={t('about.terminalSymbolFont')} value={[terminalFonts.symbols.displayName, terminalFonts.unicodeSymbols.displayName].join(', ')} divided />
             <AboutRow label={t('about.terminalEmojiFont')} value={terminalFonts.emoji.displayName} divided />
             <AboutRow label={t('about.terminalFallbackFont')} value={fallbackFont.displayName} divided />
+          </View>
+
+          <View className="mt-9">
+            <Text className="mb-3 px-1 text-sm font-semibold text-muted-foreground">{t('about.featuredProjects')}</Text>
+            <Button
+              accessibilityRole="link"
+              className="min-h-[76px] w-full min-w-0 justify-start overflow-hidden rounded-lg border border-white/30 bg-transparent px-4 py-4 dark:border-white/10"
+              size="content"
+              variant="outline"
+              onPress={hapticPress(() => openRepository(GOVUE_REPOSITORY_URL))}>
+              <GlassBackdrop shapeClassName="rounded-lg" />
+              <Image
+                accessible={false}
+                className="size-11 rounded-xl bg-white"
+                source={bundledAsset(require('../../assets/brand/govue.png'))}
+                resizeMode="contain"
+              />
+              <View className="min-w-0 flex-1">
+                <Text className="text-[15px] font-semibold leading-5">GoVue</Text>
+                <Text className="mt-0.5 text-xs leading-[17px] text-muted-foreground">{t('about.goVueDescription')}</Text>
+              </View>
+              <Icon as={ExternalLink} className="text-muted-foreground" size={19} />
+            </Button>
           </View>
 
           </View>
@@ -310,17 +338,6 @@ export function AboutSection({ onOpenLicenses }: { onOpenLicenses: () => void })
       </Animated.View>
       </SectionCard>
     </View>
-  );
-}
-
-function GitHubMark({ size }: { size: number }) {
-  return (
-    <LocalSvg
-      accessible={false}
-      asset={bundledAsset(require('../../assets/brand/github.svg'))}
-      height={size}
-      width={size}
-    />
   );
 }
 
@@ -338,9 +355,9 @@ function XMark({ size }: { size: number }) {
 function AboutRow({ label, value, divided = false }: { label: string; value: string; divided?: boolean }) {
   return (
     <View className={divided ? 'min-h-[68px] flex-row items-center border-t border-border px-4 py-3' : 'min-h-[68px] flex-row items-center px-4 py-3'}>
-      <Text className="flex-1 text-[15px] font-semibold leading-5">{label}</Text>
-      <View className="ml-4 items-end">
-        <Text className="text-sm font-medium leading-5">{value}</Text>
+      <Text className="min-w-0 flex-1 text-[15px] font-semibold leading-5">{label}</Text>
+      <View className="ml-4 min-w-0 max-w-[60%] shrink items-end">
+        <Text className="text-right text-sm font-medium leading-5">{value}</Text>
       </View>
     </View>
   );

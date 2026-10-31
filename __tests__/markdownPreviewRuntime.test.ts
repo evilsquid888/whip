@@ -6,6 +6,7 @@ import { JSDOM } from 'jsdom';
 const runtime = readFileSync(resolve(__dirname, '../scripts/markdown-preview-runtime.js'), 'utf8');
 const marked = readFileSync(resolve(__dirname, '../node_modules/marked/lib/marked.umd.js'), 'utf8');
 const purify = readFileSync(resolve(__dirname, '../node_modules/dompurify/dist/purify.min.js'), 'utf8');
+const diagramRenderer = readFileSync(resolve(__dirname, '../scripts/diagram-renderer.js'), 'utf8');
 const theme = { scheme: 'dark', colors: { canvas: '#1a1b26', foreground: '#c0caf5' } };
 let dom: JSDOM;
 let messages: Record<string, unknown>[];
@@ -19,6 +20,7 @@ beforeEach(() => {
   dom.window.ResizeObserver = class { observe() {} };
   dom.window.eval(marked);
   dom.window.eval(purify);
+  dom.window.eval(diagramRenderer);
   dom.window.eval(runtime);
 });
 afterEach(() => dom.window.close());
@@ -59,6 +61,42 @@ test('updates cached images in place and rejects stale or arbitrary local URLs',
   expect(messages.at(-1)).toEqual({ type: 'link', target: 'details.md', requestId: 1 });
 });
 
+test.each(['react-native-frontend', 'whip-rust-core'])('keeps the %s diagram as an SVG image with its original labels and link', name => {
+  const target = `docs/${name}-architecture.svg`;
+  const svgBase64 = readFileSync(resolve(__dirname, '..', target), 'base64');
+  const uri = `data:image/svg+xml;base64,${svgBase64}`;
+  render(`[![Architecture](${target})](${target})`);
+  const image = dom.window.document.querySelector('a img')!;
+
+  dom.window.herdrSetMarkdownImage(0, target, uri);
+  expect(image.hasAttribute('src')).toBe(false);
+  dom.window.herdrSetMarkdownImage(1, target, uri);
+
+  expect(image.getAttribute('src')).toBe(uri);
+  expect(image.getAttribute('alt')).toBe('Architecture');
+  expect(dom.window.document.querySelectorAll('svg, foreignObject, script')).toHaveLength(0);
+  image.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true, cancelable: true }));
+  expect(messages.at(-1)).toEqual({ type: 'link', target, requestId: 1 });
+});
+
+test('rejects document data URLs and retains alt text when an SVG fails to decode', async () => {
+  render('![Diagram](diagram.svg)');
+  const image = dom.window.document.querySelector('img')!;
+  for (const uri of ['data:text/html;base64,cG5n', 'data:image/svg+xml,<svg/>', 'data:image/svg+xml;base64,invalid<svg>']) {
+    dom.window.herdrSetMarkdownImage(1, 'diagram.svg', uri);
+    expect(image.hasAttribute('src')).toBe(false);
+  }
+  dom.window.herdrSetMarkdownImage(1, 'diagram.svg', 'data:image/svg+xml;base64,aW52YWxpZA==');
+  Object.defineProperty(image, 'complete', { value: false });
+  // The browser's error event must finish layout restoration just like an image load.
+  const finish = dom.window.herdrFinishMarkdownImages(1);
+  await Promise.resolve();
+  image.dispatchEvent(new dom.window.Event('error'));
+  await finish;
+  expect(image.getAttribute('alt')).toBe('Diagram');
+  expect(messages.at(-1)!.type).toBe('size');
+});
+
 test('creates unique anchors and handles fragment links inside the document', () => {
   render('# Title\n\n# Title\n\n[Jump](#title-1)');
   const heading = dom.window.document.getElementById('title-1')!;
@@ -82,13 +120,35 @@ test('retains SVG and Mermaid diagram previews with readable source on invalid d
   dom.window.document.body.style.fontFamily = fontFamily;
   const load = jest.fn().mockResolvedValue([]);
   Object.defineProperty(dom.window.document, 'fonts', { value: { load } });
-  dom.window.mermaid = { initialize: jest.fn(), render: jest.fn()
-    .mockResolvedValueOnce({ svg: '<svg xmlns="http://www.w3.org/2000/svg"><text>Diagram</text></svg>' })
-    .mockRejectedValueOnce(new Error('Invalid diagram')) };
+  dom.window.pele = { render: jest.fn()
+    .mockReturnValueOnce({ svg: '<svg xmlns="http://www.w3.org/2000/svg"><text>Diagram</text></svg>' })
+    .mockImplementationOnce(() => { throw new Error('Invalid diagram'); }) };
   render('```mermaid\nflowchart LR\nA --> B\n```\n\n```svg\n<svg xmlns="http://www.w3.org/2000/svg"><rect width="10" height="10"/></svg>\n```\n\n```mermaid\ninvalid\n```');
   await dom.window.herdrFinishMarkdownImages(1);
   expect(load).toHaveBeenCalledWith(`16px ${fontFamily}`, 'flowchart LR\nA --> B\n');
-  expect(dom.window.mermaid.initialize).toHaveBeenCalledWith(expect.objectContaining({ fontFamily }));
+  expect(dom.window.pele.render).toHaveBeenCalledWith('flowchart LR\nA --> B\n', expect.objectContaining({ links: false, images: false }));
   expect(dom.window.document.querySelectorAll('.diagram svg')).toHaveLength(2);
   expect(dom.window.document.querySelector('pre code')!.textContent).toContain('invalid');
+});
+
+test('ignores diagrams whose fonts finish loading after replacing the Markdown document', async () => {
+  let finish!: () => void;
+  let start!: () => void;
+  const renderingStarted = new Promise<void>(done => { start = done; });
+  Object.defineProperty(dom.window.document, 'fonts', { value: {
+    load: jest.fn().mockImplementationOnce(() => {
+      start();
+      return new Promise<void>(done => { finish = done; });
+    }).mockResolvedValue([]),
+  } });
+  dom.window.pele = { render: jest.fn().mockReturnValue({ svg: '<svg><text>New</text></svg>' }) };
+  render('```mermaid\nflowchart LR\nOld --> Document\n```');
+  const previous = dom.window.herdrFinishMarkdownImages(1);
+  await renderingStarted;
+  render('```mermaid\nflowchart LR\nNew --> Document\n```', 2);
+  await dom.window.herdrFinishMarkdownImages(2);
+  finish();
+  await previous;
+  expect(dom.window.document.querySelectorAll('.diagram svg')).toHaveLength(1);
+  expect(dom.window.document.querySelector('.diagram text')!.textContent).toBe('New');
 });

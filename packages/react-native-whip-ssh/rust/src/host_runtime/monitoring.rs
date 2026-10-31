@@ -1,8 +1,14 @@
 //! Process-owned health monitoring; UI visibility only controls fast latency probes.
 
-use super::*;
-use std::sync::atomic::AtomicBool;
-use std::time::Instant;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
+use super::{
+    HostConnectionState, HostRuntimeEvent, RuntimeInner, agent_view, begin_reconnect, emit,
+    log_lifecycle, measure_application_latency_inner, measure_host_latency_inner,
+    refresh_host_state_inner, runtimes,
+};
 
 static BACKGROUND_MONITORING_ACTIVE: AtomicBool = AtomicBool::new(false);
 
@@ -140,7 +146,8 @@ pub(super) fn set_monitoring_state(
                 let reconcile_due = last_reconcile.elapsed() >= RECONCILE_INTERVAL;
                 let needs_reconcile = {
                     let state = inner.state.lock();
-                    state.connection == HostConnectionState::Connected
+                    inner.config.herdr_enabled
+                        && state.connection == HostConnectionState::Connected
                         && (reconcile_due
                             || (health_due && inner.reverse_control.needs_resume())
                             || (health_due

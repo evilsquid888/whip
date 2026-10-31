@@ -23,12 +23,15 @@ import {
   Link,
   Search,
   SquareTerminal,
+  Volume2,
+  VolumeX,
   type LucideIcon,
 } from 'lucide-react-native';
 import {
   ActivityIndicator,
   Keyboard,
   Linking,
+  Platform,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -37,24 +40,30 @@ import {
   type NativeSyntheticEvent,
 } from 'react-native';
 import { useTranslation } from 'react-i18next';
+import type { HostRuntimeConnection } from 'react-native-whip-ssh';
+import type { ChatSearchInitialTarget } from 'react-native-whip-ssh/src/chatSearch';
 import { useCopyFeedback } from '../hooks/useCopyFeedback';
-import Animated, { useAnimatedStyle } from 'react-native-reanimated';
+import type { ChatReadAloudControl } from '../hooks/useChatReadAloud';
+import Animated, { useAnimatedStyle, type SharedValue } from 'react-native-reanimated';
 import { useDecorativeProgress } from '../hooks/useDecorativeProgress';
 import { useChatSearch } from '../hooks/useChatSearch';
+import { useChatActivity, type ChatActivity, type ChatToolActivity } from '../hooks/useChatActivity';
 import { useScrollActivity } from '../hooks/useScrollActivity';
-import { chatSearchPresentation, EMPTY_CHAT_SEARCH_PRESENTATION } from '../lib/chatSearchPresentation';
 import { ChatSearchBar, chatSearchBarHeight } from './ChatSearchBar';
 
 import type {
   AgentChatState,
-  TranscriptFileDiff,
   TranscriptMessage,
   TranscriptPart,
   TranscriptQuestion,
   TranscriptToolPart,
   TranscriptTurn,
 } from '../agentChat';
-import { isQuestionTool, isRunningTool as isRunning, transcriptBlocks, type ChatBlock } from '../lib/agentChatBlocks';
+import { isQuestionTool, isRunningTool as isRunning } from '../lib/agentChatBlocks';
+import { resolveChatRow, type ChatBlock, type ChatRow, type ChatRowStore } from '../lib/nativeChatRows';
+import { useNativeChatRows } from '../hooks/useNativeChatRows';
+import { nativeTranscriptLookup } from '../lib/nativeAgentTranscript';
+import { CHAT_WORKING_LABEL, CHAT_WORKING_SHIMMER_PERIOD_MS, workingShimmerOpacity } from '../lib/chatWorkingAnimation';
 import type { ChatViewportState } from '../lib/chatViewportState';
 import { chatAgentDisplayName, type ChatAgent } from '../lib/agentChatSession';
 import {
@@ -83,16 +92,22 @@ import { OverlayScrollbar, type OverlayScrollbarDragEvent } from './OverlayScrol
 import { Button } from './ui/button';
 import { Text } from './ui/text';
 import { ChatPromptImage } from './ChatPromptImage';
+import { ChatFileDiff as ToolFileDiffBlock } from './ChatFileDiff';
 import type { RemoteFileClient } from '../services/remoteFileTransfer';
 
 interface Props {
   imageClient?: RemoteFileClient;
+  searchRuntime?: Pick<HostRuntimeConnection, 'agentTranscriptSearch' | 'agentChatRows'>;
+  searchKey?: string;
+  savedSearchNamespace?: string;
+  initialSearchTarget?: ChatSearchInitialTarget;
   state: AgentChatState;
   /** Selected and requested, including preparation before the viewport is revealed. */
   active?: boolean;
   agent: ChatAgent;
   agentStatus: AgentStatus;
   contentInsets: VisualContentInsets;
+  animatedBottomInset?: SharedValue<number>;
   latestButtonBottom: number;
   searchOpen?: boolean;
   onCloseSearch?: () => void;
@@ -102,6 +117,7 @@ interface Props {
   onInitialViewportReady?: () => void;
   savedViewport?: ChatViewportState;
   onSaveViewport?: (state: ChatViewportState) => void;
+  readAloud?: ChatReadAloudControl;
 }
 
 const CHAT_CONTENT_TOP_GAP = 16;
@@ -116,6 +132,10 @@ const TOOL_HEADER_PREVIEW_LENGTH = 160;
 const CHAT_CONTEXT_PREVIEW_LENGTH = 256;
 const CHAT_CONTEXT_HEIGHT = 44;
 const CHAT_CONTEXT_GAP = 8;
+const CHAT_ACTIVITY_TINT_OPACITY = 0.6;
+const CHAT_WORKING_TICK_MS = 1_000;
+const CHAT_WORKING_LETTERS = Array.from(CHAT_WORKING_LABEL);
+const CHAT_WORKING_TEXT_CLASS = 'text-[12px] font-medium leading-4 text-foreground';
 const NIX_EXECUTABLE_PREFIX = /\/nix\/store\/[^/\s"'`]+\/s?bin\//g;
 const CHAT_MAINTAIN_VISIBLE_CONTENT_POSITION = {
   startRenderingFromBottom: true,
@@ -157,23 +177,47 @@ function chatContextPreview(text: string): string {
   return text.length > CHAT_CONTEXT_PREVIEW_LENGTH ? `${prefix}…` : prefix;
 }
 
+function reasoningContextPreview(text: string): string {
+  const lines = text.split('\n');
+  for (let index = lines.length - 1; index >= 0; index--) {
+    let line = lines[index].trim();
+    if (!line || line.startsWith('<!--')) continue;
+    line = line.replace(/^#+/u, '').trim();
+    if (line.startsWith('**')) {
+      const end = line.indexOf('**', 2);
+      if (end < 0) continue;
+      line = line.slice(2, end) + line.slice(end + 2);
+    }
+    const preview = chatContextPreview(line);
+    if (preview) return preview;
+  }
+  return '';
+}
+
+const promptPreviews = new WeakMap<TranscriptMessage, string>();
 function promptContextPreview(message: TranscriptMessage): string {
+  const cached = promptPreviews.get(message);
+  if (cached !== undefined) return cached;
   let text = '';
   for (const part of message.parts) {
     const value = part.type === 'text' ? part.text : part.type === 'image' ? '[Image]' : '';
     if (value) text += `${text ? ' ' : ''}${value.slice(0, CHAT_CONTEXT_PREVIEW_LENGTH + 1 - text.length)}`;
     if (text.length > CHAT_CONTEXT_PREVIEW_LENGTH) break;
   }
-  return chatContextPreview(text);
+  const preview = chatContextPreview(text);
+  promptPreviews.set(message, preview);
+  return preview;
 }
 
 /** Select against the natural viewport edge so showing the header cannot change its owner. */
-function usePinnedPrompt(blocks: ChatBlock[], list: RefObject<FlashListRef<ChatBlock> | null>, top: number) {
-  const prompts = useMemo(() => blocks.flatMap((block, index) => {
-    if (block.type !== 'user') return [];
-    const preview = promptContextPreview(block.message);
-    return preview ? [{ id: block.id, index, preview }] : [];
-  }), [blocks]);
+function usePinnedPrompt(store: ChatRowStore, state: AgentChatState, list: RefObject<FlashListRef<ChatRow> | null>, top: number) {
+  const { messages, userRevision } = nativeTranscriptLookup(state);
+  const userRows = store.userRows;
+  const prompts = useMemo(() => userRows.filter(row => {
+    const message = row.type === 'user' ? messages.get(row.messageId) : undefined;
+    return message && promptContextPreview(message);
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- The shared message index mutates in place; only user edits invalidate prompt previews.
+  }), [userRows, messages, userRevision]);
   const [promptId, setPromptId] = useState<string | null>(null);
   const currentId = useRef<string | null>(null);
   const update = useCallback((offset: number) => {
@@ -182,40 +226,135 @@ function usePinnedPrompt(blocks: ChatBlock[], list: RefObject<FlashListRef<ChatB
     let high = prompts.length;
     while (low < high) {
       const mid = Math.floor((low + high) / 2);
-      const layout = list.current?.getLayout?.(prompts[mid].index);
+      const layout = list.current?.getLayout?.(store.indexOf(prompts[mid].id));
       if (!layout) return;
       if (layout.y <= edge) low = mid + 1;
       else high = mid;
     }
     const candidate = prompts[low - 1];
-    const layout = candidate && list.current?.getLayout?.(candidate.index);
+    const layout = candidate && list.current?.getLayout?.(store.indexOf(candidate.id));
     // A partially visible prompt supplies its own context, including long prompts.
     const nextId = layout && layout.y + layout.height <= edge ? candidate.id : null;
     if (currentId.current === nextId) return;
     currentId.current = nextId;
     setPromptId(nextId);
-  }, [list, prompts, top]);
-  return { prompt: prompts.find(prompt => prompt.id === promptId), update };
+  }, [list, prompts, store, top]);
+  const index = promptId ? store.indexOf(promptId) : -1;
+  const row = store.rows[index];
+  const block = row && resolveChatRow(row, state);
+  const preview = block?.type === 'user' ? promptContextPreview(block.message) : '';
+  return { prompt: preview && row ? { id: row.id, index, preview } : undefined, update };
 }
 
-function currentActivity(blocks: ChatBlock[], turn?: TranscriptTurn) {
+function currentActivity(blocks: ChatRow[], state: AgentChatState, turn?: TranscriptTurn) {
+  let summary: ChatActivity | undefined;
+  let progress: ChatActivity | undefined;
+  let tool: ChatToolActivity | undefined;
+  let question: ChatToolActivity | undefined;
+  let promptId: string | undefined;
+  let beforeLatestPrompt = false;
   for (let index = blocks.length - 1; index >= 0; index--) {
-    const block = blocks[index];
-    if (block.turnId !== turn?.id) break;
-    if (block.type === 'thinking') break;
+    const row = blocks[index];
+    if (row.turnId !== turn?.id) break;
+    const block = resolveChatRow(row, state);
+    if (!block) continue;
+    if (block.type === 'user') {
+      promptId ??= block.id;
+      beforeLatestPrompt = true;
+    }
     if (block.type !== 'part') continue;
     const part = block.part;
     if (part.type === 'tool' && isRunning(part)) {
       const presentation = toolPresentation(part);
-      return { title: isQuestionTool(part) ? 'Question requested' : presentation.title,
-        detail: chatContextPreview(presentation.subtitle ?? '') };
+      const detail = chatContextPreview(presentation.subtitle ?? '');
+      const candidate = { id: block.id, activity: { title: presentation.title, detail } };
+      if (isQuestionTool(part)) question ??= { ...candidate, activity: { title: 'Question requested', detail } };
+      tool ??= candidate;
     }
-    if (block.streaming && (part.type === 'text' || part.type === 'reasoning')) {
-      return { title: part.type === 'reasoning' ? 'Thinking' : 'Responding',
-        detail: chatContextPreview(part.text.slice(-CHAT_CONTEXT_PREVIEW_LENGTH)) };
+    // Codex retains its useful status through tool calls. Some rollouts omit
+    // reasoning summaries entirely, but still record assistant progress text.
+    if (!beforeLatestPrompt && !summary && part.type === 'reasoning') {
+      const preview = reasoningContextPreview(part.text);
+      if (preview) summary = { title: preview, detail: '' };
+    }
+    if (!beforeLatestPrompt && !progress && part.type === 'text') {
+      const preview = chatContextPreview(block.streaming ? part.text.slice(-CHAT_CONTEXT_PREVIEW_LENGTH) : part.text);
+      if (preview) progress = { title: preview, detail: '' };
     }
   }
-  return { title: 'Thinking', detail: '' };
+  return { summary: summary ?? progress, tool: question ?? tool, promptId };
+}
+
+function WorkingLetter({ letter, index, progress, reduceMotion }: {
+  letter: string;
+  index: number;
+  progress: SharedValue<number>;
+  reduceMotion: boolean;
+}) {
+  const style = useAnimatedStyle(() => ({
+    opacity: reduceMotion ? 1 : workingShimmerOpacity(progress.value, index),
+  }), [index, reduceMotion]);
+  return <Animated.View style={style}><Text className={CHAT_WORKING_TEXT_CLASS}>{letter}</Text></Animated.View>;
+}
+
+function ChatWorkingStatus({ startedAt, active }: { startedAt?: number; active: boolean }) {
+  const { colors } = useTheme();
+  const reduceMotion = useReducedMotion();
+  const [fallbackStartedAt] = useState(Date.now);
+  const [now, setNow] = useState(fallbackStartedAt);
+  const progress = useDecorativeProgress(active && !reduceMotion, CHAT_WORKING_SHIMMER_PERIOD_MS, false);
+  useEffect(() => {
+    if (!active) return;
+    setNow(Date.now());
+    const timer = setInterval(() => setNow(Date.now()), CHAT_WORKING_TICK_MS);
+    return () => clearInterval(timer);
+  }, [active]);
+  const start = startedAt ?? fallbackStartedAt;
+  const duration = formatDuration(start, Math.max(start, now));
+  const label = `${CHAT_WORKING_LABEL} (${duration})`;
+  return (
+    <View testID="chat-inline-working" className="min-h-11 flex-row items-center gap-2">
+      <ActivityIndicator animating={active && !reduceMotion} hidesWhenStopped={false} size={13} color={colors.textTertiary} />
+      <View testID="chat-working-status" accessible accessibilityLabel={label} className="flex-row items-center">
+        {CHAT_WORKING_LETTERS.map((letter, index) => (
+          <WorkingLetter key={index} letter={letter} index={index} progress={progress} reduceMotion={reduceMotion} />
+        ))}
+        <Text className="text-[12px] font-medium leading-4 text-muted-foreground">{` (${duration})`}</Text>
+      </View>
+    </View>
+  );
+}
+
+function ChatActivityStrip({ activity, onPress }: {
+  activity: ChatActivity;
+  onPress: () => void;
+}) {
+  const { colors } = useTheme();
+  const glass = useAppGlassEnabled();
+  const reduceMotion = useReducedMotion();
+  return (
+    <GlassSurface
+      testID="chat-pinned-activity"
+      tintOpacity={CHAT_ACTIVITY_TINT_OPACITY}
+      className={cn('absolute left-4 right-4 z-20 rounded-xl', glass && APP_GLASS_BORDER_CLASS_NAME)}
+      fallbackClassName="border border-border bg-background"
+      style={{ bottom: CHAT_CONTEXT_GAP, height: CHAT_CONTEXT_HEIGHT }}
+    >
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel={`Current activity: ${activity.title}${activity.detail ? `, ${activity.detail}` : ''}`}
+        accessibilityHint="Jump to the latest output"
+        className="min-h-11 flex-row items-center gap-2 px-3"
+        onPress={hapticPress(onPress)}
+      >
+        <ActivityIndicator animating={!reduceMotion} hidesWhenStopped={false} size={13} color={colors.textTertiary} />
+        <Text numberOfLines={1} className="min-w-0 flex-1 text-[12px] leading-5 text-foreground">
+          {activity.title}{activity.detail ? ` · ${activity.detail}` : ''}
+        </Text>
+        <ArrowDown size={16} color={colors.textSecondary} />
+      </Pressable>
+    </GlassSurface>
+  );
 }
 
 enum ChatScrollInteractionKind {
@@ -240,19 +379,6 @@ function ChatBoundarySpacer({ height }: { height: number }) {
       pointerEvents="none"
       style={style}
     />
-  );
-}
-
-function ThinkingIndicator({ active = true }: { active?: boolean }) {
-  const reduceMotion = useReducedMotion();
-  const progress = useDecorativeProgress(active && !reduceMotion, 800);
-  const style = useAnimatedStyle(() => ({ opacity: reduceMotion ? 1 : 0.48 + (progress.value * 0.52) }), [reduceMotion]);
-  return (
-    <View accessibilityLiveRegion="polite" className="mt-3 min-h-5 flex-row items-center">
-      <Animated.View style={style}>
-        <Text className="text-[13px] font-medium leading-5 text-muted-foreground">Thinking</Text>
-      </Animated.View>
-    </View>
   );
 }
 
@@ -367,7 +493,7 @@ function toolHeaderPreview(text: string): string {
   return preview.length < text.length ? `${preview}…` : preview;
 }
 
-function ToolCard({ item, expanded, onToggle, active, onLinkPress }: BlockExpansion & { item: TranscriptToolPart; active: boolean; onLinkPress: (url: string) => void }) {
+function ToolCard({ item, expanded, onToggle, active, onLinkPress, directory }: BlockExpansion & { item: TranscriptToolPart; active: boolean; onLinkPress: (url: string) => void; directory?: string }) {
   const { colors } = useTheme();
   const failed = item.state.status === 'error';
   const presentation = toolPresentation(item);
@@ -468,7 +594,7 @@ function ToolCard({ item, expanded, onToggle, active, onLinkPress }: BlockExpans
           {shellCommand
             ? <ShellToolBlock command={shellCommand} output={shellOutput} />
             : shellOutput ? <ToolOutputBlock text={shellOutput} bordered copyable /> : null}
-          {files.map(file => <ToolFileDiffBlock key={file.file} file={file} />)}
+          {files.map(file => <ToolFileDiffBlock key={file.file} file={file} directory={directory} />)}
           {markdownOutput && <ToolOutputBlock text={markdownOutput} markdown bordered copyable onLinkPress={onLinkPress} />}
           {otherOutput && <ToolOutputBlock text={otherOutput} bordered copyable />}
           {writtenContent && <ToolOutputBlock text={writtenContent} bordered copyable />}
@@ -634,57 +760,6 @@ const chatListStyles = StyleSheet.create({
   },
 });
 
-function ToolDiffBlock({ diff }: { diff: string }) {
-  const { colors } = useTheme();
-  const lines = diff.split('\n');
-  return (
-    <View className="overflow-hidden">
-      <ScrollView className="w-full" horizontal nestedScrollEnabled showsHorizontalScrollIndicator={false} contentContainerClassName="min-w-full px-1">
-        <Text selectable className="font-mono text-[11px] leading-[17px] text-foreground">
-          {lines.map((line, index) => (
-            <Text
-              key={`${index}:${line}`}
-              style={{
-                color: line.startsWith('+') && !line.startsWith('+++')
-                  ? colors.done
-                  : line.startsWith('-') && !line.startsWith('---')
-                    ? colors.error
-                    : colors.text,
-              }}
-            >
-              <SearchText text={line} />{index < lines.length - 1 ? '\n' : ''}
-            </Text>
-          ))}
-        </Text>
-      </ScrollView>
-    </View>
-  );
-}
-
-function fileDiffText(file: TranscriptFileDiff): string | undefined {
-  if (file.patch) return file.patch;
-  if (file.before === undefined && file.after === undefined) return undefined;
-  const before = (file.before || '').split('\n').map(line => `-${line}`).join('\n');
-  const after = (file.after || '').split('\n').map(line => `+${line}`).join('\n');
-  return [`--- ${file.file}`, `+++ ${file.file}`, before, after].filter(Boolean).join('\n');
-}
-
-function ToolFileDiffBlock({ file }: { file: TranscriptFileDiff }) {
-  const { colors } = useTheme();
-  const diff = fileDiffText(file);
-  return (
-    <View className="overflow-hidden rounded-md border border-border">
-      <View className="min-h-8 flex-row items-center gap-2 border-b border-border px-2.5 py-1.5">
-        <File size={13} color={colors.textTertiary} />
-        <Text numberOfLines={1} className="min-w-0 flex-1 font-mono text-[10px] text-foreground"><SearchText text={file.file} /></Text>
-        {file.additions > 0 && <Text className="font-mono text-[10px]" style={{ color: colors.done }}>+{file.additions}</Text>}
-        {file.deletions > 0 && <Text className="font-mono text-[10px]" style={{ color: colors.error }}>−{file.deletions}</Text>}
-      </View>
-      {diff && <View className="py-2"><ToolDiffBlock diff={diff} /></View>}
-    </View>
-  );
-}
-
 function TranscriptNoticeCard({
   error = false,
   className,
@@ -737,6 +812,7 @@ function TranscriptQuestions({ questions }: { questions: readonly TranscriptQues
 
 function AssistantPart({
   part,
+  directory,
   onLinkPress,
   streaming = false,
   expanded,
@@ -744,6 +820,7 @@ function AssistantPart({
   active,
 }: BlockExpansion & {
   active: boolean;
+  directory?: string;
   part: TranscriptPart;
   onLinkPress: (url: string) => void;
   streaming?: boolean;
@@ -778,7 +855,7 @@ function AssistantPart({
       </TranscriptNoticeCard>
     );
   }
-  if (part.type === 'tool') return <ToolCard item={part} expanded={expanded} onToggle={onToggle} active={active} onLinkPress={onLinkPress} />;
+  if (part.type === 'tool') return <ToolCard item={part} directory={directory} expanded={expanded} onToggle={onToggle} active={active} onLinkPress={onLinkPress} />;
   if (part.type === 'plan') {
     return <View className="w-full py-1"><Text className="mb-2 text-[13px] font-medium leading-5 text-foreground">Plan</Text><MarkdownText content={part.text} variant="transcript" onLinkPress={({ url }) => onLinkPress(url)} /></View>;
   }
@@ -889,8 +966,12 @@ function assistantCopyText(turn: TranscriptTurn): string {
   }).join('\n\n');
 }
 
-function TurnMeta({ turn, expanded, onToggle }: BlockExpansion & { turn: TranscriptTurn }) {
+function TurnMeta({ turn, expanded, onToggle, readAloud }: BlockExpansion & {
+  turn: TranscriptTurn;
+  readAloud?: ChatReadAloudControl;
+}) {
   const { colors } = useTheme();
+  const { t } = useTranslation();
   const { copied, copyText } = useCopyFeedback();
   const duration = formatDuration(turn.startedAt, turn.completedAt);
   const details = turn.details;
@@ -906,6 +987,8 @@ function TurnMeta({ turn, expanded, onToggle }: BlockExpansion & { turn: Transcr
     outcomeLabel,
   ].filter(Boolean);
   const copy = assistantCopyText(turn);
+  const reading = readAloud?.readingTurnId === turn.id;
+  const readDisabled = !reading && !readAloud?.canRead(turn);
   const hasDetails = Boolean(details?.model || details?.provider || usage || outcomeLabel || turn.startedAt !== undefined || turn.completedAt !== undefined);
   if (!values.length && !copy && !hasDetails) return null;
   return (
@@ -929,6 +1012,19 @@ function TurnMeta({ turn, expanded, onToggle }: BlockExpansion & { turn: Transcr
             onPress={() => copyText(copy)}
           >
             {copied ? <Check size={13} color={colors.done} /> : <Copy size={13} color={colors.textTertiary} />}
+          </Button>
+        )}
+        {copy.trim().length > 0 && readAloud && (
+          <Button
+            testID={`chat-response-read-aloud-${turn.id}`}
+            accessibilityLabel={t(reading ? 'terminal.readAloud.stop' : 'terminal.readAloud.start')}
+            accessibilityState={{ selected: reading, disabled: readDisabled }}
+            disabled={readDisabled}
+            className="size-7 rounded-full px-0"
+            variant="ghost"
+            onPress={hapticPress(() => readAloud.toggle(turn))}
+          >
+            {reading ? <VolumeX size={13} color={colors.primary} /> : <Volume2 size={13} color={colors.textTertiary} />}
           </Button>
         )}
       </View>
@@ -971,7 +1067,7 @@ function ChangedFiles({ turn, expanded, onToggle }: BlockExpansion & { turn: Tra
 }
 
 const TranscriptBlockView = memo(function TranscriptBlockRow({
-  block, active, expanded, searchSelected, searchQuery, onToggle, onLinkPress, imageClient, directory, onAddToComposer,
+  block, active, expanded, searchSelected, searchQuery, onToggle, onLinkPress, imageClient, directory, onAddToComposer, readAloud,
 }: {
   block: ChatBlock;
   active: boolean;
@@ -983,6 +1079,7 @@ const TranscriptBlockView = memo(function TranscriptBlockRow({
   imageClient?: RemoteFileClient;
   directory?: string;
   onAddToComposer?: (text: string) => void;
+  readAloud?: ChatReadAloudControl;
 }) {
   const { colors } = useTheme();
   const toggle = () => onToggle(block.id);
@@ -991,13 +1088,12 @@ const TranscriptBlockView = memo(function TranscriptBlockRow({
       case 'user': return <UserPrompt message={block.message} imageClient={imageClient} directory={directory} active={active} />;
       case 'part': return <View className="gap-1">
         {block.message?.createdAt !== undefined && <Text className="text-[9px] text-muted-foreground">Assistant · {new Date(block.message.createdAt).toLocaleTimeString()}</Text>}
-        <AssistantPart part={block.part} streaming={active && block.streaming} expanded={expanded} onToggle={toggle} active={active} onLinkPress={onLinkPress} />
+        <AssistantPart part={block.part} directory={directory} streaming={active && block.streaming} expanded={expanded} onToggle={toggle} active={active} onLinkPress={onLinkPress} />
       </View>;
-      case 'thinking': return <ThinkingIndicator active={active} />;
       case 'error': return <TranscriptNoticeCard error className="flex-row"><CircleAlert size={15} color={colors.error} /><Text selectable className="min-w-0 flex-1 text-[12px] leading-[18px] text-muted-foreground"><SearchText text={block.error} /></Text></TranscriptNoticeCard>;
       case 'changes': return <ChangedFiles turn={block.turn} expanded={expanded} onToggle={toggle} />;
-      case 'diff': return <ToolFileDiffBlock file={block.file} />;
-      case 'meta': return <TurnMeta turn={block.turn} expanded={expanded} onToggle={toggle} />;
+      case 'diff': return <ToolFileDiffBlock file={block.file} directory={directory} expanded={expanded} onToggle={toggle} />;
+      case 'meta': return <TurnMeta turn={block.turn} expanded={expanded} onToggle={toggle} readAloud={readAloud} />;
     }
   };
   return (
@@ -1016,11 +1112,16 @@ const TranscriptBlockView = memo(function TranscriptBlockRow({
 
 export function AgentChatView({
   imageClient,
+  searchRuntime,
+  searchKey,
+  savedSearchNamespace,
+  initialSearchTarget,
   state,
   active = true,
   agent,
   agentStatus,
   contentInsets,
+  animatedBottomInset,
   latestButtonBottom,
   searchOpen: searchRequested = false,
   onCloseSearch,
@@ -1029,6 +1130,7 @@ export function AgentChatView({
   onInitialViewportReady,
   savedViewport,
   onSaveViewport,
+  readAloud,
 }: Props) {
   const { colors } = useTheme();
   const addToComposer = useContext(ChatComposerSelection);
@@ -1061,10 +1163,19 @@ export function AgentChatView({
   });
   const turns = state.transcript.turns;
   const agentWorking = agentStatus === 'working';
-  const searchPresentation = useMemo(() => searchOpen
-    ? chatSearchPresentation(turns, agentWorking)
-    : EMPTY_CHAT_SEARCH_PRESENTATION, [searchOpen, turns, agentWorking]);
-  const search = useChatSearch(searchPresentation.documents, searchOpen && active);
+  const requestedSource = useMemo(() => searchRuntime && searchKey
+    ? { type: 'live' as const, runtime: searchRuntime, key: searchKey }
+    : savedSearchNamespace
+      ? { type: 'saved' as const, namespace: savedSearchNamespace, agent, sessionId: state.sessionId }
+      : undefined, [searchRuntime, searchKey, savedSearchNamespace, agent, state.sessionId]);
+  const sourceIdentity = JSON.stringify([state.sessionId, agent, searchKey, savedSearchNamespace]);
+  const retainedSource = useRef<{ identity: string; source: NonNullable<typeof requestedSource> } | undefined>(undefined);
+  if (requestedSource) retainedSource.current = { identity: sourceIdentity, source: requestedSource };
+  else if (retainedSource.current?.identity !== sourceIdentity) retainedSource.current = undefined;
+  // A host disconnect can temporarily remove its JS client. This viewport's
+  // native owner still has the canonical manager and its last usable history.
+  const searchSource = retainedSource.current?.source;
+  const search = useChatSearch(searchSource, state.transcript, searchOpen && active, initialSearchTarget);
   const pendingSearch = useRef<string | null>(null);
   const lastSearchReveal = useRef('');
   const [expandedBlocks, setExpandedBlocks] = useState<ReadonlySet<string>>(
@@ -1079,11 +1190,12 @@ export function AgentChatView({
       return next;
     });
   }, []);
-  const blocks = useMemo(() => transcriptBlocks(turns, agentWorking, expandedBlocks), [turns, agentWorking, expandedBlocks]);
+  const rowStore = useNativeChatRows(searchSource, state, agentWorking, expandedBlocks);
+  const blocks = rowStore.rows;
   const blocksRef = useRef(blocks);
   blocksRef.current = blocks;
   const latestBlockId = blocks.at(-1)?.id ?? null;
-  const list = useRef<FlashListRef<ChatBlock>>(null);
+  const list = useRef<FlashListRef<ChatRow>>(null);
   const followEndRef = useRef(savedViewport?.followEnd ?? true);
   const latestBlockIdRef = useRef(latestBlockId);
   latestBlockIdRef.current = latestBlockId;
@@ -1107,13 +1219,9 @@ export function AgentChatView({
   initialViewportReadyCallbackRef.current = onInitialViewportReady;
   const lastInitialViewportDiagnosticRef = useRef('');
   const agentName = chatAgentDisplayName(agent);
-  const [initialScrollIndex] = useState(() => {
-    if (!savedViewport?.anchor || savedViewport.followEnd) return undefined;
-    const index = blocks.findIndex(
-      block => block.id === savedViewport.anchor?.blockId,
-    );
-    return index < 0 ? undefined : index;
-  });
+  const anchorIndex = savedViewport?.anchor && !savedViewport.followEnd
+    ? rowStore.indexOf(savedViewport.anchor.blockId) : -1;
+  const initialScrollIndex = anchorIndex < 0 ? undefined : anchorIndex;
 
   const saveViewport = useCallback(() => {
     if (initialViewportRef.current.ready) {
@@ -1171,20 +1279,24 @@ export function AgentChatView({
     pendingSearch.current = match.documentId;
     followEndRef.current = false;
     setFollowEndState(false);
-    setExpandedBlocks(current => new Set([...current, ...(searchPresentation.reveal.get(match.documentId) ?? [match.documentId])]));
-  }, [search.match, search.query, search.navigationRevision, searchPresentation, active]);
+    setExpandedBlocks(current => new Set([...current, ...match.reveal]));
+  }, [search.match, search.query, search.navigationRevision, active]);
 
   const searchBarHeight = searchOpen ? chatSearchBarHeight(search.query) : 0;
   const contextTop = contentInsets.top + searchBarHeight;
-  const { prompt: pinnedPrompt, update: updatePinnedPrompt } = usePinnedPrompt(blocks, list, contextTop);
+  const { prompt: pinnedPrompt, update: updatePinnedPrompt } = usePinnedPrompt(rowStore, state, list, contextTop);
   const latestTurn = turns.at(-1);
-  const activity = useMemo(() => state.status === 'live'
+  const workActive = state.status === 'live'
     && (agentWorking || latestTurn?.status === 'working')
-    && latestTurn?.status !== 'error' && latestTurn?.status !== 'interrupted'
-      ? currentActivity(blocks, latestTurn)
-      : undefined, [state.status, agentWorking, latestTurn, blocks]);
-  const activityBottom = contentInsets.bottom + CHAT_CONTEXT_GAP;
-  const activityClearance = activity ? CHAT_CONTEXT_HEIGHT + CHAT_CONTEXT_GAP : 0;
+    && latestTurn?.status !== 'error' && latestTurn?.status !== 'interrupted';
+  const candidates = useMemo(() => workActive
+      ? currentActivity(blocks, state, latestTurn)
+      : undefined, [workActive, latestTurn, blocks, state]);
+  // Floating controls follow native frames independently of the list's React
+  // spacing, including the final frame before keyboardDidHide reaches JS.
+  const floatingChromeStyle = useAnimatedStyle(() => ({
+    transform: [{ translateY: -(animatedBottomInset?.value ?? contentInsets.bottom) }],
+  }));
 
   useLayoutEffect(() => {
     updatePinnedPrompt(scrollGeometryRef.current.offset);
@@ -1192,7 +1304,7 @@ export function AgentChatView({
 
   const revealSearchMatch = () => {
     if (pendingSearch.current && active && initialViewportRef.current.ready) {
-      const index = blocks.findIndex(block => block.id === pendingSearch.current);
+      const index = rowStore.indexOf(pendingSearch.current);
       if (index < 0) return;
       pendingSearch.current = null;
       const scroll = list.current?.scrollToIndex({
@@ -1205,9 +1317,12 @@ export function AgentChatView({
   useLayoutEffect(() => () => saveViewport(), [saveViewport]);
   const contentPadding = insetContentPadding(contentInsets, {
     top: CHAT_CONTENT_TOP_GAP + searchBarHeight,
-    bottom: CHAT_CONTENT_BOTTOM_GAP + activityClearance,
+    bottom: CHAT_CONTENT_BOTTOM_GAP,
   });
   const maxOffset = Math.max(0, scrollGeometry.contentHeight - scrollGeometry.viewportHeight);
+  const awayFromLatest = !followEnd && !nearEnd(scrollGeometry.offset, maxOffset);
+  const activity = useChatActivity(active && workActive && awayFromLatest,
+    JSON.stringify([state.sessionId, latestTurn?.id, candidates?.promptId]), candidates?.summary, candidates?.tool);
   const scrollThumb = scrollThumbGeometry(
     scrollGeometry.offset,
     maxOffset,
@@ -1261,7 +1376,7 @@ export function AgentChatView({
     maximumOffset: number,
   ) => {
     const index = saved?.anchor
-      ? blocks.findIndex(block => block.id === saved.anchor?.blockId)
+      ? rowStore.indexOf(saved.anchor.blockId)
       : -1;
     const layout = index < 0 ? undefined : list.current?.getLayout?.(index);
     const offset =
@@ -1283,7 +1398,7 @@ export function AgentChatView({
       saved,
       Math.max(0, geometry.contentHeight - geometry.viewportHeight),
     );
-    return readiness.viewportLaidOut
+    return rowStore.ready && readiness.viewportLaidOut
       && readiness.itemsLoaded
       && readiness.contentSizeKnown
       && readiness.positionConfirmed
@@ -1613,7 +1728,7 @@ export function AgentChatView({
   const trackViewableBlocks = ({
     viewableItems,
   }: {
-    viewableItems: ViewToken<ChatBlock>[];
+    viewableItems: ViewToken<ChatRow>[];
   }) => {
     updatePinnedPrompt(scrollGeometryRef.current.offset);
     const currentLatestBlockId = latestBlockIdRef.current;
@@ -1642,7 +1757,7 @@ export function AgentChatView({
     [onOpenFile, onOpenWebLink, state.transcript.info?.directory],
   );
 
-  const viewportVisible = active && activeRef.current === active && viewportReady;
+  const viewportVisible = active && activeRef.current === active && (viewportReady || Boolean(rowStore.error));
 
   return (
     <View
@@ -1673,7 +1788,7 @@ export function AgentChatView({
           alignLoadedInitialViewport();
         }}
       >
-        <FlashList
+        {(rowStore.ready || rowStore.error) && <FlashList
           ref={list}
           onCommitLayoutEffect={() => {
             updatePinnedPrompt(scrollGeometryRef.current.offset);
@@ -1682,11 +1797,14 @@ export function AgentChatView({
           initialScrollIndex={initialScrollIndex}
           data={blocks}
           keyExtractor={block => block.id}
-          getItemType={block => block.type === 'part' ? block.part.type : block.type}
-          renderItem={({ item }) => (
+          extraData={state}
+          getItemType={block => block.type === 'part' ? block.partKind : block.type}
+          renderItem={({ item }) => {
+            const block = resolveChatRow(item, state);
+            return block ? (
             <TranscriptBlockView
               key={item.id}
-              block={item}
+              block={block}
               active={active}
               expanded={expandedBlocks.has(item.id)}
               searchSelected={search.match?.documentId === item.id}
@@ -1696,10 +1814,12 @@ export function AgentChatView({
               imageClient={imageClient}
               directory={state.transcript.info?.directory}
               onAddToComposer={active && addToComposer ? addSelectionToComposer : undefined}
+              readAloud={active ? readAloud : undefined}
             />
-          )}
+          ) : null;
+          }}
           contentContainerStyle={chatListStyles.content}
-          keyboardDismissMode="interactive"
+          keyboardDismissMode={Platform.OS === 'ios' ? 'interactive' : 'on-drag'}
           keyboardShouldPersistTaps="handled"
           maintainVisibleContentPosition={
             CHAT_MAINTAIN_VISIBLE_CONTENT_POSITION
@@ -1710,7 +1830,7 @@ export function AgentChatView({
           ListHeaderComponent={
             <>
               <ChatBoundarySpacer height={contentPadding.top} />
-              {state.status !== 'live' && (
+              {(state.status !== 'live' || rowStore.error) && (
                 <View
                   className={cn(
                     'flex-row items-center gap-2 py-3',
@@ -1726,7 +1846,7 @@ export function AgentChatView({
                     numberOfLines={2}
                     className="min-w-0 flex-1 text-[12px] text-muted-foreground"
                   >
-                    {state.error ||
+                    {rowStore.error || state.error ||
                       (state.status === 'loading'
                         ? `Reading the local ${agentName} history…`
                         : 'The transcript is temporarily unavailable.')}
@@ -1737,13 +1857,16 @@ export function AgentChatView({
           }
           ListFooterComponent={
             <>
+              {workActive && <ChatWorkingStatus
+                key={`${state.sessionId}:${latestTurn?.id ?? 'starting'}`}
+                startedAt={latestTurn?.startedAt}
+                active={active && !awayFromLatest}
+              />}
               <ChatBoundarySpacer height={contentPadding.bottom} />
             </>
           }
           ListEmptyComponent={
-            state.status === 'live' && agentWorking ? (
-              <ThinkingIndicator active={active} />
-            ) : state.status === 'live' ? (
+            rowStore.ready && state.status === 'live' && !agentWorking ? (
               <View className="flex-1 items-center justify-center px-8 py-20">
                 <Text className="text-center text-[14px] font-semibold text-foreground">
                   No conversation yet
@@ -1797,7 +1920,7 @@ export function AgentChatView({
           onMomentumScrollEnd={endMomentumScroll}
           onViewableItemsChanged={trackViewableBlocks}
           scrollEventThrottle={16}
-        />
+        />}
         {active && !searchOpen && pinnedPrompt && (
           <Pressable
             testID="chat-pinned-prompt"
@@ -1823,55 +1946,46 @@ export function AgentChatView({
             <ChevronUp size={16} color="#faf5ff" />
           </Pressable>
         )}
-        {active && activity && (
-          <GlassSurface
-            testID="chat-pinned-activity"
-            className={cn('absolute left-4 right-4 z-20 rounded-xl', appGlassEnabled && APP_GLASS_BORDER_CLASS_NAME)}
-            fallbackClassName="border border-border bg-background"
-            style={{ bottom: activityBottom, height: CHAT_CONTEXT_HEIGHT }}
-          >
-            <Pressable
-              accessibilityRole="button"
-              accessibilityLabel={`Current activity: ${activity.title}${activity.detail ? `, ${activity.detail}` : ''}`}
-              accessibilityHint="Jump to the latest output"
-              className="min-h-11 flex-row items-center gap-2 px-3"
-              onPress={hapticPress(() => {
-                pendingSearch.current = null;
-                setFollowEnd(true);
-                scrollToLatest(true);
-              })}
-            >
-              <ActivityIndicator animating={active} size={13} color={colors.textTertiary} />
-              <Text numberOfLines={1} className="min-w-0 flex-1 text-[12px] leading-5 text-foreground">
-                {activity.title}{activity.detail ? ` · ${activity.detail}` : ''}
-              </Text>
-              <ArrowDown size={16} color={colors.textSecondary} />
-            </Pressable>
-          </GlassSurface>
-        )}
         {searchOpen && <ChatSearchBar search={search} top={contentInsets.top} onClose={() => {
           pendingSearch.current = null;
           onCloseSearch?.();
           Keyboard.dismiss();
         }} />}
-        {!followEnd && !scrolling && !nearEnd(scrollGeometry.offset, maxOffset) && (
-          <Button
-            accessibilityLabel="Jump to latest"
-            className={LATEST_BUTTON_CLASS_NAME}
-            style={[
-              { bottom: activity ? Math.max(latestButtonBottom, activityBottom + activityClearance) : latestButtonBottom },
-              latestButtonStyle(colors),
-            ]}
-            variant="secondary"
-            size="icon"
-            onPress={() => {
-              setFollowEnd(true);
-              scrollToLatest(true);
-            }}
-          >
-            <ArrowDown size={LATEST_BUTTON_ICON_SIZE} color={colors.text} />
-          </Button>
-        )}
+        <Animated.View
+          testID="chat-floating-chrome"
+          pointerEvents="box-none"
+          className="absolute inset-0"
+          style={floatingChromeStyle}
+        >
+          {activity && (
+            <ChatActivityStrip
+              activity={activity}
+              onPress={() => {
+                pendingSearch.current = null;
+                setFollowEnd(true);
+                scrollToLatest(true);
+              }}
+            />
+          )}
+          {awayFromLatest && !scrolling && !activity && (
+            <Button
+              accessibilityLabel="Jump to latest"
+              className={LATEST_BUTTON_CLASS_NAME}
+              style={[
+                { bottom: latestButtonBottom - contentInsets.bottom },
+                latestButtonStyle(colors),
+              ]}
+              variant="secondary"
+              size="icon"
+              onPress={() => {
+                setFollowEnd(true);
+                scrollToLatest(true);
+              }}
+            >
+              <ArrowDown size={LATEST_BUTTON_ICON_SIZE} color={colors.text} />
+            </Button>
+          )}
+        </Animated.View>
         {scrollThumb && (
           <OverlayScrollbar
             accessibilityLabel="Conversation scroll position"

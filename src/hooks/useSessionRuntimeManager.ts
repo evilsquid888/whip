@@ -1,3 +1,5 @@
+import { sessionPersistence } from '../services/sessionPersistence';
+import { useNotificationLeases } from './useNotificationLeases';
 import { useCallback, useMemo, useRef, useState } from 'react';
 import type { TFunction } from 'i18next';
 import {
@@ -5,6 +7,7 @@ import {
   type AppCoreProjection,
   type HerdProjection,
   type HerdSessionMetadata,
+  type RuntimeHerdrSetup,
 } from 'react-native-whip-ssh';
 
 import type { AppNavigationController } from './useAppNavigation';
@@ -23,6 +26,10 @@ import { useSessionRuntimeTelemetry } from './useSessionRuntimeTelemetry';
 import { useSessionStartupRestore } from './useSessionStartupRestore';
 import { useSessionOfflineRestore } from './useSessionOfflineRestore';
 import { useSessionTerminalLifecycle } from './useSessionTerminalLifecycle';
+import {
+  useHerdrInstallation,
+  type HerdrInstallProgress,
+} from './useHerdrInstallation';
 import type { useTerminalSessions } from './useTerminalSessions';
 import type { LoadState } from './useStartupStorage';
 import type {
@@ -122,6 +129,7 @@ export interface SessionRuntimeController {
     sessionId: string,
     terminalId: string,
     enabled: boolean,
+    shizukuAccess?: boolean,
   ) => Promise<void>;
   restartAgent: (sessionId: string, terminalId: string) => Promise<void>;
   copyAgent: (
@@ -136,6 +144,10 @@ export interface SessionRuntimeController {
     launch: TabLaunchIntent,
   ) => Promise<void>;
   startServer: (sessionId: string) => Promise<void>;
+  checkHerdr: (sessionId: string) => Promise<RuntimeHerdrSetup>;
+  installHerdr: (sessionId: string) => Promise<void>;
+  openHerdrInstallation: (sessionId: string) => void;
+  herdrInstallations: Readonly<Record<string, HerdrInstallProgress>>;
 }
 
 /** Coordinates the independently-owned session runtime concerns. */
@@ -159,12 +171,15 @@ export function useSessionRuntimeManager({
   terminals,
   telemetry,
 }: SessionRuntimeManagerOptions): SessionRuntimeController {
-  const [appCore] = useState(() => new NativeAppCore());
+  const [appCore] = useState(() => {
+    const core = new NativeAppCore();
+    core.setSessionPersistence(sessionPersistence());
+    return core;
+  });
   const { state, project } = useAppCoreSessions(() => appCore.view());
   const getState = useCallback(() => appCore.view(), [appCore]);
   const runtimesRef = useRef(new Map<string, LiveRuntime>());
   const sessionProfilesRef = useRef(new Map<string, HostProfile>());
-  const restoredTerminalHostIdsRef = useRef(new Set<string>());
   const persistTerminals = terminals.persistProjection;
   const commitAppCore = useCallback<SessionRuntimeStore['commitAppCore']>(
     view => {
@@ -184,6 +199,7 @@ export function useSessionRuntimeManager({
   };
   useSessionOfflineRestore(store);
 
+  useNotificationLeases(alertsEnabled && notifications.ready);
   const handleAgentStateChange = useAgentNotificationSideEffects({
     alertsEnabled,
     agentAlertLevel,
@@ -196,7 +212,6 @@ export function useSessionRuntimeManager({
   });
   const connection = useSessionConnectionLifecycle({
     ...store,
-    restoredTerminalHostIdsRef,
     hosts,
     navigation,
     security,
@@ -214,7 +229,6 @@ export function useSessionRuntimeManager({
     appCore,
     sessionProfilesRef,
     commitAppCore,
-    restoredTerminalHostIdsRef,
     startupStorage,
     deferredHydrationReady,
     preferencesLoaded,
@@ -249,12 +263,21 @@ export function useSessionRuntimeManager({
     scheduleReconnect: connection.scheduleReconnect,
     t,
   });
+  const herdrInstallation = useHerdrInstallation({
+    runtimesRef,
+    terminals,
+    navigation,
+    select: connection.select,
+    t,
+  });
   useAgentNotificationNavigation({
     notifications,
     restoreComplete,
     getState,
     hosts,
     openPaneTerminal: terminal.openPaneTerminal,
+    connectSavedHost: connection.connectSavedHost,
+    runtimesRef,
   });
 
   const presentationSessions = useMemo(() => {
@@ -281,11 +304,7 @@ export function useSessionRuntimeManager({
       restoreComplete,
       terminalTargets: terminal.terminalTargets,
       herdView: (metadata, selectedHostId, selectedWorkspaceId) =>
-        appCore.herdView(
-          metadata,
-          selectedHostId,
-          selectedWorkspaceId,
-        ),
+        appCore.herdView(metadata, selectedHostId, selectedWorkspaceId),
       getState: connection.getState,
       getClient: connection.getClient,
       select: connection.select,
@@ -313,6 +332,10 @@ export function useSessionRuntimeManager({
       copyAgent: terminal.copyAgent,
       launchTab: terminal.launchTab,
       startServer: terminal.startServer,
+      checkHerdr: herdrInstallation.checkHerdr,
+      installHerdr: herdrInstallation.installHerdr,
+      openHerdrInstallation: herdrInstallation.openHerdrInstallation,
+      herdrInstallations: herdrInstallation.installations,
     }),
     [
       activeSession,
@@ -322,6 +345,7 @@ export function useSessionRuntimeManager({
       restoreComplete,
       state,
       terminal,
+      herdrInstallation,
     ],
   );
 }

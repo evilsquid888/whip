@@ -1,66 +1,39 @@
-jest.mock('@react-native-async-storage/async-storage', () => ({
-  __esModule: true,
-  default: {
-    getItem: jest.fn(),
-    setItem: jest.fn(),
-    removeItem: jest.fn(),
-  },
+const mockNative = {
+  scheduleSnapshot: jest.fn(),
+  flush: jest.fn(() => ({ wait: jest.fn().mockResolvedValue(true) })),
+  readSnapshot: jest.fn(() => ({
+    snapshot: jest.fn().mockResolvedValue('opaque Rust cache'),
+  })),
+  deleteSnapshot: jest.fn(() => ({ wait: jest.fn().mockResolvedValue(true) })),
+};
+jest.mock('../src/services/sessionPersistence', () => ({
+  sessionPersistence: () => mockNative,
+  sessionPersistenceEffect: (effect: () => Promise<unknown>) => effect(),
 }));
-
-import AsyncStorage from '@react-native-async-storage/async-storage';
-
 import { HerdrSnapshotCache } from '../src/services/herdrSnapshotCache';
+beforeEach(() => jest.clearAllMocks());
 
-describe('offline Herdr snapshot cache', () => {
-  const stored = new Map<string, string>();
+test('passes the native runtime identity without exporting or scheduling in JavaScript', async () => {
+  const cache = new HerdrSnapshotCache();
+  cache.schedule('host', { runtimeId: 'runtime', runtimeIncarnation: 7 });
+  expect(mockNative.scheduleSnapshot).toHaveBeenCalledWith(
+    'host',
+    'runtime',
+    7n,
+  );
+  await cache.flush('host');
+  expect(mockNative.flush).toHaveBeenCalledWith('host');
+  expect(await cache.load('host')).toBe('opaque Rust cache');
+  expect(mockNative.readSnapshot).toHaveBeenCalledWith('host');
+  await cache.delete('host');
+  expect(mockNative.deleteSnapshot).toHaveBeenCalledWith('host');
+});
 
-  beforeEach(() => {
-    jest.useFakeTimers();
-    stored.clear();
-    jest.mocked(AsyncStorage.getItem).mockImplementation(async key => stored.get(key) ?? null);
-    jest.mocked(AsyncStorage.setItem).mockImplementation(async (key, value) => { stored.set(key, value); });
-    jest.mocked(AsyncStorage.removeItem).mockImplementation(async key => { stored.delete(key); });
+test('native flush failures reach the lifecycle caller', async () => {
+  mockNative.flush.mockReturnValueOnce({
+    wait: jest.fn().mockRejectedValue(new Error('write failed')),
   });
-
-  afterEach(() => {
-    jest.clearAllTimers();
-    jest.useRealTimers();
-    jest.clearAllMocks();
-  });
-
-  test('coalesces updates and stores the latest opaque blob unchanged', async () => {
-    const cache = new HerdrSnapshotCache();
-    const latest = '  opaque Rust cache\n';
-    cache.schedule('host', 'earlier blob');
-    cache.schedule('host', latest);
-    expect(AsyncStorage.setItem).not.toHaveBeenCalled();
-
-    jest.runAllTimers();
-    expect(await cache.load('host')).toBe(latest);
-    expect(AsyncStorage.setItem).toHaveBeenCalledWith('herdr.host.snapshot.v1.host', latest);
-    expect(AsyncStorage.setItem).toHaveBeenCalledTimes(1);
-  });
-
-  test('deletion cancels a pending write', async () => {
-    const cache = new HerdrSnapshotCache();
-    cache.schedule('host', 'pending blob');
-    await cache.delete('host');
-    jest.runAllTimers();
-    expect(await cache.load('host')).toBeNull();
-    expect(AsyncStorage.setItem).not.toHaveBeenCalled();
-  });
-
-  test('passes malformed stored data to Rust without projecting it in JS', async () => {
-    stored.set('herdr.host.snapshot.v1.host', '{invalid');
-    expect(await new HerdrSnapshotCache().load('host')).toBe('{invalid');
-  });
-
-  test('stores each host independently without interpreting empty blobs', async () => {
-    const cache = new HerdrSnapshotCache();
-    cache.schedule('first', 'first blob');
-    cache.schedule('second', '');
-    jest.runAllTimers();
-    expect(await cache.load('first')).toBe('first blob');
-    expect(await cache.load('second')).toBe('');
-  });
+  await expect(new HerdrSnapshotCache().flush()).rejects.toThrow(
+    'write failed',
+  );
 });

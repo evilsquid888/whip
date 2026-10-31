@@ -2,6 +2,7 @@ jest.mock('expo-constants', () => ({
   __esModule: true,
   default: { expoConfig: null },
 }));
+jest.mock('../src/billing/policy', () => ({ resolveBillingRolloutPolicy: jest.fn() }));
 jest.mock('expo-localization', () => ({ useLocales: () => [] }));
 jest.mock('../src/i18n', () => ({
   __esModule: true,
@@ -18,9 +19,9 @@ jest.mock('../src/services/latencyDiagnostics', () => ({
 import { effectiveDevicePreferences } from '../src/billing/effectiveSettings';
 import { applyDeveloperOptionsPolicy } from '../src/billing/rollout';
 import { shouldPersistDevicePreferences } from '../src/hooks/useDevicePreferences';
-jest.mock('@react-native-async-storage/async-storage', () => ({
+jest.mock('../src/services/appStorage', () => ({
   __esModule: true,
-  default: { getItem: jest.fn(), setItem: jest.fn() },
+  appStorage: { getItem: jest.fn(), setItem: jest.fn() },
 }));
 jest.mock('../src/services/terminalBackground', () => ({
   migrateTerminalBackgroundImage: jest.fn(uri => Promise.resolve(uri)),
@@ -31,7 +32,7 @@ jest.mock('../src/services/appBackground', () => ({
   removeAppBackgroundImage: jest.fn(() => Promise.resolve()),
 }));
 
-import AsyncStorage from '@react-native-async-storage/async-storage';
+import { appStorage } from '../src/services/appStorage';
 import {
   migrateAppBackgroundImage,
   removeAppBackgroundImage,
@@ -46,8 +47,8 @@ import {
   removeTerminalBackgroundImage,
 } from '../src/services/terminalBackground';
 
-const mockGetItem = jest.mocked(AsyncStorage.getItem);
-const mockSetItem = jest.mocked(AsyncStorage.setItem);
+const mockGetItem = jest.mocked(appStorage.getItem);
+const mockSetItem = jest.mocked(appStorage.setItem);
 const mockMigrateBackground = jest.mocked(migrateTerminalBackgroundImage);
 const mockRemoveBackground = jest.mocked(removeTerminalBackgroundImage);
 const mockMigrateAppBackground = jest.mocked(migrateAppBackgroundImage);
@@ -88,10 +89,28 @@ test('preferences cannot persist while loading, failed, or merely hydrated', () 
   expect(shouldPersistDevicePreferences({ status: 'loaded' }, 1)).toBe(true);
 });
 
-test('requires Rancher for the default fullscreen terminal and preserves disabled choices', () => {
-  expect(effectiveDevicePreferences(defaultDevicePreferences, 'cowboy').terminal.fullscreen)
+test('app font size defaults for existing installs and persists independently of terminal size', async () => {
+  mockGetItem.mockResolvedValueOnce(JSON.stringify({ terminal: { fontSize: 12 } }));
+  const preferences = await loadDevicePreferences();
+  expect(preferences.appFontSizePercent).toBe(100);
+  await saveDevicePreferences({ ...preferences, appFontSizePercent: 125 });
+  mockGetItem.mockResolvedValueOnce(mockSetItem.mock.calls.at(-1)![1]);
+  const restored = await loadDevicePreferences();
+  expect(restored.appFontSizePercent).toBe(125);
+  expect(restored.terminal.fontSize).toBe(12);
+});
+
+test.each([
+  [0, 80], [250, 150], ['125', 100], [null, 100],
+])('validates stored app font size %p', async (appFontSizePercent, expected) => {
+  mockGetItem.mockResolvedValueOnce(JSON.stringify({ appFontSizePercent }));
+  expect((await loadDevicePreferences()).appFontSizePercent).toBe(expected);
+});
+
+test('applies native fullscreen capability and preserves disabled choices', () => {
+  expect(effectiveDevicePreferences(defaultDevicePreferences, new Set()).terminal.fullscreen)
     .toBe(false);
-  expect(effectiveDevicePreferences(defaultDevicePreferences, 'rancher').terminal.fullscreen)
+  expect(effectiveDevicePreferences(defaultDevicePreferences, new Set(['fullscreen-terminal'])).terminal.fullscreen)
     .toBe(true);
 
   const disabled = {
@@ -99,7 +118,7 @@ test('requires Rancher for the default fullscreen terminal and preserves disable
     fullscreenApp: false,
     terminal: { ...defaultDevicePreferences.terminal, fullscreen: false },
   };
-  const rancher = effectiveDevicePreferences(disabled, 'rancher');
+  const rancher = effectiveDevicePreferences(disabled, new Set(['fullscreen-app', 'fullscreen-terminal']));
   expect(rancher.fullscreenApp).toBe(false);
   expect(rancher.terminal.fullscreen).toBe(false);
 });
@@ -125,7 +144,6 @@ test('terminal preference defaults match the mobile renderer', () => {
   expect(defaultDevicePreferences.persistentAlertDurationSeconds).toBe(30);
   expect(defaultDevicePreferences.appearance).toBe('system');
   expect(defaultDevicePreferences.fullscreenApp).toBe(false);
-  expect(defaultDevicePreferences.smoothSpinners).toBe(false);
   expect(defaultDevicePreferences.appBackgroundImageUri).toBeNull();
   expect(defaultDevicePreferences.appBackgroundDimming).toBe(60);
   expect(defaultDevicePreferences.appGlassEnabled).toBe(false);
@@ -140,13 +158,19 @@ test('terminal preference defaults match the mobile renderer', () => {
   expect(defaultDevicePreferences.lastTab).toBe('hosts');
 });
 
-test('persists the spinner frame-rate choice across reloads', async () => {
-  for (const smoothSpinners of [true, false]) {
-    await saveDevicePreferences({ ...defaultDevicePreferences, smoothSpinners });
-    const saved = mockSetItem.mock.calls.at(-1)![1];
-    mockGetItem.mockResolvedValueOnce(saved);
-    await expect(loadDevicePreferences()).resolves.toMatchObject({ smoothSpinners });
-  }
+test.each([true, false])('drops the removed spinner frame-rate preference (%s) on load and save', async smoothSpinners => {
+  mockGetItem.mockResolvedValueOnce(JSON.stringify({
+    ...defaultDevicePreferences,
+    smoothSpinners,
+    appearance: 'dark',
+  }));
+  const preferences = await loadDevicePreferences();
+  expect(preferences).not.toHaveProperty('smoothSpinners');
+  expect(preferences.appearance).toBe('dark');
+  await saveDevicePreferences(preferences);
+  const saved = JSON.parse(mockSetItem.mock.calls.at(-1)![1]);
+  expect(saved).not.toHaveProperty('smoothSpinners');
+  expect(saved.appearance).toBe('dark');
 });
 
 test('opens Hosts when the saved last tab was the removed Chats tab', async () => {
@@ -173,8 +197,8 @@ test('migrates the old 11px mobile default to the usable 8px geometry', async ()
     biometricForKeys: false,
     biometricOnResume: false,
     appearance: 'system',
+    appFontSizePercent: 100,
     fullscreenApp: false,
-    smoothSpinners: false,
     appBackgroundImageUri: null,
     appBackgroundDimming: 60,
     appGlassEnabled: false,

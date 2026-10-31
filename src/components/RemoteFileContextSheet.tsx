@@ -1,10 +1,12 @@
+import { KeyboardAvoidingView } from 'react-native-keyboard-controller';
 import Clipboard from '@react-native-clipboard/clipboard';
 import { Check, ChevronLeft, Copy, Download, FileText, Folder, FolderInput, Info } from 'lucide-react-native';
 import { useEffect, useRef, useState } from 'react';
-import { ActivityIndicator, FlatList, Keyboard, KeyboardAvoidingView, Platform, Pressable, ScrollView, TextInput, View } from 'react-native';
+import { ActivityIndicator, FlatList, Keyboard, Pressable, ScrollView, View, type TextInputInstance } from 'react-native';
 import { useTranslation } from 'react-i18next';
 import type { RuntimeRemoteFileEntry } from 'react-native-whip-ssh';
 import { formatRemoteFileSize, joinRemotePath, parentRemotePath, sortRemoteEntries } from '@/src/lib/remoteFiles';
+import { REMOTE_FILE_GLASS_SURFACE_PROPS } from '@/src/lib/remoteFileGlass';
 import type { HerdrClient } from '@/src/services/HerdrClient';
 import { downloadRemoteEntry } from '@/src/services/remoteFileTransfer';
 import { appGlassControlStyle, useTheme } from '@/src/theme';
@@ -46,7 +48,7 @@ export function RemoteFileContextSheet({ entry, client, onClose, onChanged, onBu
   const [loading, setLoading] = useState(false);
   const [loadedPath, setLoadedPath] = useState<string | null>(null);
   const [properties, setProperties] = useState(entry);
-  const input = useRef<TextInput>(null);
+  const input = useRef<TextInputInstance>(null);
   const downloadAbort = useRef<AbortController | null>(null);
   const alive = useRef(true);
   const operation = useRef(false);
@@ -165,7 +167,7 @@ export function RemoteFileContextSheet({ entry, client, onClose, onChanged, onBu
 
   return (
     <KeyboardAvoidingView
-      behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+      behavior="padding" automaticOffset
       className="absolute inset-0 items-center justify-center px-5">
       <Pressable
         accessibilityLabel={t('common.cancel')}
@@ -174,6 +176,7 @@ export function RemoteFileContextSheet({ entry, client, onClose, onChanged, onBu
         onPress={onClose}
       />
       <GlassSurface
+        {...REMOTE_FILE_GLASS_SURFACE_PROPS}
         accessibilityViewIsModal
         className="w-full max-h-[85%] max-w-[380px] rounded-[24px] border border-white/30 p-5 dark:border-white/10">
         {page === 'menu' ? (

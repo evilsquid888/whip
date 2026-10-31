@@ -18,9 +18,9 @@ The app must not render the full Herdr management TUI in a terminal and place mo
 
 The mobile device reaches a remote machine over SSH. A saved host profile owns host, port, username, authentication reference, Herdr binary path, named Herdr session, optional jump host, and optional agent-forwarding setting.
 
-Metadata is stored in AsyncStorage. Passwords, private keys, and passphrases are stored through the platform credential store and referenced by profile ID; they must never be embedded in profile JSON, logs, screenshots, or fixtures. Android may back up only AES-GCM ciphertext, with its recovery token separated into Block Store. Global SSH keychain secrets are excluded from that recovery path.
+Metadata is stored in the embedded Rust-owned Turso application database. Passwords, private keys, and passphrases are stored through the platform credential store and referenced by profile ID; they must never be embedded in profile JSON, logs, screenshots, or fixtures. Android may back up only AES-GCM ciphertext, with its recovery token separated into Block Store. Global SSH keychain secrets are excluded from that recovery path.
 
-Both platforms link one `whip-ssh` static library and expose one WhipSsh TurboModule. The Rust core loads one process-wide OpenSSH-compatible known-host repository, returns typed unknown/changed challenges for explicit fingerprint approval, and parses and validates structured trusted-key records supplied by the platform store. Unsupported SSH host certificates remain a separate typed failure through UniFFI and never enter the ordinary host-key approval flow. React Native owns confirmation UI and durable storage, but never parses native error strings or constructs OpenSSH `known_hosts` lines. Direct hosts and every jump-host hop follow the same rule.
+Both platforms link one `whip-ssh` static library and expose one WhipSsh TurboModule. The Rust core loads one process-wide OpenSSH-compatible known-host repository, returns typed unknown/changed challenges for explicit fingerprint approval, and parses and validates structured trusted-key records supplied by the platform store. Unsupported SSH host certificates remain a separate typed failure through UniFFI and never enter the ordinary host-key approval flow. React Native owns confirmation UI and submits Rust-validated mutations to Rust persistence, but never parses native error strings or constructs OpenSSH `known_hosts` lines. Direct hosts and every jump-host hop follow the same rule.
 
 ### Control plane
 
@@ -41,6 +41,13 @@ builds application-level projections such as the multi-host Herd view. Each app
 session may reference one `HostRuntime`, but `AppCore` does not duplicate or
 replace Herdr server truth: the referenced runtime's `HostState` remains the
 authoritative per-host projection.
+
+`AppCore` also owns startup membership reconstruction, jump-host authentication
+dependencies, active-first restoration with bounded background concurrency, and
+connection-attempt admission/cancellation. React supplies readiness signals and
+platform effects for credential access, biometric confirmation and navigation.
+Native attempt tokens prevent delayed credentials or an old completion from
+reviving a closed session or clearing a replacement attempt.
 
 Whip opens SSH stream-local channels directly to Herdr's local API socket. Short-lived request channels carry structured actions and snapshots; a persistent subscription channel carries events. The `whip-ssh` Rust core owns request IDs and JSON serialization, newline response framing, response/error validation, subscription serialization, incremental JSONL framing, event normalization, and conversion into typed domain events. It also owns cohesive launch semantics: one typed shell/command/agent tab operation performs tab creation and the exact follow-up action, including managed-agent naming and typed partial failure. React Native supplies explicit shell or agent intents for dedicated UI actions and passes command-runner text as a command intent without tokenizing it. Rust alone interprets direct managed-agent command lines, preserves shell-bearing input as an ordinary command, and sequences `tab.create` with exactly one `agent.start` or `pane.send_input`.
 
@@ -97,7 +104,7 @@ Herdr version and protocol from its `pong` response. Rust then takes a bootstrap
 snapshot to obtain the current pane IDs, opens the complete lifecycle and
 per-pane event subscription, waits for Herdr's `subscription_started`
 acknowledgement, and takes a reconciliation snapshot while buffering events.
-AsyncStorage retains one opaque resolved-socket hint per saved host across app
+The Turso app-data store retains one opaque resolved-socket hint per saved host across app
 launches. TypeScript only loads and stores that hint; it has no socket validity,
 invalidation, discovery, or replay policy. `HostRuntime` treats the hint as
 untrusted, validates it through normal control traffic, and re-resolves it
@@ -113,6 +120,88 @@ unavailability, and polls native control snapshots to a 12-second deadline with
 accepted generation-scoped authoritative snapshot, normal event-subscription
 reconciliation, and a `HostStateChanged` projection. React Native neither sleeps
 nor requests a follow-up snapshot after this operation.
+
+### Reverse Control host actions
+
+Rust `HostActionCoordinator` executes the authenticated `hosts.*` workflows.
+It reuses the owning Reverse Control session
+and request identity and serializes mutations, including credential source/target
+operations. Opaque native permits fence each platform effect against cancellation,
+runtime/session/pane/terminal replacement, app locking, adapter replacement and
+relevant host-profile changes. Final responses are settled while the native
+authorization locks are held; foreign callbacks run after those locks are released.
+Native policy decides whether source or jump-host keys require biometric approval.
+Confirmed mutations update the native projection before replying, so a following
+host request does not wait for React to render. Newer app projections fence delayed
+mutation completions.
+
+TypeScript publishes secret-free application context and implements typed biometric,
+credential-store, profile-store, snapshot, transcript and existing connection effects.
+Its only operation handles are abort controllers for live platform connection calls.
+It does not dispatch host tools, determine host ownership or build MCP results.
+Credentials cross the private effect boundary only and never enter tool projections.
+Storage exceptions become bounded typed failures rather than remote error text.
+
+Deletion keeps the existing transcript → snapshot → profile/credentials → live
+runtime teardown order. Failure or cancellation prevents later phases. Error details
+include completed phases and the possibly ambiguous current phase so a caller can
+inspect state before retrying. Earlier commits are retained; metadata and secure
+storage do not share an atomic transaction. Their lower-level compensation and
+recovery policy remains the host/credential repository's separate responsibility.
+
+### Agent-facing browser operations
+
+Rust owns logical browser sessions and tab IDs, selected-tab admission, document,
+view and driver generations, request ordering, leases, deadlines and cancellation.
+Each MCP request pins its tab and position in the FIFO session queue at admission.
+Cancelling a waiter preserves the order of later requests. Requests arriving
+during archive hydration use the initial restored selection, so a later UI tab
+selection cannot redirect them. Saved page locations never authorize an agent;
+the native Reverse Control owner still validates runtime, launch, pane, terminal
+and transport generation before effects and final replies.
+
+The existing Rust browser engine drives DOM programs, navigation completion,
+typed tool results and downloads. Typed platform effects prepare the SSH route,
+mount/restore a WebView and execute individual page primitives. Native permits
+reject stale documents, replaced drivers, renderer crashes, data clearing and
+route changes, including late callbacks after cancellation or reconnect. Reads
+are fenced again while settling the MCP response. Explicit user navigation also
+invalidates an agent's pending page effect. Browser leases prevent view-budget
+reclamation until the owning native request settles.
+
+React owns actual WebView/WKWebView handles, native history tokens, view residency,
+navigation controls, local UI commands and page-location persistence. It keeps
+only per-effect abort handles for pending platform work; browser MCP requests no
+longer pass through the JSON action/reply registry or a JavaScript agent queue.
+Available views need no separate prepare round trip for each primitive. Downloads
+remain native cache files uploaded as bytes to the original SSH owner, with
+cancellation/rollback and cache cleanup through the transfer boundary.
+
+### Terminal composer submissions
+
+Rust `TerminalSubmissionQueue` owns per-terminal message IDs, admission, FIFO
+ordering, retry limits, cancellation and typed submission projections. React
+retains editable drafts, keyboard/focus state, image previews and native attachment
+resources. A queued message transfers those resources out of the draft; successful
+native completion releases them and publishes command history exactly once.
+Unqueue transfers them back without discarding subsequent draft edits. Renderer
+remounts retain unsent queues; authoritative terminal/session removal cancels them.
+
+The renderer supplies the existing native keyboard barrier and terminal arbitration
+reservation. SSH pastes are encoded by the originating xterm instance inside that
+reservation. Only a Rust-minted permit can dispatch the resulting input. Native
+writes pin runtime incarnation, SSH generation and terminal/pane identity; SSH shell
+writes also pin the shell operation epoch. Delayed encoding, reconnection or adapter
+replacement cannot revalidate an old permit or redirect it to another terminal.
+
+Failures before dispatch remain unsent and may retry with bounded native backoff.
+SSH input is accepted when its complete encoded submission enters the existing
+native transport queue, which does not prove remote execution. Herdr retains the
+existing separate paste/separator/Enter requests without replay, checking ownership
+before each request. Lost replies and partial writes become ambiguous and block the
+queue. They never resend automatically; the UI exposes the uncertainty before an
+explicit unqueue/edit action. Queue contents are transient and are not restored
+after process termination; persisted drafts and composer preferences are unchanged.
 
 ### Terminal plane
 
@@ -148,6 +237,28 @@ persisted terminal metadata excludes transient transport state.
 
 The renderer is responsible for ANSI color, alternate screen applications, cursor modes, bracketed paste, resize, selection, scrollback, clipboard, and mobile special keys. It does not interpret Herdr management state.
 
+### Billing access policy
+
+Rust `billing` evaluates trial eligibility and expiration, RevenueCat entitlement
+identifiers, Cowboy/Rancher capabilities, distribution rollout, developer override
+precedence, and purchase availability. One typed projection supplies the effective
+tier, access reason, SDK status, trial countdown, capabilities, purchase route,
+and next countdown/expiry deadline. Native store builds ignore developer overrides;
+GitHub/development builds retain the existing preview and simulator behavior.
+Unknown or unavailable customer information is distinct from confirmed absence of
+an entitlement and cannot grant lifetime access from stale SDK data. A valid
+installation-based trial is evaluated independently of SDK availability.
+
+TypeScript adapts RevenueCat customer information and platform installation time,
+executes purchase/restore/paywall and URL operations, renders localized prices,
+and applies the projected cosmetic capabilities without mutating saved settings.
+SDK reads are fenced across adapter lifetimes and customer-info events so delayed
+refreshes cannot replace newer purchase/restore results or revocations. Resume and
+Rust-provided countdown deadlines trigger policy evaluation with the current
+clock; no trial duration, entitlement-to-tier table, or override decision lives in
+React. Client-side cosmetic gating is not remote authorization: services must
+verify paid entitlements independently.
+
 ### Rust-owned agent transcripts
 
 Codex and OpenCode panes can expose two presentations of the same live process. The existing
@@ -180,17 +291,42 @@ callbacks from replaced transcript streams; transcript state uses its own
 operation and source epochs for reducer correctness.
 Each state projection has a monotonic revision and can be fetched in full, so a
 missed callback does not lose transcript correctness. The remote rollout remains
-authoritative. Rust constructs the host/agent/session-qualified opaque cache key,
-owns the blob schema/version and compatibility checks, and emits a checkpoint
-token with each opaque blob. The existing platform SQLite adapter stores only
-that key, host namespace, and bytes; it does not compare transcript revisions or
-reconstruct session identity. Rust validates and replays the blob before
-resuming, and only advances the durable checkpoint after the platform confirms
-the blob write. P0 cache rows are migrated once to the Rust key and the obsolete
-semantic tables are removed.
-Opening Chat first binds the terminal and semantic agent session in Rust. The
-platform cache is loaded afterward and starts that exact binding; a late cache
-load is rejected natively if the terminal was closed or rebound meanwhile.
+authoritative. Rust owns the host/agent/session identity, checkpoint format and
+compatibility checks, and all local persistence through the official embedded
+`turso` crate. A process-wide conversation database worker owns its connection
+and orders reads, writes, final detach checkpoints, retention and host deletion.
+It uses the existing Rust runtime from a dedicated thread, keeping portable
+database I/O off the UI thread and Tokio executor threads. Only a successful
+WAL transaction COMMIT with FULL synchronization confirms a durable checkpoint;
+failed writes leave the durable cursor unchanged and allow a later retry. At
+most one regular full checkpoint per session is in flight. Final detach admits
+its checkpoint before evicting the core, and a fast reopen reads behind that write.
+
+Native bootstrap provides Android's private no-backup files directory or an
+iOS Application Support directory excluded from backup. `conversations.db`
+contains a versioned conversation catalog with host namespace, agent, session,
+creation/update times and checkpoint byte counts. A separate checkpoint table
+references conversation IDs with cascading deletion. Saves commit both tables
+atomically; catalog listing and pruning never materialize checkpoint blobs.
+Identity and chronological
+indexes support lookup, host pruning and saved-conversation listing without
+reading blobs. Future message and search tables can reference conversation IDs
+without changing the checkpoint format. The Turso FTS feature is compiled in;
+current persistence does not create FTS tables or use experimental FTS APIs.
+
+Opening Chat binds the terminal and semantic session, then asynchronously asks
+Rust to restore and start that exact binding. A late restore is rejected if the
+terminal was closed or rebound meanwhile. UniFFI carries normalized transcript
+state and saved-conversation metadata; serialized checkpoints and confirmation
+tokens never pass through JavaScript. Offline reads need no host runtime or SSH.
+Missing caches remain a normal empty offline result and rebuild from the remote
+source when available. Corrupt or incompatible databases are recreated after
+closing all handles; ordinary I/O, permission and capacity errors do not delete
+the database. Each transaction is durable independently of orderly shutdown;
+dropping the last database sender drains admitted jobs and closes the worker.
+UI reloads and background transitions keep the process-owned database alive.
+The disposable Expo cache is not migrated. The worker removes only the old
+`whip-agent-chat.db` file and known SQLite sidecars in Expo's former directory.
 Transient source failure retains known content as stale rather than replacing it
 with an empty transcript.
 
@@ -251,8 +387,8 @@ Rust owns two distinct levels of state:
 
 - **`AppCore` application state:** application sessions across hosts, the active
   session, client-side workspace/tab/pane selection and repair, ordered logical
-  terminal rails and active terminals, Herd aggregation, and revisioned typed
-  application projections.
+  terminal rails and active terminals, startup restoration, connection admission,
+  Herd aggregation, and revisioned typed application projections.
 - **`HostRuntime` per-host truth:** connection/reconnect state, authoritative
   `HostState` topology and server focus, synchronization/freshness, terminal
   transports, agent transcript sessions, monitoring, diagnostics, and remote
@@ -273,13 +409,12 @@ React Native owns presentation and platform integration:
   gestures, selection, scrollback, renderer caches, composer drafts, font size,
   and other presentation preferences. Rust owns the logical rail and transport;
   React owns how each rail entry is rendered.
-- **Transcript persistence:** the platform SQLite adapter stores opaque Rust
-  keys and blobs and confirms durable checkpoints; it does not interpret the
-  transcript schema or identity. Fresh, synchronized Herdr projections provide
-  a Rust-owned list of retained transcript keys, including unopened agents.
-  Confirmed removal releases native and presentation state and prunes SQLite
-  history, including caches from previous app runs. Namespace-ordered writes
-  cannot recreate removed rows. Temporary detach, disconnect, and failed sync
+- **Transcript presentation:** React subscribes to Rust transcript projections
+  and requests typed offline reads or saved-conversation metadata. Rust applies
+  fresh, synchronized Herdr retention directly, including unopened agents and
+  previous-run caches. Runtime/revision guards reject stale retention and writes
+  from replaced runtimes; host deletion fences delayed saves. Confirmed removal
+  also releases presentation state. Temporary detach, disconnect and failed sync
   preserve history; a transcript shared by surviving panes is retained.
 - **Platform surfaces:** navigation destinations, sheets, forms, pickers/share,
   previews, notifications, and presentation preferences. React may use
@@ -382,3 +517,92 @@ Implemented:
   `AppCore` references one runtime per application session, and React Native
   receives typed lifecycle and versioned state projections;
 - Android release signing/Play delivery, signed iOS App Store distribution, and unsigned ARM64 iOS device artifacts for CI compile validation.
+
+## Local durable application data
+
+`app_database.rs` owns `whip-app.db`, separate from the disposable transcript
+cache. Native bootstrap chooses Android's private database directory (covered by
+both backup rule sets), or iOS Application Support/WhipAppData (included in backup).
+A dedicated worker serializes transactions using the existing Rust runtime;
+portable database I/O never runs on the UI thread or Tokio executor. WAL with
+`synchronous=FULL` acknowledges writes only after commit. The versioned
+`app_values` table stores small settings and snapshots by their existing stable
+keys, alongside a transactional migration-receipt table. Structured conversation
+catalog and checkpoint tables remain separate for lookup, retention and future
+search. Existing Rust host, trust, terminal and browser domain models keep their
+validation, ordering and serialization responsibilities.
+
+`appStorage` initializes the database and imports older data before reads or
+mutations. Startup state is a single batch. Session persistence uses one native
+`SessionPersistence` worker after the same initialization barrier: snapshot
+deadlines, pending exports, runtime/revision cursors, terminal resume/font
+transactions and live-host membership identities are Rust-owned. Commands enter
+the worker synchronously in call order; committed identities advance only after
+successful writes. Failed exports remain retryable and leave the previous durable
+snapshot readable. Snapshot deletion follows earlier admitted writes and
+cancels pending exports. Terminal persistence is gated on native storage
+hydration so placeholders cannot overwrite a saved rail. Other app consumers
+continue through the `appStorage` adapter. An initialization/read error remains an error, never an authoritative
+empty store. Durable database corruption or a newer/unknown schema is reported
+without deleting files, modifying SSH trust or enabling writes with defaults.
+Only the separate transcript cache may be recreated automatically.
+
+The AsyncStorage dependency remains exclusively as a read-only upgrade source.
+Rust's key inventory selects every current fixed/dynamic key family and the older
+host, device preference and browser preference formats used by direct upgrades.
+One complete legacy snapshot and its receipt commit in a single transaction;
+failed/incomplete reads and failed commits leave migration unfinished and retryable.
+A committed receipt makes retries no-ops even if acknowledgement was lost, so
+legacy values cannot overwrite edits or resurrect deleted data. Legacy data and
+unknown library keys are retained for recovery, never cleared. Keep this importer
+in future releases for users skipping versions. See
+[the storage key inventory](docs/local-storage.md).
+
+Passwords, private keys and passphrases remain in platform Keychain/Keystore.
+Only metadata and native AES-GCM credential-backup envelopes enter Turso; metadata
+writes containing unexpected plaintext credential fields are rejected. Android
+Block Store recovery, device-bound wrapped keys and global-keychain rollback
+behavior remain unchanged. Background image/download/usage files remain at their
+existing locations with their existing backup behavior. No cloud database or
+synchronization is configured.
+
+## Local agent alerts
+
+The Rust `LocalAlertCoordinator` owns local agent alert admission, host/pane/tab
+identity, pending and active lifetimes, announcement ownership, dismissal, and
+stale-result fencing. React forwards native status transitions, alert preferences,
+and foreground state; Rust chooses whether to alert, dismiss, or use brief
+foreground delivery. The coordinator receives runtime attachment identities and
+invalidates that host's alerts when its runtime is replaced or detached.
+
+Commands synchronously return typed effects with unique IDs. The TypeScript
+adapter asks Rust to admit each effect immediately before calling the platform,
+then acknowledges completion, failure, or skipped admission with the same ID.
+Late scheduling results produce notification cleanup; late speech callbacks
+cannot resume dismissed alerts or cancel a newer announcement. Token-scoped
+speech stops preserve chat playback. Rust serializes Android persistent-alert
+arming and dismissal and reconciles late completions against the current owner;
+native dismissal also checks the notification ID.
+
+TypeScript/native adapters own Expo notification scheduling and dismissal,
+Android channels, permissions and presentation, localized text, vibration, TTS,
+and native persistent-alert timeout/shake/OS-dismissal behavior. There is no
+second authoritative alert lifecycle in TypeScript. The Rust coordinator is
+independent of remote push registration, encryption, and relay delivery; it does
+not run a native timer or renew remote push leases.
+
+## Optional encrypted remote notifications
+
+The independent [`whip-notify`](whip-notify/) Rust package and Herdr plugin provide remote push through [`notify-relay`](notify-relay/), a Cloudflare Worker/D1 service using Expo/APNs/FCM. WhipAir is isolated and unchanged. No host daemon or additional network listener is required. The existing local notification pipeline remains available without either component.
+
+The Rust application notification manager owns device registrations, ordered enable/encryption/revoke transitions, relay verification, cleanup tombstones and replay admission. Platform adapters perform opaque Keychain storage, push-SDK and HTTP effects; typed state and semantic commands cross the UI boundary. A running JS notification consumer supplies a liveness pulse every three seconds, and the manager renews private device leases over the existing Rust SSH runtimes only while delivery and runtime health permit it. Stale or busy pulses never queue for later renewal. Herdr's `pane.agent_status_changed` hook checks each registered device's host-filesystem mtime independently: a lease younger than ten seconds suppresses remote delivery; expired, missing, corrupt or future-dated leases select remote delivery. iOS suspension and loss of Android JS/service readiness stop renewal. There is an unavoidable ten-second crash window and no exactly-once claim.
+
+The host encrypts padded, versioned events separately for each device with RFC 9180 HPKE Auth (X25519/HKDF-SHA256/ChaCha20-Poly1305). Device keys live in the platform Keychain; the host notification identity is pinned over authenticated SSH. The relay holds routing tokens and opaque delivery metadata, never plaintext or decryption keys. APNs/FCM display a generic alert without starting JavaScript. On tap, Rust authenticates/decrypts and checks replay state; Whip reconnects to the saved host, obtains a fresh Herdr snapshot and resolves the pane. Receiving a push never schedules another local alert.
+
+Each saved host's detail screen owns its relay configuration, device registration and plugin install/uninstall controls, using the existing Rust SSH runtime and Herdr's native GitHub plugin installer/API. It queries plugin status only for that host. General Settings retain local alert preferences. Installation pins the plugin release tag and downloads a SHA-256-verified arm64 Linux or macOS executable; hosts need Git and curl, with no Rust compiler or marketplace listing. An independent GitHub Action tests, builds and publishes the binaries without changing the mobile app's latest release. Herdr installations are shared by the SSH account's sessions, while opt-in and lease state stay per device/session. Uninstall stops that account's hooks and preserves host configuration for reinstall.
+
+Clients use the managed relay by default without an enrollment code or shared client secret. Protocol 2 creates an inactive registration and sends a random, expiring proof through Expo to the intended receiver. The foreground app confirms it with its independent management capability before the route is activated. The proof is consumed transactionally and bound to that registration's routing parameters. Global D1 budgets limit verification pushes per token/IP. Pending state expires and is cleaned on the existing schedule. Token possession does not replace the SSH-pinned host identity or HPKE authentication. Self-hosted relay origins are optional host-detail settings.
+
+Herdr 0.9.5 uses the dotted subscription above but serializes the hook envelope as `pane_agent_status_changed`; a captured real-hook fixture checks that boundary. The Worker uses manual redirects and rejects non-success responses because Workers does not implement Fetch's `error` redirect mode. Simulator push registration explicitly selects APNs sandbox; production devices retain provisioning-profile detection. Real Expo/APNs simulator acceptance covers terminated-app delivery, authenticated cold navigation with a fresh snapshot, active leases, and remote fallback after iOS backgrounding.
+
+[Remote notification documentation](docs/remote-notifications.md) specifies the wire format, compatibility checks, optional server installation, native push provisioning, deployment, per-device enable/revoke/rotation/uninstall lifecycle, tests and limitations.

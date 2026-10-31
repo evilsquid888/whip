@@ -99,6 +99,7 @@ impl Fixture {
         assert!(handle.authenticate_none("test").await?.success());
         let ssh = Arc::new(SshSession {
             inner: Arc::new(Session {
+                builtin_tailcat_ssh: false,
                 handle,
                 agent,
                 lifecycle,
@@ -260,6 +261,27 @@ impl server::Handler for ForwardServer {
         Ok(())
     }
 
+    async fn channel_open_direct_streamlocal(
+        &mut self,
+        channel: russh::Channel<server::Msg>,
+        socket_path: &str,
+        reply: server::ChannelOpenHandle,
+        _session: &mut server::Session,
+    ) -> Result<(), Self::Error> {
+        if !self.allow {
+            return Ok(());
+        }
+        let Ok(mut target) = tokio::net::UnixStream::connect(socket_path).await else {
+            return Ok(());
+        };
+        reply.accept().await;
+        tokio::spawn(async move {
+            let mut stream = channel.into_stream();
+            let _ = tokio::io::copy_bidirectional(&mut stream, &mut target).await;
+        });
+        Ok(())
+    }
+
     fn auth_none(
         &mut self,
         _user: &str,
@@ -315,29 +337,33 @@ impl server::Handler for ForwardServer {
                     let _ = tokio::io::copy_bidirectional(&mut source, &mut target).await;
                 });
             }
+            // Release the socket before dropping the cancellation receiver so
+            // the server can acknowledge that the listener has actually closed.
+            drop(listener);
         });
         tokio::time::sleep(self.delay).await;
         Ok(true)
     }
 
-    fn cancel_tcpip_forward(
+    async fn cancel_tcpip_forward(
         &mut self,
         address: &str,
         port: u32,
         _session: &mut server::Session,
-    ) -> impl Future<Output = Result<bool, Self::Error>> {
+    ) -> Result<bool, Self::Error> {
         if address != BIND_ADDRESS {
-            return ready(Ok(false));
+            return Ok(false);
         }
         let Some(cancel) = u16::try_from(port)
             .ok()
             .and_then(|port| self.state.listeners.write().remove(&port))
         else {
-            return ready(Ok(false));
+            return Ok(false);
         };
         cancel.send_replace(true);
+        cancel.closed().await;
         self.state.cancelled.fetch_add(1, Ordering::Relaxed);
-        ready(Ok(true))
+        Ok(true)
     }
 }
 
@@ -483,7 +509,8 @@ fn reverse_forward_moves_bytes_over_ssh_and_closes_active_streams_on_drop()
             tokio::time::timeout(Duration::from_secs(2), remote.read(&mut message)).await??,
             0
         );
-        wait_until(|| fixture.state.listeners.read().is_empty()).await?;
+        wait_until(|| fixture.state.cancelled.load(Ordering::Relaxed) == 1).await?;
+        assert!(fixture.state.listeners.read().is_empty());
         assert!(fixture.ssh.inner.reverse_forwards.read().is_empty());
         assert!(
             TcpStream::connect((BIND_ADDRESS, remote_port))

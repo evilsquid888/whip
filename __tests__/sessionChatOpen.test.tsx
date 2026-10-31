@@ -1,12 +1,12 @@
-import type { ComponentProps } from 'react';
-import { Linking, Platform } from 'react-native';
+import { createRef, Profiler, type ComponentProps } from 'react';
+import { Linking, Platform, type View } from 'react-native';
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import { SessionScreen } from '../src/components/SessionScreen';
+import { moveKeyboard, publishKeyboard, resetKeyboardController } from '../test-support/keyboardAnimation';
 import { TerminalComposerStore } from '../src/lib/terminalComposerStore';
-import { agentChatCache } from '../src/services/agentChatCache';
-import { readCachedAgentTranscript } from 'react-native-whip-ssh';
+import { readSavedAgentTranscript } from 'react-native-whip-ssh';
 import { agentTranscriptService } from '../src/services/NativeTranscriptService';
-import { listenToChat } from '../src/services/chatSpeech';
+import { listenToChat, readChatResponse } from '../src/services/chatSpeech';
 import type { ChatAgent } from '../src/lib/agentChatSession';
 import { AgentChatPresentationPhase } from '../src/lib/agentChatPresentation';
 import { TerminalResidencyEndReason } from '../src/lib/terminalResidency';
@@ -38,14 +38,22 @@ jest.mock('react-native', () => ({
   Platform: { OS: 'android', select: (options: Record<string, unknown>) => options.android },
   Linking: { openURL: jest.fn() },
 }));
+jest.mock('expo-modules-core', () => ({
+  requireNativeViewManager: () => 'WhipTerminalInput',
+}));
+jest.mock('expo', () => ({
+  requireNativeView: () => 'WhipTerminalInput',
+}));
 jest.mock('react-native-css-interop/jsx-runtime', () =>
   jest.requireActual('react/jsx-runtime'),
 );
+jest.mock('react-native-reanimated', () => require('../test-support/keyboardAnimation').reanimatedKeyboardMock);
 jest.mock('react-native-whip-ssh', () =>
   require('./mockWhipSsh').createMockWhipSshModule(),
 );
 jest.mock('../src/services/chatSpeech', () => ({
   listenToChat: jest.fn(() => jest.fn()),
+  readChatResponse: jest.fn((_target, _messages, onStopped) => jest.fn(onStopped)),
 }));
 jest.mock(
   'lucide-react-native',
@@ -78,15 +86,18 @@ jest.mock('../src/components/app-ui', () => ({
   hapticPress: (fn: unknown) => fn,
 }));
 jest.mock('../src/components/GlassSurface', () => ({
+  GlassSurface: 'GlassSurface',
   useAppGlassEnabled: () => false,
 }));
 jest.mock('../src/services/terminalAssets', () => ({ IOS_TERMINAL_ASSETS: null }));
 jest.mock('../src/components/TerminalScreen', () => {
   const { createElement: element, useLayoutEffect } = require('react');
+  const { useSharedValue } = require('react-native-reanimated');
   const { TerminalRendererHost } = require('../src/components/TerminalRendererHost');
   const noop = () => {};
   return {
     TerminalScreen: (props: ComponentProps<typeof import('../src/components/TerminalScreen').TerminalScreen>) => {
+      const animatedBottomInset = useSharedValue(0);
       useLayoutEffect(() => {
         mockChatFrames.push({ visible: props.visible, chat: props.chatViewEnabled });
       });
@@ -100,7 +111,7 @@ jest.mock('../src/components/TerminalScreen', () => {
           onBufferModeChange: noop, onVisualScrollState: noop, onProtocolStateChange: noop,
           onTitleChange: noop, onFontSizeChange: noop, onStatus: noop, onError: noop,
         }),
-        props.renderViewportOverlay?.({ top: 0, bottom: 0 }, 0, { open: false, onClose: noop }),
+        props.renderViewportOverlay?.({ top: 0, bottom: 0 }, 0, { open: false, onClose: noop }, animatedBottomInset),
       );
     },
     TerminalBackground: 'TerminalBackground',
@@ -108,6 +119,12 @@ jest.mock('../src/components/TerminalScreen', () => {
 });
 jest.mock('../src/components/AgentChatView', () => ({
   AgentChatView: 'AgentChatView',
+}));
+jest.mock('../src/components/GithubViewer', () => ({
+  GithubViewer: 'GithubViewer',
+}));
+jest.mock('../src/hooks/useGithubRepository', () => ({
+  useGithubRepository: () => null,
 }));
 jest.mock('../src/components/AgentIntegrationInstallSheet', () => ({
   AgentIntegrationInstallSheet: 'IntegrationSheet',
@@ -119,6 +136,7 @@ jest.mock('../src/components/AppAlertPopup', () => ({
   AppAlertPopup: 'Alert',
 }));
 jest.mock('../src/components/AppBackground', () => ({
+  FrostedAppBackground: 'FrostedAppBackground',
   AppBackground: 'AppBackground',
 }));
 jest.mock('../src/components/AttachmentPasteSheet', () => ({
@@ -216,7 +234,7 @@ function setup(agent: ChatAgent) {
       },
     ),
     startAgentChat: jest.fn(
-      (_bindingToken: string, _cacheBlob?: ArrayBuffer): NativeAgentChatStartResult => ({ type: 'stale-binding' }),
+      (_bindingToken: string): NativeAgentChatStartResult | Promise<NativeAgentChatStartResult> => ({ type: 'stale-binding' }),
     ),
     detachAgentChat: jest.fn((terminalId: string) => {
       bindings.delete(terminalId);
@@ -273,6 +291,7 @@ function setup(agent: ChatAgent) {
     onCloseTerminal: jest.fn(),
     onTerminalStatus: jest.fn(),
     onTerminalFontSizeChange: jest.fn(),
+    onTerminalChatSelect: jest.fn(),
     onOpenFiles: jest.fn(),
     composerStore: new TerminalComposerStore(),
     onTerminalControlUse: jest.fn(),
@@ -306,14 +325,30 @@ const navigationPhases = [
 
 beforeEach(() => {
   Platform.OS = 'android';
+  resetKeyboardController();
   mockChatFrames.length = 0;
   mockVolumeKeyListeners.clear();
   mockTunneledHosts.clear();
   jest.mocked(supportsBrowserControl).mockReturnValue(false);
   jest.mocked(listenToChat).mockClear();
+  jest.mocked(readChatResponse).mockClear();
   jest.mocked(Linking.openURL).mockReset().mockResolvedValue(undefined);
   jest.spyOn(console, 'info').mockImplementation(() => {});
-  jest.spyOn(agentChatCache, 'loadNative').mockResolvedValue(null);
+  jest.mocked(readSavedAgentTranscript).mockReset().mockResolvedValue(undefined);
+});
+
+test('attachment picker keeps the opening composer blur source and clears it for normal attachments', async () => {
+  const host = setup('codex');
+  const composerTarget = createRef<View>();
+  await act(async () => { renderer = create(<SessionScreen {...host.props} />); });
+  act(() => { ui('TerminalScreen').props.onRequestAttachment(composerTarget); });
+  expect(ui('AttachmentSheet').props.visible).toBe(true);
+  expect(ui('AttachmentSheet').props.blurTarget).toBe(composerTarget);
+
+  act(() => { ui('AttachmentSheet').props.onClose(); });
+  act(() => { ui('TerminalScreen').props.onRequestAttachment(); });
+  expect(ui('AttachmentSheet').props.visible).toBe(true);
+  expect(ui('AttachmentSheet').props.blurTarget).toBeUndefined();
 });
 
 test('interacting with a completed agent acknowledges it through Herdr once per pending request', async () => {
@@ -383,51 +418,44 @@ test.each(['hidden', 'background', 'offline', 'stale', 'different-terminal'] as 
   },
 );
 
-test('session rail follows measured terminal controls and keyboard visibility', async () => {
+test('session rail follows native keyboard frames before the JS hide event without a React commit', async () => {
   const host = setup('codex');
-  await act(async () => { renderer = create(<SessionScreen {...host.props} />); });
+  const commits = jest.fn();
+  await act(async () => { renderer = create(<Profiler id="rail" onRender={commits}><SessionScreen {...host.props} /></Profiler>); });
   const back = renderer.root.findByProps({ accessibilityLabel: 'session.backToHerd' });
   const rail = back.parent!;
-  const railContainer = rail.parent!;
+  const railContainer = rail.parent!.parent!;
   const measuredBottom = terminalControlBarInset(34) + 8;
 
   expect(railContainer.props.style.bottom).toBe(terminalControlBarInset(0));
-  for (const { keyboardInset, visible } of [
-    { keyboardInset: 300, visible: false },
-    { keyboardInset: 0, visible: true },
-  ]) {
-    act(() => {
-      ui('TerminalScreen').props.onSessionChromeLayoutChange({
-        bottom: measuredBottom + keyboardInset, visible,
-      });
-    });
-    expect(railContainer.props.style.bottom).toBe(measuredBottom + keyboardInset);
-    expect(rail.props.pointerEvents).toBe(visible ? 'auto' : 'none');
-    expect(rail.props.style?.display).toBe(visible ? undefined : 'none');
+  act(() => { ui('TerminalScreen').props.onControlBarHeightChange(measuredBottom); });
+  act(() => publishKeyboard(true));
+  commits.mockClear();
+  for (const height of [300, 120, 1, 0, 100, 0]) {
+    act(() => moveKeyboard(height));
+    const visible = height === 0;
+    expect(railContainer.props.style.bottom).toBe(measuredBottom);
+    expect(rail.props.animatedProps.pointerEvents).toBe(visible ? 'auto' : 'none');
+    expect(rail.props.style.opacity).toBe(visible ? 1 : 0);
+    expect(rail.props.animatedProps.accessibilityElementsHidden).toBe(!visible);
+    expect(renderer.root.findByProps({ accessibilityLabel: 'session.backToHerd' }).parent).toBe(rail);
   }
+  expect(commits).not.toHaveBeenCalled();
 });
 
-test('offline terminal shows cached chat in the usual Chat viewport', async () => {
+test.each([false, true])('offline terminal shows cached chat (restored selection=%s)', async chatSelected => {
   const host = setup('codex');
-  const blob = new Uint8Array([1, 2, 3]).buffer;
-  jest.spyOn(agentChatCache, 'listNative').mockResolvedValue([{
-    namespace: 'host-1',
-    key: 'cached-key',
-    agent: 'codex',
+  host.props.snapshot.tabs[0].label_is_custom = false;
+  jest.mocked(readSavedAgentTranscript).mockResolvedValue({
     sessionId: host.pane.agent_session!.value,
-    updatedAt: 1,
-    cacheBytes: 3,
-  }]);
-  jest.mocked(agentChatCache.loadNative).mockResolvedValue(blob);
-  jest.mocked(readCachedAgentTranscript).mockReturnValue({
-    sessionId: host.pane.agent_session!.value,
+    info: { id: host.pane.agent_session!.value, title: 'Explicitly loaded saved conversation' },
     agent: 'codex',
     revision: 1,
     status: 'stale',
     messages: [],
     turns: [],
   });
-  act(() => {
+  await act(async () => {
     renderer = create(<SessionScreen
       {...host.props}
       client={null}
@@ -437,18 +465,19 @@ test('offline terminal shows cached chat in the usual Chat viewport', async () =
         sessions: [{
           ...host.props.terminalState.sessions[0],
           status: 'disconnected',
+          chatSelected,
         }],
       }}
     />);
   });
-  await act(async () => {
-    await control().onPress();
-  });
-  expect(agentChatCache.loadNative).toHaveBeenCalledWith('cached-key');
+  if (!chatSelected) await act(async () => { await control().onPress(); });
+  expect(readSavedAgentTranscript).toHaveBeenCalledWith('host-1', 'codex', host.pane.agent_session!.value);
   expect(ui('TerminalScreen').props.chatViewEnabled).toBe(true);
   expect(ui('AgentChatView').props.state.transcript.sessionId)
     .toBe(host.pane.agent_session!.value);
   expect(host.native.openAgentChat).not.toHaveBeenCalled();
+  expect(tabLabels()).toContain('Explicitly loaded saved conversation');
+  expect(readSavedAgentTranscript).toHaveBeenCalledTimes(1);
   await act(async () => {
     ui('AgentChatView').props.onOpenWebLink('https://example.com/docs');
   });
@@ -523,16 +552,41 @@ test('plain SSH tabs use the shared create, switch, rename, close and volume con
   act(() => { ui('Input').props.onChangeText('Server logs'); });
   await act(async () => { await ui('EditorSheet').props.onSave(); });
   expect(host.props.onRenameSshShell).toHaveBeenCalledWith(shells[1].terminalId, 'Server logs');
+  expect(ui('EditorSheet').props.visible).toBe(false);
+
+  act(() => { tabButtons('session.openTab')[1].props.onLongPress(); });
+  act(() => { ui('Input').props.onChangeText('Discarded rename'); });
+  act(() => { ui('EditorSheet').props.onClose(); });
 
   act(() => { tabButtons('session.newTab')[0].props.onPress(); });
   expect(ui('EditorSheet').props.title).toBe('session.newTab');
   expect(ui('Input').props.placeholder).toBe('terminal.sshShell');
+  expect(ui('Input').props.value).toBe('');
   act(() => { ui('Input').props.onChangeText('Deploy'); });
   await act(async () => { await ui('EditorSheet').props.onSave(); });
   expect(host.props.onOpenSshShell).toHaveBeenCalledWith('Deploy');
+  expect(host.props.onRenameSshShell).toHaveBeenCalledTimes(1);
   act(() => { tabButtons('session.closeTab')[0].props.onPress(); });
   expect(host.props.onCloseTerminal).toHaveBeenCalledWith(shells[0].terminalId);
   expect(host.native.requestHerdrApi).not.toHaveBeenCalled();
+});
+
+test('changing hosts closes the editor and clears its draft before creating another tab', async () => {
+  const host = setup('codex');
+  await act(async () => { renderer = create(<SessionScreen {...host.props} />); });
+  const newTab = () => renderer.root.findByProps({ accessibilityLabel: 'session.newTab' });
+  act(() => { newTab().props.onPress(); });
+  act(() => { ui('Input').props.onChangeText('Previous host draft'); });
+
+  act(() => { renderer.update(<SessionScreen {...host.props} hostSessionId="host-2" />); });
+
+  expect(ui('EditorSheet').props.visible).toBe(false);
+  expect(ui('Input').props.value).toBe('');
+  await act(async () => { await ui('EditorSheet').props.onSave(); });
+  expect(host.native.requestHerdrApi).not.toHaveBeenCalled();
+  act(() => { newTab().props.onPress(); });
+  expect(ui('EditorSheet').props.visible).toBe(true);
+  expect(ui('Input').props.value).toBe('');
 });
 
 test('an active SSH tab remains selected when a focused Herdr workspace appears', () => {
@@ -613,6 +667,167 @@ function revealChat() {
   act(() => { viewport.props.onInitialViewportReady(); });
   expect(ui('TerminalScreen').props.chatViewEnabled).toBe(true);
 }
+
+function bindTitledChat(host: ReturnType<typeof setup>, agent: ChatAgent, title: string) {
+  const sessionId = host.pane.agent_session!.value;
+  const binding = bindChat(host, agent, { sessionId });
+  binding.state = { ...binding.state, sessionId, status: 'live', revision: 1, info: { id: sessionId, title } };
+  host.native.startAgentChat.mockImplementation(() => ({ type: 'started', state: binding.state }));
+  host.props.snapshot.tabs[0] = {
+    ...host.props.snapshot.tabs[0], label: 'Herdr label', label_is_custom: false,
+  };
+  return binding;
+}
+
+function tabLabels() {
+  return renderer.root.findAll(node => String(node.type) === 'Text' && node.props.numberOfLines === 1)
+    .map(node => node.props.children);
+}
+
+function emitTitle(host: ReturnType<typeof setup>, binding: NativeAgentChatBinding, title?: string) {
+  binding.state = { ...binding.state, revision: binding.state.revision + 1, info: { id: binding.sessionId, title } };
+  host.handlers.get(binding.terminalId)!({
+    key: binding.transcriptKey, runtimeIncarnation: binding.runtimeIncarnation,
+    revision: binding.state.revision,
+    deltas: [{ type: 'info-changed', info: binding.state.info }],
+  });
+}
+
+test.each(['claude', 'codex', 'opencode', 'pi'] as const)('%s titles follow loaded metadata without opening inactive transcripts', async agent => {
+  const host = setup(agent);
+  const binding = bindTitledChat(host, agent, 'Loaded conversation');
+  host.props.snapshot.tabs.push({ ...host.props.snapshot.tabs[0], tab_id: 'inactive', label: 'Inactive' });
+  host.props.snapshot.panes.push({ ...host.pane, tab_id: 'inactive', pane_id: 'inactive-pane', terminal_id: 'inactive-terminal' });
+  const renders = jest.fn();
+  await act(async () => { renderer = create(<Profiler id="tabs" onRender={renders}><SessionScreen {...host.props} /></Profiler>); });
+  expect(tabLabels()).toEqual(expect.arrayContaining(['Loaded conversation', 'Inactive']));
+  const openCount = host.native.openAgentChat.mock.calls.length;
+  const startCount = host.native.startAgentChat.mock.calls.length;
+  const renderCount = renders.mock.calls.length;
+  act(() => { emitTitle(host, binding, 'Loaded conversation'); });
+  expect(renders).toHaveBeenCalledTimes(renderCount);
+  act(() => { emitTitle(host, binding, 'Updated conversation'); });
+  expect(tabLabels()).toContain('Updated conversation');
+  expect(host.native.openAgentChat).toHaveBeenCalledTimes(openCount);
+  expect(host.native.openAgentChat.mock.calls.every(([terminalId]) => terminalId === binding.terminalId)).toBe(true);
+  expect(host.native.startAgentChat).toHaveBeenCalledTimes(startCount);
+  expect(host.native.requestHerdrApi).not.toHaveBeenCalled();
+  expect(readSavedAgentTranscript).not.toHaveBeenCalled();
+});
+
+test.each([true, undefined])('manual or unknown rename origin (%s) preserves the tab label as metadata changes', async origin => {
+  const host = setup('claude');
+  const binding = bindTitledChat(host, 'claude', 'Automatic');
+  host.props.snapshot.tabs[0].label_is_custom = origin;
+  const renders = jest.fn();
+  await act(async () => { renderer = create(<Profiler id="tabs" onRender={renders}><SessionScreen {...host.props} /></Profiler>); });
+  const renderCount = renders.mock.calls.length;
+  act(() => { emitTitle(host, binding, 'Changed automatic'); });
+  expect(renders).toHaveBeenCalledTimes(renderCount);
+  expect(tabLabels()).toContain('Herdr label');
+  expect(tabLabels()).not.toContain('Changed automatic');
+});
+
+test('a title remains after transcript eviction without reloading, and never survives a session switch', async () => {
+  const host = setup('codex');
+  bindTitledChat(host, 'codex', 'Retained conversation');
+  await act(async () => { renderer = create(<SessionScreen {...host.props} />); });
+  const openCount = host.native.openAgentChat.mock.calls.length;
+  const startCount = host.native.startAgentChat.mock.calls.length;
+  await act(async () => { renderer.update(<SessionScreen {...host.props} visible={false} />); });
+  act(() => { ui('TerminalScreen').props.onResidencyEnd(host.props.terminalTargets[0], TerminalResidencyEndReason.Evicted); });
+  expect(tabLabels()).toContain('Retained conversation');
+  const snapshot = { ...host.props.snapshot, panes: [{
+    ...host.pane, agent_session: { ...host.pane.agent_session!, value: 'resumed-session' },
+  }] };
+  host.setSnapshot(snapshot);
+  await act(async () => { renderer.update(<SessionScreen {...host.props} snapshot={snapshot} visible={false} />); });
+  expect(tabLabels()).toContain('Herdr label');
+  expect(tabLabels()).not.toContain('Retained conversation');
+  expect(host.native.openAgentChat).toHaveBeenCalledTimes(openCount);
+  expect(host.native.startAgentChat).toHaveBeenCalledTimes(startCount);
+  expect(readSavedAgentTranscript).not.toHaveBeenCalled();
+});
+
+test('metadata changes and transcript resets update the label while Chat is open', async () => {
+  const host = setup('opencode');
+  const binding = bindTitledChat(host, 'opencode', 'Initial conversation');
+  await act(async () => { renderer = create(<SessionScreen {...host.props} />); });
+  await act(async () => { await control().onPress(); });
+  act(() => { emitTitle(host, binding, 'Renamed conversation'); });
+  expect(tabLabels()).toContain('Renamed conversation');
+  act(() => {
+    binding.state = { ...binding.state, revision: binding.state.revision + 1, info: undefined, messages: [], turns: [] };
+    host.handlers.get(binding.terminalId)!({
+      key: binding.transcriptKey, runtimeIncarnation: binding.runtimeIncarnation,
+      revision: binding.state.revision, deltas: [{ type: 'reset', state: binding.state }],
+    });
+  });
+  expect(tabLabels()).toContain('Herdr label');
+  expect(tabLabels()).not.toContain('Renamed conversation');
+});
+
+test('loaded background tabs receive title changes without activating their transcripts', async () => {
+  const host = setup('codex');
+  const first = bindTitledChat(host, 'codex', 'Codex conversation');
+  const second = bindChat(host, 'opencode', {
+    bindingToken: 'binding-2', bindingGeneration: 2, transcriptKey: 'transcript-2',
+    terminalId: 'terminal-2', paneId: 'pane-2', sessionId: 'session-2',
+  });
+  second.state = { ...second.state, sessionId: second.sessionId, status: 'live', revision: 1,
+    info: { id: second.sessionId, title: 'OpenCode conversation' } };
+  const pane = { ...host.pane, pane_id: second.paneId, terminal_id: second.terminalId, tab_id: 'tab-2',
+    agent_session: { ...host.pane.agent_session!, agent: second.agent, value: second.sessionId } };
+  host.props.snapshot.panes.push(pane);
+  host.props.snapshot.tabs.push({ ...host.props.snapshot.tabs[0], tab_id: pane.tab_id, label: 'Second tab' });
+  const terminal = { ...host.props.terminalState.sessions[0], terminalId: pane.terminal_id, paneId: pane.pane_id };
+  host.props.terminalState.sessions.push(terminal);
+  host.props.terminalTargets = [...host.props.terminalTargets,
+    { ...host.props.terminalTargets[0], key: 'target-2', session: terminal }];
+  host.native.startAgentChat.mockImplementation(token => ({
+    type: 'started', state: token === first.bindingToken ? first.state : second.state,
+  }));
+  await act(async () => { renderer = create(<SessionScreen {...host.props} />); });
+  expect(host.native.openAgentChat).toHaveBeenCalledTimes(1);
+  expect(tabLabels()).toContain('Second tab');
+  const select = async (terminalId: string) => {
+    host.props.terminalState = { ...host.props.terminalState, activeTerminalId: terminalId };
+    await act(async () => { renderer.update(<SessionScreen {...host.props} />); });
+  };
+  await select(second.terminalId);
+  await select(first.terminalId);
+  expect(tabLabels()).toEqual(expect.arrayContaining(['Codex conversation', 'OpenCode conversation']));
+  const calls = host.native.openAgentChat.mock.calls.length;
+  act(() => { emitTitle(host, second, 'Updated background conversation'); });
+  expect(tabLabels()).toEqual(expect.arrayContaining(['Codex conversation', 'Updated background conversation']));
+  expect(host.native.openAgentChat).toHaveBeenCalledTimes(calls);
+});
+
+test('resume rebinds title identity and ignores late updates from the previous conversation', async () => {
+  const host = setup('codex');
+  const first = bindTitledChat(host, 'codex', 'Original conversation');
+  await act(async () => { renderer = create(<SessionScreen {...host.props} />); });
+  const oldHandler = host.handlers.get(first.terminalId)!;
+  const resumed = bindChat(host, 'codex', {
+    bindingToken: 'binding-2', bindingGeneration: 2, sessionId: 'resumed-session', transcriptKey: 'resumed-transcript',
+  });
+  resumed.state = { ...resumed.state, sessionId: resumed.sessionId, revision: 1, status: 'live',
+    info: { id: resumed.sessionId, title: 'Resumed conversation' } };
+  host.bindings.set(resumed.terminalId, resumed);
+  host.native.startAgentChat.mockImplementation(() => ({ type: 'started', state: resumed.state }));
+  const snapshot = { ...host.props.snapshot, panes: [{ ...host.pane,
+    agent_session: { ...host.pane.agent_session!, value: resumed.sessionId },
+  }] };
+  host.setSnapshot(snapshot);
+  await act(async () => { renderer.update(<SessionScreen {...host.props} snapshot={snapshot} />); });
+  expect(tabLabels()).toContain('Resumed conversation');
+  act(() => { oldHandler({
+    key: first.transcriptKey, runtimeIncarnation: first.runtimeIncarnation, revision: 10,
+    deltas: [{ type: 'info-changed', info: { id: first.sessionId, title: 'Late old title' } }],
+  }); });
+  expect(tabLabels()).toContain('Resumed conversation');
+  expect(tabLabels()).not.toContain('Late old title');
+});
 
 test('Codex identity reads follow visible chat entry and activity without repeating on transcript updates', async () => {
   const host = setup('codex');
@@ -826,13 +1041,46 @@ function addCachePressure(host: ReturnType<typeof setup>) {
   ));
 }
 
-describe.each(['codex', 'opencode'] as const)('%s SessionScreen', agent => {
-  test.each(['hidden', 'background', 'ssh', 'shell', 'no-target'] as const)('does not preload an ineligible %s terminal', async reason => {
+describe.each(['codex', 'opencode', 'pi'] as const)('%s SessionScreen', agent => {
+  test.each([false, true])('restores Chat after remount (late storage=%s) and saves Terminal selection', async lateStorage => {
+    const host = setup(agent);
+    await openReadyChat(host, agent);
+    revealChat();
+    expect(host.props.onTerminalChatSelect).toHaveBeenLastCalledWith('host-1', 'terminal-1', true);
+    const selected = { ...host.props.terminalState.sessions[0], chatSelected: true };
+    act(() => renderer.unmount());
+
+    if (!lateStorage) {
+      host.props.terminalState = { activeTerminalId: selected.terminalId, sessions: [selected] };
+      host.props.terminalTargets = [{ ...host.props.terminalTargets[0], session: selected }];
+    }
+    await act(async () => { renderer = create(<SessionScreen {...host.props} />); });
+    if (lateStorage) {
+      expect(ui('TerminalScreen').props.chatViewEnabled).toBe(false);
+      host.props.terminalState = { activeTerminalId: selected.terminalId, sessions: [selected] };
+      host.props.terminalTargets = [{ ...host.props.terminalTargets[0], session: selected }];
+      await act(async () => { renderer.update(<SessionScreen {...host.props} />); });
+    }
+    expect(control().loading).toBe(true);
+    revealChat();
+    act(() => { control().onPress(); });
+    expect(host.props.onTerminalChatSelect).toHaveBeenLastCalledWith('host-1', 'terminal-1', false);
+    const terminal = { ...selected, chatSelected: false };
+    host.props.terminalState = { activeTerminalId: terminal.terminalId, sessions: [terminal] };
+    host.props.terminalTargets = [{ ...host.props.terminalTargets[0], session: terminal }];
+    act(() => renderer.unmount());
+    await act(async () => { renderer = create(<SessionScreen {...host.props} />); });
+    expect(ui('TerminalScreen').props.chatViewEnabled).toBe(false);
+    expect(control().active).toBe(false);
+  });
+
+  test.each(['hidden', 'background', 'ssh', 'shell', 'unsupported', 'no-target'] as const)('does not preload an ineligible %s terminal', async reason => {
     const host = setup(agent);
     bindChat(host, agent);
     if (reason === 'hidden') host.props.visible = false;
     if (reason === 'ssh') host.props.terminalTargets[0].session.kind = 'ssh';
     if (reason === 'shell') Object.assign(host.pane, { agent: 'shell', display_agent: 'shell', agent_session: undefined });
+    if (reason === 'unsupported') host.pane.agent_session!.agent = 'gemini';
     if (reason === 'no-target') host.props.terminalTargets = [];
     // Mount hidden first so the AppState listener can receive a background event.
     if (reason === 'background') host.props.visible = false;
@@ -845,8 +1093,9 @@ describe.each(['codex', 'opencode'] as const)('%s SessionScreen', agent => {
     }
     await act(async () => {});
     expect(host.native.openAgentChat).not.toHaveBeenCalled();
-    expect(agentChatCache.loadNative).not.toHaveBeenCalled();
+    expect(host.native.startAgentChat).not.toHaveBeenCalled();
     expect(ui('TerminalScreen').props.chatViewEnabled).toBe(false);
+    if (reason === 'shell' || reason === 'unsupported') expect(control()).toBeUndefined();
     if (reason === 'hidden' || reason === 'background') {
       await act(async () => {
         for (const listener of mockAppStateListeners) listener('active');
@@ -902,18 +1151,16 @@ describe.each(['codex', 'opencode'] as const)('%s SessionScreen', agent => {
   test.each([true, false])('preloads silently and reuses its binding when cache finishes before Chat: %s', async readyBeforePress => {
     const host = setup(agent);
     const binding = bindChat(host, agent);
-    let restore!: (blob: ArrayBuffer) => void;
-    jest.mocked(agentChatCache.loadNative).mockReturnValueOnce(new Promise(resolve => { restore = resolve; }));
-    host.native.startAgentChat.mockImplementation(() => {
+    let restore!: () => void;
+    host.native.startAgentChat.mockImplementation(() => new Promise(resolve => { restore = () => {
       binding.state = { ...binding.state, status: 'stale', revision: 1 };
-      return { type: 'started', state: binding.state };
-    });
+      resolve({ type: 'started', state: binding.state });
+    }; }));
     act(() => { renderer = create(<SessionScreen {...host.props} />); });
     const terminal = ui('WebView');
     expect(mockChatFrames[0]).toEqual({ visible: true, chat: false });
     expect(host.native.openAgentChat).toHaveBeenCalledTimes(1);
-    expect(agentChatCache.loadNative).toHaveBeenCalledWith(binding.transcriptKey);
-    expect(host.native.startAgentChat).not.toHaveBeenCalled();
+    expect(host.native.startAgentChat).toHaveBeenCalledWith(binding.bindingToken);
     expect(control()).toMatchObject({ active: false, loading: false, disabled: false });
     expect(ui('TerminalScreen').props.chatViewEnabled).toBe(false);
     expect(ui('TerminalScreen').props.renderViewportOverlay).toBeUndefined();
@@ -924,9 +1171,8 @@ describe.each(['codex', 'opencode'] as const)('%s SessionScreen', agent => {
     expect(host.props.onRefresh).not.toHaveBeenCalled();
     expect(host.native.agentIntegrationStatus).not.toHaveBeenCalled();
 
-    const blob = new Uint8Array([1, 2]).buffer;
     if (readyBeforePress) {
-      await act(async () => { restore(blob); });
+      await act(async () => { restore(); });
       expect(control().loading).toBe(false);
       expect(ui('TerminalScreen').props.renderViewportOverlay).toBeUndefined();
     }
@@ -935,11 +1181,11 @@ describe.each(['codex', 'opencode'] as const)('%s SessionScreen', agent => {
     expect(ui('TerminalScreen').props.chatViewEnabled).toBe(false);
     if (!readyBeforePress) {
       expect(ui('TerminalScreen').props.renderViewportOverlay).toBeUndefined();
-      await act(async () => { restore(blob); });
+      await act(async () => { restore(); });
     }
     expect(host.native.openAgentChat).toHaveBeenCalledTimes(1);
     expect(host.native.startAgentChat).toHaveBeenCalledTimes(1);
-    expect(host.native.startAgentChat).toHaveBeenCalledWith(binding.bindingToken, blob);
+    expect(host.native.startAgentChat).toHaveBeenCalledWith(binding.bindingToken);
     expect(ui('AgentChatView').parent?.props).toMatchObject({
       pointerEvents: 'none', accessibilityElementsHidden: true, style: { opacity: 0 },
     });
@@ -1100,20 +1346,21 @@ describe.each(['codex', 'opencode'] as const)('%s SessionScreen', agent => {
       terminalId: paneB.terminal_id, paneId: paneB.pane_id,
       bindingToken: 'binding-2', transcriptKey: 'transcript-2', sessionId: 'session-2',
     });
-    const restores = new Map<string, (blob: null) => void>();
-    jest.mocked(agentChatCache.loadNative).mockImplementation(key => new Promise(resolve => { restores.set(key, resolve); }));
-    host.native.startAgentChat.mockImplementation(token => {
-      const binding = token === a.bindingToken ? a : b;
-      binding.state = { ...binding.state, status: 'live', revision: 1, sessionId: binding.sessionId };
-      return { type: 'started', state: binding.state };
-    });
+    const restores = new Map<string, () => void>();
+    host.native.startAgentChat.mockImplementation(token => new Promise(resolve => {
+      restores.set(token, () => {
+        const binding = token === a.bindingToken ? a : b;
+        binding.state = { ...binding.state, status: 'live', revision: 1, sessionId: binding.sessionId };
+        resolve({ type: 'started', state: binding.state });
+      });
+    }));
     act(() => { renderer = create(<SessionScreen {...host.props} />); });
     act(visits[0]);
-    await act(async () => { restores.get(a.transcriptKey)?.(null); });
+    await act(async () => { restores.get(a.bindingToken)?.(); });
     expect(control()).toMatchObject({ active: false, loading: false });
     expect(ui('TerminalScreen').props.renderViewportOverlay).toBeUndefined();
     act(() => renderer.update(<SessionScreen {...host.props} />));
-    await act(async () => { restores.get(b.transcriptKey)?.(null); });
+    await act(async () => { restores.get(b.bindingToken)?.(); });
     act(() => { control().onPress(); });
     expect(ui('AgentChatView').props.state.sessionId).toBe(a.sessionId);
     revealChat();
@@ -1127,8 +1374,10 @@ describe.each(['codex', 'opencode'] as const)('%s SessionScreen', agent => {
   test('authoritative identity replacement cancels the old cache completion and keeps the new preload dormant', async () => {
     const host = setup(agent);
     const old = bindChat(host, agent);
-    let restoreOld!: (blob: null) => void;
-    jest.mocked(agentChatCache.loadNative).mockReturnValueOnce(new Promise(resolve => { restoreOld = resolve; }));
+    let restoreOld!: () => void;
+    host.native.startAgentChat.mockImplementationOnce(() => new Promise(resolve => {
+      restoreOld = () => resolve({type: 'stale-binding'});
+    }));
     act(() => { renderer = create(<SessionScreen {...host.props} />); });
     const replacement = bindChat(host, agent, { bindingToken: 'binding-2', transcriptKey: 'transcript-2', sessionId: 'session-2' });
     // Rust's authoritative reconciliation may already have rebound the terminal.
@@ -1143,10 +1392,10 @@ describe.each(['codex', 'opencode'] as const)('%s SessionScreen', agent => {
     }] };
     host.setSnapshot(snapshot);
     await act(async () => renderer.update(<SessionScreen {...host.props} snapshot={snapshot} />));
-    await act(async () => { restoreOld(null); });
+    await act(async () => { restoreOld(); });
     expect(agentTranscriptService.getState(old.bindingToken)).toBeNull();
-    expect(host.native.startAgentChat).toHaveBeenCalledTimes(1);
-    expect(host.native.startAgentChat).toHaveBeenCalledWith(replacement.bindingToken, undefined);
+    expect(host.native.startAgentChat).toHaveBeenCalledTimes(2);
+    expect(host.native.startAgentChat).toHaveBeenCalledWith(replacement.bindingToken);
     expect(control().loading).toBe(false);
     expect(ui('TerminalScreen').props.renderViewportOverlay).toBeUndefined();
     act(() => { control().onPress(); });
@@ -1173,17 +1422,55 @@ describe.each(['codex', 'opencode'] as const)('%s SessionScreen', agent => {
     expect(host.client.snapshot).toHaveBeenCalledTimes(1);
   });
 
-  test('unmount while cache hydration is pending prevents native startup', async () => {
+  test('unmount while Rust restoration is pending discards its completion', async () => {
     const host = setup(agent);
     const binding = bindChat(host, agent);
-    let restore!: (blob: null) => void;
-    jest.mocked(agentChatCache.loadNative).mockReturnValueOnce(new Promise(resolve => { restore = resolve; }));
+    let restore!: () => void;
+    host.native.startAgentChat.mockImplementationOnce(() => new Promise(resolve => {
+      restore = () => resolve({type: 'stale-binding'});
+    }));
     act(() => { renderer = create(<SessionScreen {...host.props} />); });
     act(() => renderer.unmount());
-    await act(async () => { restore(null); });
+    await act(async () => { restore(); });
     expect(host.native.detachAgentChat).toHaveBeenCalledTimes(1);
-    expect(host.native.startAgentChat).not.toHaveBeenCalled();
+    expect(host.native.startAgentChat).toHaveBeenCalledWith(binding.bindingToken);
     expect(agentTranscriptService.getState(binding.bindingToken)).toBeNull();
+  });
+
+  test('manual reading pauses automatic listening and resumes it after playback', async () => {
+    const host = setup(agent);
+    host.props.ttsEnabled = true;
+    const binding = await openReadyChat(host, agent);
+    revealChat();
+    act(() => {
+      binding.state = {
+        ...binding.state,
+        revision: 2,
+        messages: [{
+          id: 'reply', role: 'assistant', completedAt: 1,
+          diffs: [],
+          parts: [{ id: 'prose', type: 'text', text: 'Latest response' }],
+        }],
+      };
+      host.handlers.get(binding.terminalId)?.({
+        key: binding.transcriptKey, runtimeIncarnation: binding.runtimeIncarnation,
+        revision: 2, deltas: [{ type: 'reset', state: binding.state }],
+      });
+    });
+    const automaticStop = jest.mocked(listenToChat).mock.results[0].value;
+    const turn = { id: 'selected-response', status: 'idle' as const, assistants: binding.state.messages, diffs: [] };
+    expect(ui('AgentChatView').props.readAloud.canRead(turn)).toBe(true);
+    expect(ui('TerminalScreen').props.chatReadAloud).toBeUndefined();
+    act(() => { ui('AgentChatView').props.readAloud.toggle(turn); });
+    expect(ui('AgentChatView').props.readAloud.readingTurnId).toBe(turn.id);
+    expect(automaticStop).toHaveBeenCalledTimes(1);
+    expect(readChatResponse).toHaveBeenCalledWith(
+      expect.objectContaining({ agent, bindingToken: binding.bindingToken }),
+      binding.state.messages, expect.any(Function), expect.any(Function),
+    );
+    act(() => { jest.mocked(readChatResponse).mock.calls[0][2](); });
+    expect(ui('AgentChatView').props.readAloud.readingTurnId).toBeNull();
+    expect(listenToChat).toHaveBeenCalledTimes(2);
   });
 
   test.each(['terminal', 'host', 'pane'] as const)('keeps focused chat speech in background and stops on leaving the %s', async destination => {
@@ -1355,9 +1642,6 @@ describe.each(['codex', 'opencode'] as const)('%s SessionScreen', agent => {
     const host = setup(agent);
     const binding = await openReadyChat(host, agent);
     revealChat();
-    const archive = { namespace: 'host-1', key: binding.transcriptKey, blob: new Uint8Array([9, 8]).buffer };
-    const save = jest.spyOn(agentChatCache, 'saveNative').mockResolvedValue(true);
-    host.native.detachAgentChat.mockReturnValue(archive);
     const visits = addCachePressure(host);
     host.injected.length = 0;
     for (const visit of visits.slice(0, 2)) act(visit);
@@ -1369,23 +1653,26 @@ describe.each(['codex', 'opencode'] as const)('%s SessionScreen', agent => {
     expect(host.injected.join('\n')).toContain('window.herdrRemove("target")');
     expect(host.native.detachAgentChat).toHaveBeenCalledTimes(1);
     expect(host.native.detachAgentChat).toHaveBeenCalledWith(binding.terminalId);
-    expect(save).toHaveBeenCalledWith(archive);
     expect(agentTranscriptService.getState(binding.bindingToken)).toBeNull();
     expect(renderer.root.findAll(node => String(node.type) === 'AgentChatView')).toHaveLength(0);
 
     binding.state = { ...binding.state, status: 'loading', revision: 0 };
-    let finishRestore!: (blob: ArrayBuffer) => void;
-    jest.mocked(agentChatCache.loadNative).mockImplementationOnce(() => new Promise(resolve => { finishRestore = resolve; }));
+    let finishRestore!: () => void;
+    host.native.startAgentChat.mockImplementationOnce(() => new Promise(resolve => {
+      finishRestore = () => {
+        binding.state = {...binding.state,status:'stale',revision:1};
+        resolve({type:'started',state:binding.state});
+      };
+    }));
     mockChatFrames.length = 0;
     act(() => renderer.update(<SessionScreen {...host.props} />));
     expect(control().loading).toBe(true);
     expect(ui('TerminalScreen').props.chatViewEnabled).toBe(true);
     expect(ui('TerminalScreen').props.renderViewportOverlay).toBeUndefined();
-    expect(host.native.startAgentChat).toHaveBeenCalledTimes(1);
-    expect(agentChatCache.loadNative).toHaveBeenLastCalledWith(archive.key);
+    expect(host.native.startAgentChat).toHaveBeenCalledTimes(2);
 
-    await act(async () => { finishRestore(archive.blob); });
-    expect(host.native.startAgentChat).toHaveBeenLastCalledWith(binding.bindingToken, archive.blob);
+    await act(async () => { finishRestore(); });
+    expect(host.native.startAgentChat).toHaveBeenLastCalledWith(binding.bindingToken);
     expect(control().loading).toBe(true);
     revealChat();
     expect(control().loading).toBe(false);
@@ -1620,12 +1907,10 @@ describe.each(['codex', 'opencode'] as const)('%s SessionScreen', agent => {
   test('a confirmed agent-to-shell transition during cache restoration closes quietly', async () => {
     const host = setup(agent);
     bindChat(host, agent);
-    let restore!: (value: null) => void;
-    jest.mocked(agentChatCache.loadNative).mockReturnValueOnce(
-      new Promise(resolve => {
-        restore = resolve;
-      }),
-    );
+    let restore!: () => void;
+    host.native.startAgentChat.mockImplementationOnce(() => new Promise(resolve => {
+      restore = () => resolve({type:'stale-binding'});
+    }));
     act(() => {
       renderer = create(<SessionScreen {...host.props} />);
     });
@@ -1647,10 +1932,41 @@ describe.each(['codex', 'opencode'] as const)('%s SessionScreen', agent => {
     host.setSnapshot(snapshot);
     await act(async () => {
       renderer.update(<SessionScreen {...host.props} snapshot={snapshot} />);
-      restore(null);
+      restore();
     });
     expect(ui('Alert').props.visible).toBe(false);
     expect(ui('TerminalScreen').props.chatViewEnabled).toBe(false);
     expect(control()).toBeUndefined();
   });
+});
+
+test('disconnect keeps the new-tab button, tab identities, and scroll container mounted', async () => {
+  const host = setup('codex');
+  await act(async () => { renderer = create(<SessionScreen {...host.props} />); });
+  const plus = renderer.root.findByProps({ accessibilityLabel: 'session.newTab' });
+  const rail = renderer.root.findByProps({ accessibilityLabel: 'session.backToHerd' }).parent!;
+  const scroll = rail.findByType('ScrollView' as never);
+  const tabs = scroll.findAllByType('Button' as never);
+  await act(async () => { renderer.update(<SessionScreen {...host.props} client={null} />); });
+  expect(renderer.root.findByProps({ accessibilityLabel: 'session.newTab' })).toBe(plus);
+  expect(plus.props.disabled).toBe(true);
+  expect(rail.findByType('ScrollView' as never)).toBe(scroll);
+  expect(scroll.findAllByType('Button' as never)).toEqual(tabs);
+  await act(async () => { renderer.update(<SessionScreen {...host.props} />); });
+  expect(renderer.root.findByProps({ accessibilityLabel: 'session.newTab' })).toBe(plus);
+  expect(plus.props.disabled).toBe(false);
+});
+
+test('the neighboring browser control keeps its toolbar slot while disconnected', async () => {
+  const host = setup('codex');
+  const identity = { runtimeId: host.native.runtimeId, sessionId: 'browser-reconnect', paneId: host.pane.pane_id, terminalId: host.pane.terminal_id };
+  browserRegistry.ensure(identity, host.native);
+  await act(async () => { renderer = create(<SessionScreen {...host.props} />); });
+  const browser = renderer.root.findByProps({ accessibilityLabel: 'terminal.openBrowser' });
+  await act(async () => { renderer.update(<SessionScreen {...host.props} client={null} />); });
+  expect(renderer.root.findByProps({ accessibilityLabel: 'terminal.openBrowser' })).toBe(browser);
+  expect(browser.props.disabled).toBe(true);
+  await act(async () => { await browserRegistry.close(identity.sessionId); });
+  expect(renderer.root.findByProps({ accessibilityLabel: 'terminal.openBrowser' })).toBe(browser);
+  expect(browser.props.disabled).toBe(true);
 });

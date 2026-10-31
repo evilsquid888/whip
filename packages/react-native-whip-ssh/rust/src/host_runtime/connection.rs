@@ -1,9 +1,24 @@
 //! SSH and Herdr connection lifecycle, recovery, and readiness.
 
-use super::*;
 use std::future::Future;
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use tokio::sync::watch;
+
+use super::{
+    HERDR_READINESS_ATTEMPT_TIMEOUT, HERDR_READINESS_INITIAL_BACKOFF, HERDR_READINESS_MAX_BACKOFF,
+    HERDR_READINESS_TIMEOUT, HostConnectionState, HostRuntime, HostRuntimeConfig, HostRuntimeError,
+    HostRuntimeEvent, HostRuntimeStatus, HostSshConfig, HostSshCredential,
+    INITIAL_PERSISTENT_RECONNECT_DELAY_MS, INITIAL_RECONNECT_DELAY_MS,
+    MAX_PERSISTENT_RECONNECT_DELAY_MS, MAX_RECONNECT_ATTEMPTS, MAX_RECONNECT_DELAY_MS,
+    RuntimeDiagnosticOperation, RuntimeInner, agent_view, begin_host_state_sync, chat_identity,
+    clear_latency_transport, emit, emit_diagnostic, emit_diagnostic_started, emit_host_state,
+    emit_slow_or_failed_diagnostic, invalidate_remote_operations, log_lifecycle,
+    measure_host_latency_inner, publish_lifecycle_status, reconcile_control_result,
+    reconcile_host_state_subscription, refresh_host_state_inner, restore_resources,
+    unregister_runtime,
+};
 use crate::herdr_api::{
     HerdrControlError, HerdrControlRequest, HerdrControlResult, HerdrSessionSnapshot,
     request_on_runtime,
@@ -12,7 +27,7 @@ use crate::herdr_codec::{MAX_PROTOCOL, MIN_PROTOCOL};
 use crate::herdr_connection::HerdrRequestReplay;
 use crate::herdr_events::close_herdr_event_subscription;
 use crate::herdr_terminal::close_all_herdr_terminal_bridges;
-use crate::host_state::{ApplyResult, SnapshotToken, now_ms};
+use crate::host_state::{ApplyResult, HostFreshness, HostSyncStatus, SnapshotToken, now_ms};
 use crate::remote_ops::shell_quote;
 use crate::ssh::{SshConnectionConfig, SshCredential, SshSession};
 
@@ -23,8 +38,42 @@ pub(super) fn validate_config(config: &HostRuntimeConfig) -> Result<(), HostRunt
                 "SSH host, username, and port are required".to_owned(),
             ));
         }
+        if ssh
+            .tailcat_address
+            .as_deref()
+            .is_some_and(|address| address.trim().is_empty())
+        {
+            return Err(HostRuntimeError::InvalidConfiguration(
+                "Tailcat address is required".to_owned(),
+            ));
+        }
+        if ssh.tailcat_address.is_some()
+            && ssh
+                .tailcat_private_key
+                .as_deref()
+                .is_none_or(|key| key.trim().is_empty())
+        {
+            return Err(HostRuntimeError::InvalidConfiguration(
+                "Tailcat client identity is required".to_owned(),
+            ));
+        }
+        if ssh.tailcat_ssh_server
+            && (ssh.tailcat_address.is_none()
+                || !matches!(ssh.credential, HostSshCredential::Key { .. }))
+        {
+            return Err(HostRuntimeError::InvalidConfiguration(
+                "Tailcat's SSH server requires Tailcat mode and an SSH private key".to_owned(),
+            ));
+        }
     }
-    if let Some(path) = config.socket_path.as_deref()
+    let chain = config.jump_hosts.iter().chain(std::iter::once(&config.ssh));
+    if chain.skip(1).any(|ssh| ssh.tailcat_address.is_some()) {
+        return Err(HostRuntimeError::InvalidConfiguration(
+            "Tailcat must be the first connection in a jump-host chain".to_owned(),
+        ));
+    }
+    if config.herdr_enabled
+        && let Some(path) = config.socket_path.as_deref()
         && !path.starts_with('/')
     {
         return Err(HostRuntimeError::InvalidConfiguration(
@@ -32,6 +81,16 @@ pub(super) fn validate_config(config: &HostRuntimeConfig) -> Result<(), HostRunt
         ));
     }
     Ok(())
+}
+
+pub(super) fn require_herdr_enabled(inner: &RuntimeInner) -> Result<(), HostRuntimeError> {
+    if inner.config.herdr_enabled {
+        Ok(())
+    } else {
+        Err(HostRuntimeError::HerdrUnavailable(
+            crate::herdr_connection::HERDR_DISABLED_MESSAGE.to_owned(),
+        ))
+    }
 }
 
 pub(super) fn current_ssh(inner: &RuntimeInner) -> Result<Arc<SshSession>, HostRuntimeError> {
@@ -95,8 +154,11 @@ pub(super) fn validate_generation(
     Ok(())
 }
 
-pub(super) fn ssh_config(config: &HostSshConfig) -> SshConnectionConfig {
+pub(crate) fn ssh_config(config: &HostSshConfig) -> SshConnectionConfig {
     SshConnectionConfig {
+        tailcat_address: config.tailcat_address.clone(),
+        tailcat_private_key: config.tailcat_private_key.clone(),
+        tailcat_ssh_server: config.tailcat_ssh_server,
         host: config.host.trim().to_owned(),
         port: config.port,
         username: config.username.trim().to_owned(),
@@ -110,11 +172,11 @@ pub(super) fn ssh_config(config: &HostSshConfig) -> SshConnectionConfig {
                 passphrase: passphrase.clone(),
             },
         },
-        forward_agent: config.forward_agent,
+        forward_agent: config.forward_agent && !config.tailcat_ssh_server,
     }
 }
 
-pub(super) async fn disconnect_sessions(sessions: Vec<Arc<SshSession>>) {
+pub(crate) async fn disconnect_sessions(sessions: Vec<Arc<SshSession>>) {
     for session in sessions.into_iter().rev() {
         session.disconnect().await;
     }
@@ -757,6 +819,7 @@ pub(super) fn update_server_from_result(inner: &RuntimeInner, result: &HerdrCont
 }
 
 pub(super) async fn ensure_herdr_server(inner: &Arc<RuntimeInner>) -> Result<(), HostRuntimeError> {
+    require_herdr_enabled(inner)?;
     if inner.state.lock().protocol.is_some() {
         return Ok(());
     }
@@ -800,7 +863,9 @@ pub(super) async fn control_request_inner(
     let started_at = Instant::now();
     match &request {
         HerdrControlRequest::PaneSendInput { pane_id, .. }
-        | HerdrControlRequest::PaneSendKeys { pane_id, .. } => inner.agents.wake_pane(pane_id),
+        | HerdrControlRequest::PaneSendKeys { pane_id, .. } => {
+            inner.agents.wake_pane(pane_id);
+        }
         _ => {}
     }
     let result = if let HerdrControlRequest::PaneGet { pane_id } = &request {
@@ -921,23 +986,16 @@ pub(super) async fn control_request_inner(
 }
 
 pub(super) fn start_herdr_server_command(herdr_command: &str, session_name: &str) -> String {
-    let herdr_command = herdr_command.trim();
-    let mut base = shell_quote(if herdr_command.is_empty() {
-        "herdr"
-    } else {
-        herdr_command
-    });
+    let mut base = "\"$whip_herdr\"".to_owned();
     if !session_name.trim().is_empty() {
         base.push_str(" --session ");
         base.push_str(&shell_quote(session_name.trim()));
     }
-    let command = format!("nohup {base} server >/tmp/whip-herdr-server.log 2>&1 </dev/null &");
-    let bootstrap = r#"exec "${SHELL:-/bin/sh}" -lc "$1""#;
-    format!(
-        "exec /bin/sh -c {} whip {}",
-        shell_quote(bootstrap),
-        shell_quote(&command)
-    )
+    let script = format!(
+        "{}\nnohup {base} server >/tmp/whip-herdr-server.log 2>&1 </dev/null &",
+        super::herdr_setup::resolve_executable_script(herdr_command)
+    );
+    super::herdr_setup::login_shell_command(&script)
 }
 
 pub(super) struct ReadyHerdrSnapshot {
@@ -1129,6 +1187,7 @@ pub(super) async fn complete_herdr_startup_sync(
 pub(super) async fn start_herdr_server_inner(
     inner: Arc<RuntimeInner>,
 ) -> Result<(), HostRuntimeError> {
+    require_herdr_enabled(&inner)?;
     let _startup = inner.herdr_startup.lock().await;
     let generation = current_generation(&inner)?;
     let (_, token) = begin_host_state_sync(&inner);
@@ -1205,6 +1264,18 @@ pub(super) async fn start_herdr_server_inner(
 }
 #[uniffi::export]
 impl HostRuntime {
+    pub fn herdr_enabled(&self) -> bool {
+        self.inner.config.herdr_enabled
+    }
+
+    pub fn tailcat_enabled(&self) -> bool {
+        self.inner.config.ssh.tailcat_address.is_some()
+    }
+
+    pub fn matches_ssh_config(&self, config: HostSshConfig) -> bool {
+        self.inner.config.ssh == config
+    }
+
     pub fn resolved_socket_path(&self) -> Option<String> {
         self.inner.herdr.resolved_socket_path()
     }

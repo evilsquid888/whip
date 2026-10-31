@@ -1,11 +1,10 @@
 import { useMemo, useRef } from 'react';
 import { BlurTargetView } from 'expo-blur';
-import { Platform, StyleSheet, View } from 'react-native';
+import { Platform, StyleSheet, View, type ViewInstance } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useTranslation } from 'react-i18next';
 
 import type { DevicePreferencesController } from '../hooks/useDevicePreferences';
-import { SpinnerFrameRateProvider } from '../hooks/useSpinnerFrameRate';
 import type { HostManagementController } from '../hooks/useHostManagement';
 import type { AppNavigationController } from '../hooks/useAppNavigation';
 import type { RemoteFilesController } from '../hooks/useRemoteFilesController';
@@ -15,8 +14,6 @@ import type { useLiveHostTelemetry } from '../hooks/useLiveHostTelemetry';
 import type { useTerminalHistory } from '../hooks/useTerminalHistory';
 import type { useTerminalSessions } from '../hooks/useTerminalSessions';
 import { effectiveDevicePreferences } from '../billing/effectiveSettings';
-import { simulateDeveloperMembership } from '../billing/developerMembership';
-import { getBillingRolloutPolicy } from '../billing/rollout';
 import type { WhipEntitlementsController } from '../billing/useWhipEntitlements';
 import { resolveHerdProjectionRequest, type HerdHostQueue } from '../herdQueue';
 import { aggregateAgentStatus } from '../lib/agentStatusAggregate';
@@ -54,8 +51,6 @@ import { LiveSessionView } from './LiveSessionView';
 import { MoreScreen } from './MoreScreen';
 import { ScreenUpdates } from './ScreenUpdates';
 
-const NavigationBlurTarget = Platform.OS === 'android' ? View : BlurTargetView;
-
 interface AppShellProps {
   preferences: DevicePreferencesController;
   entitlements: WhipEntitlementsController;
@@ -83,23 +78,13 @@ export function AppShell({
   history,
 }: AppShellProps) {
   const { t } = useTranslation();
-  const { colors: theme, isDark } = useTheme();
-  const navigationBlurTargetRef = useRef<View | null>(null);
+  const { isDark } = useTheme();
+  const navigationBlurTargetRef = useRef<ViewInstance | null>(null);
   const storedPreferences = preferences.value;
-  const billingPolicy = getBillingRolloutPolicy(storedPreferences.developerOptionsEnabled);
-  const developerMembershipState = billingPolicy.developerOptionsEnabled
-    ? storedPreferences.developerMembershipState
-    : null;
-  const displayedEntitlements = useMemo(
-    () => developerMembershipState
-      ? simulateDeveloperMembership(entitlements, developerMembershipState)
-      : entitlements,
-    [developerMembershipState, entitlements],
-  );
-  const accessTier = billingPolicy.billingEnabled ? displayedEntitlements.tier : 'rancher';
+  const capabilities = entitlements.capabilities;
   const effectivePreferences = useMemo(
-    () => effectiveDevicePreferences(storedPreferences, accessTier),
-    [accessTier, storedPreferences],
+    () => effectiveDevicePreferences(storedPreferences, capabilities),
+    [capabilities, storedPreferences],
   );
   const {
     alertsEnabled,
@@ -141,6 +126,10 @@ export function AppShell({
   const fullscreenVisible = immersiveTerminal
     ? activeTerminalVisible && terminalPreferences.fullscreen
     : fullscreenApp;
+
+  const openGlobalKeychain = () => {
+    ignoreExpectedCancellation(hosts.openGlobalKeychain());
+  };
 
   const openAgentFiles = (sessionId: string, paneId: string) => {
     const pane = sessions.presentationSessions
@@ -186,9 +175,12 @@ export function AppShell({
         terminalCount: terminals.get(session.id, sessions.state).sessions.length,
       };
     });
-    const herdQueues: HerdHostQueue[] = herdProjection.hosts;
+    const herdQueues: HerdHostQueue[] = herdProjection.hosts.map(host => ({
+      ...host,
+      herdrEnabled: sessions.presentationSessions.find(session => session.id === host.id)?.host.herdrEnabled !== false,
+    }));
 
-    return sessions.presentationSessions.length > 0 ? (
+    return (
       <HerdScreen
         queues={herdQueues}
         agents={herdProjection.agents}
@@ -246,12 +238,11 @@ export function AppShell({
         }}
         onOpenSpace={sessions.openWorkspace}
         onStartServer={sessions.startServer}
+        onCheckHerdr={sessions.checkHerdr}
+        onInstallHerdr={sessions.installHerdr}
+        onOpenHerdrInstallation={sessions.openHerdrInstallation}
+        herdrInstallations={sessions.herdrInstallations}
         onOpenSshShell={sessions.openSshShell}
-      />
-    ) : (
-      <ConnectRequiredScreen
-        destination={t('nav.herd')}
-        onPickHost={() => navigation.selectTab('hosts')}
       />
     );
   };
@@ -264,14 +255,14 @@ export function AppShell({
     navigation.licensesOpen;
 
   return (
-    <SpinnerFrameRateProvider smoothSpinners={storedPreferences.smoothSpinners}>
+    <>
       <StableStatusBar
         hidden={fullscreenVisible}
-        backgroundColor={theme.canvas}
         isDark={isDark}
       />
       <SafeAreaView
         className="flex-1 bg-background"
+        // Android's display-cutout inset remains even with the status bar hidden.
         edges={fullscreenVisible ? ['left', 'right'] : ['top', 'left', 'right']}
       >
         <TerminalVolumeKeyBinding
@@ -285,7 +276,8 @@ export function AppShell({
           enabled={shouldEnableAppGlass(appGlassEnabled, appBackgroundImageUri)}
         >
           <View className="flex-1 bg-background">
-            <NavigationBlurTarget
+            {/* Android only captures this target while a surface requests blur. */}
+            <BlurTargetView
               ref={navigationBlurTargetRef}
               style={styles.navigationBlurTarget}
             >
@@ -374,6 +366,7 @@ export function AppShell({
                               sessions.closeHostById(host.id)
                             }
                             onEdit={hosts.openEditor}
+                            onManageGlobalKeychain={openGlobalKeychain}
                             onUnlockCredentials={hosts.unlockCredentialRecovery}
                           />
                         )}
@@ -454,8 +447,8 @@ export function AppShell({
                               : null
                           }
                           appearance={appearance}
+                          appFontSizePercent={storedPreferences.appFontSizePercent}
                           fullscreenApp={fullscreenApp}
-                          smoothSpinners={storedPreferences.smoothSpinners}
                           appBackgroundImageUri={
                             storedPreferences.appBackgroundImageUri
                           }
@@ -463,13 +456,12 @@ export function AppShell({
                             storedPreferences.appBackgroundDimming
                           }
                           appGlassEnabled={storedPreferences.appGlassEnabled}
-                          accessTier={accessTier}
-                          entitlements={displayedEntitlements}
+                          entitlements={entitlements}
                           developerOptionsEnabled={developerOptionsEnabled}
                           developerMembershipState={
                             storedPreferences.developerMembershipState
                           }
-                          membershipEnabled={billingPolicy.billingEnabled}
+                          membershipEnabled={entitlements.billingEnabled}
                           language={language}
                           keepScreenOn={keepScreenOn}
                           reopenTerminalOnLaunch={reopenTerminalOnLaunch}
@@ -542,21 +534,17 @@ export function AppShell({
                               security.updateBiometricOnResume(value),
                             );
                           }}
-                          onManageGlobalKeychain={() => {
-                            ignoreExpectedCancellation(
-                              hosts.openGlobalKeychain(),
-                            );
-                          }}
+                          onManageGlobalKeychain={openGlobalKeychain}
                           onManageKnownHosts={hosts.openKnownHosts}
                           onOpenLicenses={navigation.openLicenses}
                           onAppearanceChange={value =>
                             preferences.setPreference('appearance', value)
                           }
+                          onAppFontSizePercentChange={value =>
+                            preferences.setPreference('appFontSizePercent', value)
+                          }
                           onFullscreenAppChange={value =>
                             preferences.setPreference('fullscreenApp', value)
-                          }
-                          onSmoothSpinnersChange={value =>
-                            preferences.setPreference('smoothSpinners', value)
                           }
                           onAppBackgroundImageChange={value =>
                             preferences.setPreference(
@@ -676,10 +664,11 @@ export function AppShell({
                       }}
                       onTerminalStatus={terminals.updateStatus}
                       onTerminalFontSizeChange={terminals.updateFontSize}
+                      onTerminalChatSelect={terminals.selectChat}
                     />
                   </AgentStatusAnimationProvider>
                 )}
-            </NavigationBlurTarget>
+            </BlurTargetView>
 
             {!immersiveTerminal && !overlaysVisible && (
               <BottomNavigation
@@ -704,7 +693,7 @@ export function AppShell({
           </View>
         </GlassProvider>
       </SafeAreaView>
-    </SpinnerFrameRateProvider>
+    </>
   );
 }
 

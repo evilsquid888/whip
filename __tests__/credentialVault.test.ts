@@ -16,9 +16,9 @@ jest.mock('react-native', () => {
   };
 });
 
-jest.mock('@react-native-async-storage/async-storage', () => ({
+jest.mock('../src/services/appStorage', () => ({
   __esModule: true,
-  default: {
+  appStorage: {
     getItem: jest.fn(() => Promise.resolve(mockStoredBackups)),
     setItem: jest.fn((_key: string, value: string) => {
       mockStoredBackups = value;
@@ -32,7 +32,7 @@ jest.mock('react-native-keychain', () => ({
   setGenericPassword: jest.fn(() => Promise.resolve(true)),
 }));
 
-import AsyncStorage from '@react-native-async-storage/async-storage';
+import { appStorage } from '../src/services/appStorage';
 import * as Keychain from 'react-native-keychain';
 import { NativeModules } from 'react-native';
 import {
@@ -72,7 +72,7 @@ beforeEach(() => {
   mockNativeVault.clearRecoveryKey.mockResolvedValue(undefined);
 });
 
-test('stores only native-encrypted credential backup text in AsyncStorage', async () => {
+test('stores only native-encrypted credential backup text in appStorage', async () => {
   await expect(backupCredential(host.id, {
     secret: 'PRIVATE KEY',
     passphrase: 'key phrase',
@@ -82,12 +82,22 @@ test('stores only native-encrypted credential backup text in AsyncStorage', asyn
     JSON.stringify({ secret: 'PRIVATE KEY', passphrase: 'key phrase' }),
     host.id,
   );
-  expect(AsyncStorage.setItem).toHaveBeenCalledWith(
+  expect(appStorage.setItem).toHaveBeenCalledWith(
     'herdr.credential.backups.v1',
     JSON.stringify({ [host.id]: 'v1.iv.ciphertext' }),
   );
   expect(mockStoredBackups).not.toContain('PRIVATE KEY');
   expect(mockStoredBackups).not.toContain('key phrase');
+});
+
+test('an identity-only credential backup restores the same Tailcat client key pair', async () => {
+  const credential = { secret: '', passphrase: '', tailcatPrivateKey: 'privkey:saved-client', tailcatPublicKey: 'nodekey:saved-client' };
+  await expect(backupCredential(host.id, credential)).resolves.toBe(true);
+  expect(mockNativeVault.encryptCredential).toHaveBeenCalledWith(JSON.stringify(credential), host.id);
+  expect(mockStoredBackups).not.toContain(credential.tailcatPrivateKey);
+  mockNativeVault.decryptCredential.mockResolvedValueOnce(JSON.stringify(credential));
+  await expect(restoreCredentialBackups([host])).resolves.toEqual({ restored: 1, failed: 0 });
+  expect(Keychain.setGenericPassword).toHaveBeenCalledWith(host.username, JSON.stringify(credential), expect.objectContaining({ service: `io.github.kaminarios.whip.ssh.host.${host.id}` }));
 });
 
 test('reports restored credential backups as locked when the local key was uninstalled', async () => {
@@ -144,7 +154,7 @@ test('blocks backup mutation when the existing backup store is corrupted', async
   })).resolves.toBe(false);
 
   expect(mockNativeVault.encryptCredential).not.toHaveBeenCalled();
-  expect(AsyncStorage.setItem).not.toHaveBeenCalled();
+  expect(appStorage.setItem).not.toHaveBeenCalled();
   expect(String(consoleError.mock.calls[0]?.[0])).toContain('storage-parse-failed');
   expect(String(consoleError.mock.calls[0]?.[0])).not.toContain('corrupted backup storage');
   consoleError.mockRestore();
@@ -168,7 +178,7 @@ test('diagnoses credential backup encryption failures without logging credential
 
 test('diagnoses credential backup write failures', async () => {
   const consoleError = jest.spyOn(console, 'error').mockImplementation();
-  jest.mocked(AsyncStorage.setItem).mockRejectedValueOnce(new Error('storage unavailable'));
+  jest.mocked(appStorage.setItem).mockRejectedValueOnce(new Error('storage unavailable'));
 
   await expect(backupCredential(host.id, {
     secret: 'PRIVATE KEY',

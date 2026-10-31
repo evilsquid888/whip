@@ -1,15 +1,15 @@
 name: Personal APK
 
-# Builds a personally signed arm64 APK from a reviewed commit and uploads it
+# Builds a personally signed arm64 APK from a selected ref and uploads it
 # as a private workflow artifact. No release is created and no upstream
 # secrets (RevenueCat, Play) are used.
 on:
   workflow_dispatch:
     inputs:
       ref:
-        description: Commit to build (defaults to the audited upstream commit)
+        description: Branch, tag, or commit to build (defaults to personal-apk)
         required: true
-        default: 759eab478fcefe7103b7d415308d77e689bd109c
+        default: personal-apk
         type: string
 
 permissions:
@@ -25,7 +25,7 @@ jobs:
       WHIP_DISTRIBUTION_CHANNEL: github
 
     steps:
-      - name: Check out reviewed commit
+      - name: Check out selected ref
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ inputs.ref }}
@@ -40,7 +40,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
-          node-version: 22
+          node-version: 24
 
       - name: Set up Java
         uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1

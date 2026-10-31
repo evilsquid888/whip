@@ -1,4 +1,5 @@
 import { HerdrAgentKind, ReverseControlState } from 'react-native-whip-ssh';
+import Clipboard from '@react-native-clipboard/clipboard';
 import {
   act,
   create,
@@ -6,6 +7,7 @@ import {
   type ReactTestRenderer,
 } from 'react-test-renderer';
 import type { ComponentProps } from 'react';
+import { Platform } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { BottomNavigation } from '../src/components/BottomNavigation';
@@ -13,11 +15,17 @@ import { HerdScreen } from '../src/components/HerdScreen';
 import type { HerdHostQueue } from '../src/herdQueue';
 import { AgentActionsPopup } from '../src/components/AgentActionsPopup';
 import type { AgentInfo, AgentStatus, WorkspaceInfo } from '../src/types';
+import { agentTranscriptService } from '../src/services/NativeTranscriptService';
+import type { AgentChatState } from '../src/agentChat';
 
 jest.mock('react-native-whip-ssh', () =>
   require('./mockWhipSsh').createMockWhipSshModule(),
 );
 jest.mock('expo-blur', () => ({ BlurView: 'BlurView' }));
+jest.mock('react-native-svg/css', () => ({ LocalSvg: 'LocalSvg' }));
+jest.mock('../src/lib/bundledAsset', () => ({
+  bundledAsset: (asset: unknown) => asset,
+}));
 jest.mock('../src/components/ui/switch', () => ({ Switch: 'Switch' }));
 jest.mock('../src/browser/native', () => ({
   supportsBrowserControl: () => true,
@@ -86,51 +94,37 @@ jest.mock('react-native-safe-area-context', () => ({
 jest.mock('react-i18next', () => ({
   useTranslation: () => ({ t: (key: string) => key }),
 }));
-jest.mock('@/src/herdQueue', () => jest.requireActual('../src/herdQueue'), {
-  virtual: true,
-});
+jest.mock('@/src/herdQueue', () => jest.requireActual('../src/herdQueue'));
 jest.mock(
   '@/src/lib/herdTabSwipeActions',
   () => jest.requireActual('../src/lib/herdTabSwipeActions'),
-  { virtual: true },
 );
-jest.mock('@/src/lib/motion', () => ({ DEFAULT_SPRING_CONFIG: {} }), {
-  virtual: true,
-});
+jest.mock('@/src/lib/motion', () => ({ DEFAULT_SPRING_CONFIG: {} }));
 jest.mock(
   '@/src/lib/herdrCreationFlows',
   () => ({
     createWorkspaceAndSelect: jest.fn(),
   }),
-  { virtual: true },
 );
 jest.mock(
   '@/src/lib/inFlightSubmission',
   () => ({
     ...jest.requireActual('../src/lib/inFlightSubmission'),
   }),
-  { virtual: true },
 );
 jest.mock(
   '@/src/lib/utils',
   () => ({ cn: (...values: unknown[]) => values.filter(Boolean).join(' ') }),
-  {
-    virtual: true,
-  },
 );
 jest.mock(
   '@/src/hooks/useKeyboardInset',
   () => ({
     useKeyboardInset: () => ({ inset: 0, resetInset: jest.fn() }),
   }),
-  { virtual: true },
 );
 jest.mock(
   '@/src/lib/terminalFonts',
   () => ({ terminalFontFamily: 'monospace' }),
-  {
-    virtual: true,
-  },
 );
 jest.mock(
   '@/src/theme',
@@ -148,7 +142,6 @@ jest.mock(
       },
     }),
   }),
-  { virtual: true },
 );
 jest.mock('../src/components/app-ui', () => ({
   AgentStatusMedallion: 'AgentStatusMedallion',
@@ -233,6 +226,10 @@ function props(overrides: Record<string, unknown> = {}) {
     onLaunchTab: jest.fn(),
     onOpenSpace: jest.fn(),
     onStartServer: jest.fn(),
+    onCheckHerdr: jest.fn(),
+    onInstallHerdr: jest.fn(),
+    onOpenHerdrInstallation: jest.fn(),
+    herdrInstallations: {},
     onOpenSshShell: jest.fn(),
     ...overrides,
   };
@@ -247,6 +244,7 @@ describe('Herd workspace selection intent', () => {
 
   afterEach(() => {
     act(() => renderer?.unmount());
+    agentTranscriptService.reset();
   });
 
   test('a ready single host keeps its rail hidden and space actions available during refreshes', async () => {
@@ -315,7 +313,9 @@ describe('Herd workspace selection intent', () => {
           control: {
             terminalId: 'terminal-1',
             kind: HerdrAgentKind.Codex,
+            sessionId: 'session-1',
             reverseControl: false,
+            shizukuAccess: false,
             connected: false,
             reverseControlState: ReverseControlState.Off,
           },
@@ -327,6 +327,133 @@ describe('Herd workspace selection intent', () => {
       ...overrides,
     });
   }
+
+  test('search filters tabs and paths and clearing restores the current view', () => {
+    const screenProps = agentTray();
+    const first = screenProps.agents[0];
+    first.tabLabel = 'Terminal One';
+    first.agent.cwd = '/srv/project';
+    first.agent.foreground_cwd = '/tmp/build';
+    screenProps.agents = [first, {
+      ...first,
+      tabLabel: 'Terminal Two',
+      agent: { ...first.agent, pane_id: 'pane-2', terminal_id: 'terminal-2', tab_id: 'tab-2', cwd: '/home/user', foreground_cwd: undefined },
+    }];
+    act(() => { renderer = create(<HerdScreen {...screenProps} />); });
+    const button = (label: string) => renderer.root.find(node =>
+      String(node.type) === 'Button' && node.props.accessibilityLabel === label);
+    act(() => { button('herd.searchAgents').props.onPress(); });
+    const search = (query: string) => {
+      act(() => { renderer.root.find(node =>
+        String(node.type) === 'Input' && node.props.accessibilityLabel === 'herd.searchAgents',
+      ).props.onChangeText(query); });
+      return findHost(renderer.root, 'FlatList').props.data;
+    };
+    expect(search('PROJECT')).toEqual([first]);
+    expect(search('build')).toEqual([first]);
+    expect(search('terminal')).toEqual(screenProps.agents);
+    expect(search('no match')).toEqual([]);
+    const empty = findHost(renderer.root, 'FlatList').props.ListEmptyComponent;
+    expect(empty.props.children[1].props.children).toBe('herd.noMatchingAgents');
+    act(() => { button('herd.closeSearch').props.onPress(); });
+    expect(findHost(renderer.root, 'FlatList').props.data).toEqual(screenProps.agents);
+  });
+
+  test.each([
+    { sessionAgent: 'claude', agentType: 'codex', expected: ['claude'] },
+    { sessionAgent: undefined, agentType: 'codex', expected: ['codex'] },
+    { sessionAgent: undefined, agentType: undefined, expected: [] },
+  ])('cards show only agent types when session type is $sessionAgent and detected type is $agentType', ({ sessionAgent, agentType, expected }) => {
+    const screenProps = agentTray();
+    const { agent } = screenProps.agents[0];
+    agent.name = 'in';
+    agent.display_agent = 'in';
+    agent.agent = agentType;
+    agent.agent_session = sessionAgent
+      ? { agent: sessionAgent, source: 'herdr', kind: 'id', value: 'session-1' }
+      : undefined;
+
+    act(() => { renderer = create(<HerdScreen {...screenProps} />); });
+
+    const texts = renderer.root.findAll(node => String(node.type) === 'Text');
+    const agentLabels = texts.filter(node =>
+      node.props.className?.includes('text-muted-foreground/70'));
+    expect(agentLabels.map(node => node.props.children)).toEqual(expected);
+    expect(texts.map(node => node.props.children)).not.toContain('in');
+  });
+
+  test.each([
+    ['claude', true],
+    ['codex', true],
+    ['opencode', true],
+    ['gemini', false],
+    ['cursor', false],
+  ] as const)('cards show the chat indicator for %s only when supported', (agentType, supported) => {
+    const screenProps = agentTray();
+    screenProps.agents[0].agent.agent_session = {
+      agent: agentType, source: 'herdr', kind: 'id', value: 'session-1',
+    };
+    act(() => { renderer = create(<HerdScreen {...screenProps} />); });
+    expect(renderer.root.findAll(node => String(node.type) === 'Icon' && node.props.as === 'BookOpen'))
+      .toHaveLength(supported ? 1 : 0);
+  });
+
+  test('cards keep tab names and show only their loaded conversation title at the bottom', () => {
+    const screenProps = agentTray({ selectedHostId: null, workspaceFilterId: null });
+    const first = screenProps.agents[0];
+    first.tabLabel = 'My manual tab';
+    first.workspaceLabel = 'Project space';
+    first.primaryLabel = 'Project space · My manual tab';
+    first.agent.agent_session = { agent: 'codex', source: 'herdr', kind: 'id', value: 'session-1' };
+    screenProps.agents = [first, {
+      ...first, tabLabel: 'Other tab', primaryLabel: 'Other tab',
+      agent: { ...first.agent, pane_id: 'pane-2', terminal_id: 'terminal-2', tab_id: 'tab-2',
+        agent_session: { agent: 'claude', source: 'herdr', kind: 'id', value: 'session-2' } },
+    }];
+    const activate = jest.spyOn(agentTranscriptService, 'activate');
+    const titleState = (sessionId: string, title?: string): AgentChatState => ({
+      sessionId, status: 'live', revision: 1,
+      transcript: { sessionId, info: { id: sessionId, title }, messages: [], turns: [] },
+    });
+    const publish = (index: number, title: string) => {
+      const { agent } = screenProps.agents[index];
+      agentTranscriptService.titles.observe('host-1', agent, {
+        paneId: agent.pane_id, terminalId: agent.terminal_id,
+        agent: index === 0 ? 'codex' : 'claude', sessionId: agent.agent_session!.value,
+      }, titleState(agent.agent_session!.value, title));
+    };
+    const texts = () => renderer.root.findAll(node => String(node.type) === 'Text')
+      .map(node => node.props.children);
+
+    act(() => { renderer = create(<HerdScreen {...screenProps} />); });
+    expect(texts()).toContain('My manual tab');
+    const context = renderer.root.find(node =>
+      String(node.type) === 'Text' && node.props.children === 'codex · Host 1');
+    expect(context.parent!.children.map(child =>
+      typeof child === 'string' ? child : child.props.children ?? child.type,
+    )).toEqual(['Project space · ', expect.any(Function), 'codex · Host 1']);
+    expect(texts()).not.toContain('Loaded conversation');
+    act(() => { publish(0, 'Loaded conversation'); });
+    expect(texts()).toContain('My manual tab');
+    const subtitle = renderer.root.find(node =>
+      String(node.type) === 'Text' && node.props.children === 'Loaded conversation');
+    expect(subtitle.props.className).toContain('text-[11px]');
+    expect(subtitle.props.numberOfLines).toBe(1);
+    expect(subtitle.parent!.children.at(-1)).toBe(subtitle);
+    act(() => { publish(1, 'Claude conversation'); publish(0, 'Updated conversation'); });
+    expect(texts()).toEqual(expect.arrayContaining(['Updated conversation', 'Claude conversation']));
+    expect(texts()).not.toContain('Loaded conversation');
+
+    const switched = { ...screenProps, agents: screenProps.agents.map((item, index) => index ? item : {
+      ...item, agent: { ...item.agent,
+        agent_session: { ...item.agent.agent_session!, value: 'resumed-session' } },
+    }) };
+    act(() => { renderer.update(<HerdScreen {...switched} />); });
+    expect(texts()).not.toContain('Updated conversation');
+    expect(texts()).toContain('Claude conversation');
+    expect(activate).not.toHaveBeenCalled();
+    activate.mockRestore();
+  });
 
   function openAgentMenu() {
     const row = renderer.root.find(
@@ -389,6 +516,7 @@ describe('Herd workspace selection intent', () => {
       terminalId: 'terminal-1',
       kind: HerdrAgentKind.Codex,
       reverseControl: true,
+      shizukuAccess: false,
       connected: false,
       reverseControlState: ReverseControlState.Recovering,
     };
@@ -521,7 +649,7 @@ describe('Herd workspace selection intent', () => {
     });
     expect(onCloseTab).not.toHaveBeenCalled();
     expect(findAgentTray().props.style.width).toBe(0);
-    expect(row.parent!.parent!.props.style.height).toBe(100);
+    expect(row.parent!.parent!.props.style.height).toBeUndefined();
     expect(
       row.props.onMoveShouldSetPanResponderCapture(null, { dx: -30, dy: 1 }),
     ).toBe(true);
@@ -542,6 +670,85 @@ describe('Herd workspace selection intent', () => {
       menu.findAll(node => String(node.type) === 'GlassSurface'),
     ).toHaveLength(1);
     expect(onOpenFiles).not.toHaveBeenCalled();
+  });
+
+  test('copies the latest session ID without duplicating or restarting the agent', () => {
+    const tray = agentTray();
+    act(() => { renderer = create(<HerdScreen {...tray} />); });
+    openAgentMenu();
+    const menu = renderer.root.findByType(AgentActionsPopup);
+    expect(menu.findByProps({ selectable: true }).props.children).toBe('session-1');
+
+    act(() => {
+      renderer.update(<HerdScreen {...tray} agents={tray.agents.map(item => ({
+        ...item,
+        control: { ...item.control!, sessionId: 'session-2' },
+      }))} />);
+    });
+    expect(menu.findByProps({ selectable: true }).props.children).toBe('session-2');
+    act(() => {
+      menu.find(node => String(node.type) === 'Button' &&
+        node.props.accessibilityLabel === 'herd.copySession').props.onPress();
+    });
+    expect(Clipboard.setString).toHaveBeenLastCalledWith('session-2');
+    expect(tray.onCopyAgent).not.toHaveBeenCalled();
+    expect(tray.onRestartAgent).not.toHaveBeenCalled();
+    expect(menu.props.visible).toBe(true);
+  });
+
+  test.each(['id', 'path'] as const)(
+    'shows and copies an integration-reported session %s for other agents',
+    kind => {
+      const tray = agentTray();
+      tray.agents[0].control = undefined;
+      tray.agents[0].agent.agent = 'pi';
+      const value = kind === 'id' ? 'pi-session-1' : '/home/me/.pi/sessions/session.jsonl';
+      tray.agents[0].agent.agent_session = {
+        source: 'herdr:pi', agent: 'pi', kind, value,
+      };
+      act(() => { renderer = create(<HerdScreen {...tray} />); });
+      openAgentMenu();
+      const menu = renderer.root.findByType(AgentActionsPopup);
+      expect(menu.findByProps({ selectable: true }).props.children).toBe(value);
+      expect(menu.findAll(node => String(node.type) === 'Text' &&
+        node.props.children === (kind === 'id' ? 'herd.sessionId' : 'herd.sessionPath'))).toHaveLength(1);
+      act(() => {
+        menu.find(node => String(node.type) === 'Button' &&
+          node.props.accessibilityLabel === 'herd.copySession').props.onPress();
+      });
+      expect(Clipboard.setString).toHaveBeenLastCalledWith(value);
+      expect(menu.findAll(node => ['herd.restart', 'herd.copyAgent', 'herd.reverseControl']
+        .includes(node.props.accessibilityLabel))).toHaveLength(0);
+    },
+  );
+
+  test.each([undefined, '   '])(
+    'hides restart when the session ID is %s and keeps actions that do not require one',
+    sessionId => {
+      const tray = agentTray();
+      tray.agents[0].control!.sessionId = sessionId;
+      act(() => { renderer = create(<HerdScreen {...tray} />); });
+      openAgentMenu();
+      const menu = renderer.root.findByType(AgentActionsPopup);
+      expect(menu.findAll(node => String(node.type) === 'Button' &&
+        ['herd.restart', 'herd.copySession'].includes(node.props.accessibilityLabel))).toHaveLength(0);
+      expect(menu.find(node => String(node.type) === 'Button' &&
+        node.props.accessibilityLabel === 'herd.copyAgent').props.disabled).toBe(false);
+      expect(menu.find(node => String(node.type) === 'Switch').props.disabled).toBe(false);
+    },
+  );
+
+  test('hides unsupported controls for a plain terminal tab', () => {
+    const tray = agentTray();
+    tray.agents[0].agent.agent = undefined;
+    tray.agents[0].control = undefined;
+    act(() => { renderer = create(<HerdScreen {...tray} />); });
+    openAgentMenu();
+    const menu = renderer.root.findByType(AgentActionsPopup);
+    expect(menu.findAll(node => ['herd.restart', 'herd.copyAgent', 'herd.reverseControl', 'herd.copySession']
+      .includes(node.props.accessibilityLabel))).toHaveLength(0);
+    expect(menu.findAll(node => String(node.type) === 'Text' &&
+      node.props.children === 'herd.noAgentActions')).toHaveLength(1);
   });
 
   test('a busy agent requires confirmation before restarting', async () => {
@@ -604,6 +811,7 @@ describe('Herd workspace selection intent', () => {
         'host-1',
         'terminal-1',
         true,
+        false,
       );
       act(() => {
         menu.props.onClose();
@@ -949,6 +1157,9 @@ describe('Herd workspace selection intent', () => {
       accessibilityLabel: 'Reverse Control',
     });
     await act(() => toggle.props.onCheckedChange(true));
+    const shizuku = renderer.root.findByProps({ accessibilityLabel: 'shizuku.access' });
+    expect(shizuku.props.checked).toBe(false);
+    await act(() => shizuku.props.onCheckedChange(true));
     const submit = renderer.root.find(
       node =>
         String(node.type) === 'Button' &&
@@ -960,6 +1171,7 @@ describe('Herd workspace selection intent', () => {
       type: 'command',
       command: 'codex',
       reverseControl: true,
+      shizukuAccess: true,
     });
     await act(() => open.props.onPress());
     expect(
@@ -977,6 +1189,7 @@ describe('Herd workspace selection intent', () => {
     });
     expect(openCodeToggle.props.checked).toBe(false);
     await act(() => openCodeToggle.props.onCheckedChange(true));
+    expect(renderer.root.findByProps({ accessibilityLabel: 'shizuku.access' }).props.checked).toBe(false);
     await act(async () => submit.props.onPress());
     expect(onLaunchTab).toHaveBeenLastCalledWith('host-1', 'space-a', '', {
       type: 'command',
@@ -990,6 +1203,11 @@ describe('Herd workspace selection intent', () => {
     });
     expect(claudeToggle.props.checked).toBe(false);
     await act(() => claudeToggle.props.onCheckedChange(true));
+    await act(() => renderer.root.findByProps({ accessibilityLabel: 'shizuku.access' }).props.onCheckedChange(true));
+    await act(() => claudeToggle.props.onCheckedChange(false));
+    expect(renderer.root.findAllByProps({ accessibilityLabel: 'shizuku.access' })).toHaveLength(0);
+    await act(() => claudeToggle.props.onCheckedChange(true));
+    expect(renderer.root.findByProps({ accessibilityLabel: 'shizuku.access' }).props.checked).toBe(false);
     await act(async () => submit.props.onPress());
     expect(onLaunchTab).toHaveBeenLastCalledWith('host-1', 'space-a', '', {
       type: 'command',
@@ -1014,6 +1232,39 @@ describe('Herd workspace selection intent', () => {
       type: 'command',
       command: 'echo hello',
     });
+  });
+
+  test('Shizuku access changes apply to the selected agent session', async () => {
+    const onSetAgentReverseControl = jest.fn().mockResolvedValue(undefined);
+    const tray = agentTray({ onSetAgentReverseControl });
+    tray.agents[0].control!.reverseControl = true;
+    tray.agents[0].control!.shizukuAccess = false;
+    act(() => { renderer = create(<HerdScreen {...tray} />); });
+    openAgentMenu();
+    const toggle = renderer.root.findByProps({ accessibilityLabel: 'shizuku.access' });
+    expect(toggle.props.checked).toBe(false);
+    await act(async () => toggle.props.onCheckedChange(true));
+    expect(onSetAgentReverseControl).toHaveBeenLastCalledWith('host-1', 'terminal-1', true, true);
+    const updated = { ...tray, agents: [{ ...tray.agents[0], control: { ...tray.agents[0].control!, shizukuAccess: true } }] };
+    act(() => { renderer.update(<HerdScreen {...updated} />); });
+    const enabled = renderer.root.findByProps({ accessibilityLabel: 'shizuku.access' });
+    expect(enabled.props.checked).toBe(true);
+    await act(async () => enabled.props.onCheckedChange(false));
+    expect(onSetAgentReverseControl).toHaveBeenLastCalledWith('host-1', 'terminal-1', true, false);
+  });
+
+  test('iOS does not offer Shizuku access when Reverse Control is enabled', async () => {
+    const original = Platform.OS;
+    Platform.OS = 'ios';
+    try {
+      act(() => { renderer = create(<HerdScreen {...props()} />); });
+      const open = renderer.root.find(node => String(node.type) === 'Button' && node.props.accessibilityLabel === 'herd.runCommand' && node.props.className.includes('px-4'));
+      await act(() => open.props.onPress());
+      await act(() => renderer.root.findByProps({ accessibilityLabel: 'Reverse Control' }).props.onCheckedChange(true));
+      expect(renderer.root.findAllByProps({ accessibilityLabel: 'shizuku.access' })).toHaveLength(0);
+    } finally {
+      Platform.OS = original;
+    }
   });
 
   test('Open forwards the selected workspace intent', async () => {

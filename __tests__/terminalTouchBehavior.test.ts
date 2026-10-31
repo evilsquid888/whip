@@ -1,14 +1,14 @@
 const {
   handleKeyboardClosedStationaryTap,
   setTerminalKeyboardInputEnabled,
-  terminalMouseClickInput,
+  setTerminalNativeCursor,
   terminalMouseInputSequence,
   terminalMouseWheelInput,
 } = require('../scripts/terminal-touch-behavior.cjs') as {
   handleKeyboardClosedStationaryTap: (options: {
     point: { clientX: number; clientY: number };
     urlAtPoint: (x: number, y: number) => string | null;
-    terminalMouseInputEnabled: () => boolean;
+    terminalMouseCaptured: () => boolean;
     dispatchTerminalClick: (point: { clientX: number; clientY: number }) => boolean;
     send: (message: { type: string; link?: string }) => void;
     clearInteractiveSelection: (clearNativeSelection: boolean) => void;
@@ -19,11 +19,16 @@ const {
       blur: () => void;
     },
     enabled: boolean,
+    nativeInput?: boolean,
   ) => boolean;
-  terminalMouseClickInput: (
-    column: number,
-    row: number,
-  ) => string;
+  setTerminalNativeCursor: (terminal: {
+    element: {
+      classList: ReturnType<typeof classList>;
+      querySelector: (selector: string) => { classList: ReturnType<typeof classList> };
+      querySelectorAll: (selector: string) => Array<{ classList: ReturnType<typeof classList> }>;
+    };
+    options: { cursorStyle: string; cursorInactiveStyle: string; cursorBlink: boolean };
+  }, focused?: boolean) => void;
   terminalMouseInputSequence: (action: string, column: number, row: number) => string;
   terminalMouseWheelInput: (
     direction: 'up' | 'down',
@@ -35,7 +40,15 @@ const {
 
 const point = { clientX: 44, clientY: 40 };
 
-function tapHarness(mouseInputEnabled: boolean, link: string | null = null) {
+function classList() {
+  const values = new Set<string>();
+  return {
+    contains: (name: string) => values.has(name),
+    toggle: (name: string, enabled: boolean) => { if (enabled) values.add(name); else values.delete(name); },
+  };
+}
+
+function tapHarness(mouseCaptured: boolean, link: string | null = null) {
   const messages: Array<{ type: string; link?: string }> = [];
   const dispatchTerminalClick = jest.fn(() => true);
   const clearInteractiveSelection = jest.fn();
@@ -43,7 +56,7 @@ function tapHarness(mouseInputEnabled: boolean, link: string | null = null) {
   handleKeyboardClosedStationaryTap({
     point,
     urlAtPoint: () => link,
-    terminalMouseInputEnabled: () => mouseInputEnabled,
+    terminalMouseCaptured: () => mouseCaptured,
     dispatchTerminalClick,
     send: message => messages.push(message),
     clearInteractiveSelection,
@@ -52,7 +65,7 @@ function tapHarness(mouseInputEnabled: boolean, link: string | null = null) {
   return { messages, dispatchTerminalClick, clearInteractiveSelection };
 }
 
-test('keyboard-closed stationary tap emits no input when mouse input is disabled', () => {
+test('keyboard-closed stationary tap emits no input without application mouse tracking', () => {
   const result = tapHarness(false);
 
   expect(result.messages).toEqual([]);
@@ -60,7 +73,7 @@ test('keyboard-closed stationary tap emits no input when mouse input is disabled
   expect(result.clearInteractiveSelection).toHaveBeenCalledWith(true);
 });
 
-test('keyboard-closed stationary tap dispatches when mouse input is enabled', () => {
+test('keyboard-closed stationary tap dispatches automatically when the application captures the mouse', () => {
   const result = tapHarness(true);
 
   expect(result.messages).toEqual([]);
@@ -78,11 +91,10 @@ test('keyboard-closed stationary tap opens a link before considering mouse input
   expect(result.dispatchTerminalClick).not.toHaveBeenCalled();
 });
 
-test('encodes forced TUI clicks and wheel input with SGR cell coordinates', () => {
+test('encodes application mouse events and wheel input with SGR cell coordinates', () => {
   expect(terminalMouseInputSequence('move', 11, 6)).toBe('\u001b[<32;12;7M');
-  expect(
-    terminalMouseClickInput(11, 6),
-  ).toBe('\u001b[<0;12;7M\u001b[<0;12;7m');
+  expect(terminalMouseInputSequence('press', 11, 6)).toBe('\u001b[<0;12;7M');
+  expect(terminalMouseInputSequence('release', 11, 6)).toBe('\u001b[<0;12;7m');
   expect(terminalMouseWheelInput('up', 2, 11, 6)).toBe(
     '\u001b[<64;12;7M\u001b[<64;12;7M',
   );
@@ -101,4 +113,40 @@ test('keyboard-disabled xterm remains focusable for mouse handling without openi
 
   expect(setTerminalKeyboardInputEnabled(terminal, true)).toBe(true);
   expect(terminal.textarea).toEqual({ readOnly: false, inputMode: '' });
+});
+
+test('Android native keyboard ownership keeps the xterm textarea read-only when enabled', () => {
+  const terminal = { textarea: { readOnly: false, inputMode: '' }, blur: jest.fn() };
+  expect(setTerminalKeyboardInputEnabled(terminal, true, true)).toBe(true);
+  expect(terminal.textarea).toEqual({ readOnly: true, inputMode: 'none' });
+  expect(terminal.blur).toHaveBeenCalled();
+});
+
+test('native visual focus preserves xterm cursor shape and blink without focusing its textarea', () => {
+  const rows = { classList: classList() };
+  const cursor = { classList: classList() };
+  const terminal = {
+    element: {
+      classList: classList(),
+      querySelector: () => rows,
+      querySelectorAll: () => [cursor],
+    },
+    options: { cursorStyle: 'bar', cursorInactiveStyle: 'outline', cursorBlink: true },
+    focus: jest.fn(),
+  };
+  setTerminalNativeCursor(terminal, true);
+  expect(terminal.options.cursorInactiveStyle).toBe('bar');
+  expect(rows.classList.contains('xterm-focus')).toBe(true);
+  expect(cursor.classList.contains('xterm-cursor-blink')).toBe(true);
+  expect(terminal.focus).not.toHaveBeenCalled();
+
+  terminal.options.cursorBlink = false;
+  terminal.options.cursorStyle = 'block';
+  setTerminalNativeCursor(terminal);
+  expect(terminal.options.cursorInactiveStyle).toBe('block');
+  expect(cursor.classList.contains('xterm-cursor-blink')).toBe(false);
+
+  setTerminalNativeCursor(terminal, false);
+  expect(terminal.options.cursorInactiveStyle).toBe('outline');
+  expect(rows.classList.contains('xterm-focus')).toBe(false);
 });

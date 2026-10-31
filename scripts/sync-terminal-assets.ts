@@ -1,6 +1,7 @@
-import { access, copyFile, mkdir, readFile, rm, writeFile as writeAsset } from 'node:fs/promises';
+import { access, copyFile, mkdir, readFile, readdir, rm, writeFile as writeAsset } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { build } from 'esbuild';
 
 import androidImeBridge from './android-ime-bridge.cjs';
 import terminalClipboardPaste from './terminal-clipboard-paste.cjs';
@@ -11,9 +12,16 @@ import terminalLinkExtraction from './terminal-link-extraction.cjs';
 import terminalTouchBehavior from './terminal-touch-behavior.cjs';
 import terminalBoundaryScrollModel from '../src/lib/terminalBoundaryScroll.cjs';
 import terminalControlCharacter from '../src/lib/terminalControlCharacter.cjs';
+import { TerminalFrameSequence } from '../src/lib/terminalFrameSequence.ts';
+import { terminalInputBottomRow } from '../src/lib/terminalInputRegion.ts';
+import terminalDelivery from './terminal-delivery.cjs';
+import nativeTerminalDelivery from './terminal-native-delivery.cjs';
+
+const { decodeTerminalBase64, createTerminalBatchWriter } = terminalDelivery;
+const { postNativeTerminalMessage, createNativeTerminalDelivery } = nativeTerminalDelivery;
 
 const { legacyControlCharacter } = terminalControlCharacter;
-const { installAndroidImeBridge, terminalInputDelta } = androidImeBridge;
+const { installAndroidImeBridge } = androidImeBridge;
 const { createTerminalPasteBridge } = terminalClipboardPaste;
 const { terminalSelectionSnapshot } = terminalSelection;
 const { createTerminalSearch } = terminalSearch;
@@ -21,7 +29,7 @@ const { createTerminalOfflineCache } = terminalOfflineCache;
 const {
   handleKeyboardClosedStationaryTap,
   setTerminalKeyboardInputEnabled,
-  terminalMouseClickInput,
+  setTerminalNativeCursor,
   terminalMouseInputSequence,
   terminalMouseWheelInput,
 } = terminalTouchBehavior;
@@ -92,6 +100,7 @@ const previewFontFaces = `
       unicode-range: ${cjkUnicodeRange};
     }
     :root { --whip-preview-font-family: WhipChatCJK, WhipInter, system-ui, sans-serif; }`;
+const diagramStyles = await readFile(resolve(root, 'scripts/diagram-preview.css'), 'utf8');
 const nerdSymbolsRegular = resolve(
   terminalFonts,
   fontManifest.symbols.regularFile,
@@ -105,6 +114,7 @@ const terminalFontFamily = (fallback: { cssFamily: string }) => [
   fontManifest.text.cssFamily,
   fontManifest.emoji.cssFamily,
   fontManifest.symbols.cssFamily,
+  fontManifest.unicodeSymbols.cssFamily,
   fontManifest.cjk.cssFamily,
   fallback.cssFamily,
 ].map(family => family.endsWith('monospace') ? family : `"${family}"`).join(', ');
@@ -114,9 +124,9 @@ if (!checkOnly) {
   await mkdir(assets, { recursive: true });
   await mkdir(iosAssets, { recursive: true });
 }
-// Replace the WebView-only UKai file; retaining it would package the font twice.
-await Promise.all([assets, iosAssets].map(async directory => {
-  const retired = resolve(directory, 'arphic-ukai-hk.woff2');
+// Remove assets replaced by the shared font and Pele renderer.
+await Promise.all([assets, iosAssets].flatMap(directory => ['arphic-ukai-hk.woff2', 'mermaid.min.js', 'mermaid-LICENSE.txt'].map(async name => {
+  const retired = resolve(directory, name);
   if (!checkOnly) {
     await rm(retired, { force: true });
     return;
@@ -127,8 +137,8 @@ await Promise.all([assets, iosAssets].map(async directory => {
     if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return;
     throw error;
   }
-  throw new Error('Retired font asset is still packaged: ' + retired);
-}));
+  throw new Error('Retired asset is still packaged: ' + retired);
+})));
 const copyTerminalAsset = async (source: string, bundledName: string) => {
   const expected = checkOnly ? await readFile(source) : null;
   await Promise.all([assets, iosAssets].map(async directory => {
@@ -146,6 +156,7 @@ await Promise.all([
   copyTerminalAsset(resolve(root, 'node_modules/marked/lib/marked.umd.js'), 'marked.umd.js'),
   copyTerminalAsset(resolve(root, 'node_modules/dompurify/dist/purify.min.js'), 'purify.min.js'),
   copyTerminalAsset(resolve(root, 'scripts/markdown-preview-runtime.js'), 'markdown-preview.js'),
+  copyTerminalAsset(resolve(root, 'scripts/diagram-renderer.js'), 'diagram-renderer.js'),
   copyTerminalAsset(resolve(root, 'assets/gui-fonts/Inter-Regular.ttf'), 'markdown-Inter-Regular.ttf'),
   copyTerminalAsset(resolve(root, 'assets/gui-fonts/Inter-Bold.ttf'), 'markdown-Inter-Bold.ttf'),
   copyTerminalAsset(resolve(root, 'assets/gui-fonts/WhipChatCJK.bin'), 'chat-cjk-codepoints.bin'),
@@ -170,17 +181,18 @@ await Promise.all([
     'addon-serialize.js',
   ),
   copyTerminalAsset(
-    resolve(root, 'node_modules/mermaid/dist/mermaid.min.js'),
-    'mermaid.min.js',
+    resolve(root, 'node_modules/pele/dist/pele.global.js'),
+    'pele.global.js',
   ),
   copyTerminalAsset(
-    resolve(root, 'node_modules/mermaid/LICENSE'),
-    'mermaid-LICENSE.txt',
+    resolve(root, 'node_modules/pele/LICENSE'),
+    'pele-LICENSE.txt',
   ),
   copyTerminalAsset(
     resolve(root, 'scripts/mermaid-preview-runtime.js'),
     'mermaid-preview.js',
   ),
+  copyTerminalAsset(resolve(root, 'node_modules/codemirror/LICENSE'), 'codemirror-LICENSE.txt'),
   copyTerminalAsset(
     jetBrainsMonoRegular,
     fontManifest.text.bundledRegularFile,
@@ -203,6 +215,14 @@ await Promise.all([
     nerdSymbolsLicense,
     fontManifest.symbols.bundledLicenseFile,
   ),
+  copyTerminalAsset(
+    resolve(terminalFonts, fontManifest.unicodeSymbols.regularFile),
+    fontManifest.unicodeSymbols.bundledRegularFile,
+  ),
+  copyTerminalAsset(
+    resolve(terminalFonts, fontManifest.unicodeSymbols.licenseFile),
+    fontManifest.unicodeSymbols.bundledLicenseFile,
+  ),
 ]);
 
 const mermaidPreviewHtml = `<!doctype html>
@@ -214,6 +234,7 @@ const mermaidPreviewHtml = `<!doctype html>
   <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; img-src data: https:; font-src 'self' data:">
   <style>
     ${previewFontFaces}
+    ${diagramStyles}
     :root { color-scheme: dark; }
     :root[data-appearance='light'] { color-scheme: light; }
     html, body { width: 100%; min-height: 100%; margin: 0; background: transparent; }
@@ -224,7 +245,8 @@ const mermaidPreviewHtml = `<!doctype html>
 </head>
 <body>
   <main id="diagram" aria-live="polite"></main>
-  <script src="mermaid.min.js"></script>
+  <script src="pele.global.js"></script>
+  <script src="diagram-renderer.js"></script>
   <script src="mermaid-preview.js"></script>
 </body>
 </html>`;
@@ -241,9 +263,35 @@ await writeFile(
 );
 
 const markdownPreviewHtml = (await readFile(resolve(root, 'scripts/markdown-preview.html'), 'utf8'))
-  .replace('/* WHIP_PREVIEW_FONT_FACES */', previewFontFaces);
+  .replace('/* WHIP_PREVIEW_FONT_FACES */', previewFontFaces)
+  .replace('/* WHIP_DIAGRAM_STYLES */', diagramStyles);
 await writeFile(resolve(assets, 'markdown-preview.html'), markdownPreviewHtml, 'utf8');
 await writeFile(resolve(iosAssets, 'markdown-preview.html'), markdownPreviewHtml.replace('  <base href="file:///android_asset/">\n', ''), 'utf8');
+
+const codeBundle = await build({
+  absWorkingDir: root,
+  entryPoints: [resolve(root, 'scripts/code-editor-runtime.ts')],
+  bundle: true, write: false, minify: true, format: 'iife', platform: 'browser', target: 'es2020', charset: 'utf8',
+  metafile: true,
+});
+// Preserve notices for every bundled language parser, including transitive packages.
+const editorPackages = [...new Set(Object.keys(codeBundle.metafile.inputs).flatMap(input => {
+  const match = /^(.*node_modules\/(?:@[^/]+\/)?[^/]+)\//.exec(input);
+  return match ? [match[1]] : [];
+}))].sort();
+const editorLicenses = await Promise.all(editorPackages.map(async path => {
+  const directory = resolve(root, path);
+  const names = (await readdir(directory)).filter(name => /^licen[cs]e(?:\..*)?$/i.test(name)).sort();
+  if (!names.length) throw new Error(`Missing bundled editor license: ${path}`);
+  return `${path}\n${await readFile(resolve(directory, names[0]), 'utf8')}`;
+}));
+const codeEditorBundle = `${codeBundle.outputFiles[0].text}\n/*!\n${editorLicenses.join('\n\n').replaceAll('*/', '* /')}\n*/\n`;
+const codePreviewHtml = (await readFile(resolve(root, 'scripts/code-editor.html'), 'utf8'))
+  .replace('/* WHIP_PREVIEW_FONT_FACES */', previewFontFaces);
+await Promise.all([assets, iosAssets].map(async directory => {
+  await writeFile(resolve(directory, 'code-editor.js'), codeEditorBundle);
+  await writeFile(resolve(directory, 'code-editor.html'), directory === iosAssets ? codePreviewHtml.replace('  <base href="file:///android_asset/">\n', '') : codePreviewHtml);
+}));
 
 const terminalSessionHtml = `<!doctype html>
 <html>
@@ -270,6 +318,13 @@ const terminalSessionHtml = `<!doctype html>
     @font-face {
       font-family: '${fontManifest.symbols.cssFamily}';
       src: url('${fontManifest.symbols.bundledRegularFile}') format('${terminalFontFormat}');
+      font-style: normal;
+      font-weight: 400;
+      font-display: block;
+    }
+    @font-face {
+      font-family: '${fontManifest.unicodeSymbols.cssFamily}';
+      src: url('${fontManifest.unicodeSymbols.bundledRegularFile}') format('${terminalFontFormat}');
       font-style: normal;
       font-weight: 400;
       font-display: block;
@@ -320,16 +375,16 @@ const terminalSessionHtml = `<!doctype html>
   <script src="addon-image.js"></script>
   <script src="addon-serialize.js"></script>
   <script>
-    ${terminalInputDelta.toString()}
     ${installAndroidImeBridge.toString()}
     ${createTerminalPasteBridge.toString()}
     ${terminalSelectionSnapshot.toString()}
     ${createTerminalOfflineCache.toString()}
     ${handleKeyboardClosedStationaryTap.toString()}
     ${setTerminalKeyboardInputEnabled.toString()}
+    ${setTerminalNativeCursor.toString()}
     ${terminalMouseInputSequence.toString()}
-    ${terminalMouseClickInput.toString()}
     ${terminalMouseWheelInput.toString()}
+    ${terminalInputBottomRow.toString()}
     ${terminalBoundaryFiniteNumber.toString()}
     ${terminalBoundaryClamp.toString()}
     ${terminalBoundaryVisualOffset.toString()}
@@ -344,14 +399,17 @@ const terminalSessionHtml = `<!doctype html>
           document.fonts.load('400 8px "${fontManifest.text.cssFamily}"'),
           document.fonts.load('700 8px "${fontManifest.text.cssFamily}"'),
           document.fonts.load('400 8px "${fontManifest.symbols.cssFamily}"', '\\uf120'),
+          document.fonts.load('400 8px "${fontManifest.unicodeSymbols.cssFamily}"', '\\u23f5'),
           document.fonts.load('400 8px "${fontManifest.cjk.cssFamily}"', '\\u4e2d'),
         ]).then(() => document.fonts.ready)
       : Promise.resolve();
     const initializeTerminal = () => {
       const send = value => window.parent.postMessage({ herdrTerminalMessage: value }, '*');
+      const nativeKeyboardInput = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
       const terminal = new Terminal({
       cursorBlink: true,
       cursorStyle: 'bar',
+      showCursorImmediately: nativeKeyboardInput,
       allowTransparency: true,
       linkHandler: { activate: (_event, link) => send({ type: 'open-link', link }) },
       fontFamily: terminalFontFamily,
@@ -390,7 +448,6 @@ const terminalSessionHtml = `<!doctype html>
     let lastTap = null;
     let doubleTapAction = 'tab';
     let keyboardEnabled = false;
-    let forcedMouseInput = false;
     let applicationMouseCapture = false;
     let localScrollback = false;
     let offlineScrollback = false;
@@ -422,7 +479,11 @@ const terminalSessionHtml = `<!doctype html>
       boundaryAllowancePx: 0,
       rowRemainderPx: 0,
     };
-    setTerminalKeyboardInputEnabled(terminal, keyboardEnabled);
+    const focusTerminal = () => {
+      if (nativeKeyboardInput) setTerminalNativeCursor(terminal, true);
+      else terminal.focus();
+    };
+    setTerminalKeyboardInputEnabled(terminal, keyboardEnabled, nativeKeyboardInput);
     const offlineCache = createTerminalOfflineCache({
       serialize: options => serializer.serialize(options),
       send,
@@ -450,13 +511,15 @@ const terminalSessionHtml = `<!doctype html>
       const cellHeight = terminal.dimensions?.css.cell.height;
       if (!screen || !cellHeight || !terminal.rows) return;
       const buffer = terminal.buffer.active;
-      const cursorRow = buffer.baseY + buffer.cursorY - buffer.viewportY;
+      // The input region includes status/help rows drawn below the cursor.
+      // Reporting only the cursor lets the shortcut bar cover the TUI footer.
+      const bottomRow = terminalInputBottomRow(buffer, terminal.rows);
       // Both rectangles are inside the WebView. The native parent translation
       // cannot affect this coordinate, so reporting it cannot feed back on itself.
-      const bottom = cursorRow >= 0 && cursorRow < terminal.rows
+      const bottom = bottomRow !== null
         ? Math.round(
           screen.getBoundingClientRect().top - root.getBoundingClientRect().top
-            + (cursorRow + 1) * cellHeight,
+            + (bottomRow + 1) * cellHeight,
         )
         : null;
       const viewportHeight = Math.round(root.getBoundingClientRect().height);
@@ -632,7 +695,6 @@ const terminalSessionHtml = `<!doctype html>
     });
     let bufferedInput = null;
     let fitResizeInProgress = false;
-    let resetAndroidImeAfterPaste = () => {};
     const pasteBridge = createTerminalPasteBridge(
       terminal,
       (data, kind) => {
@@ -640,20 +702,26 @@ const terminalSessionHtml = `<!doctype html>
         else send({ type: 'input', data, kind });
       },
       window,
-      () => resetAndroidImeAfterPaste(),
     );
     const disposeAndroidImeBridge = installAndroidImeBridge(
       terminal,
       send,
       navigator.userAgent,
     );
-    resetAndroidImeAfterPaste = disposeAndroidImeBridge.reset;
     terminal.onData(data => {
       if (offlineScrollback) {
         handleOfflineInput(data);
         return;
       }
       pasteBridge.handleData(data);
+    });
+    let lastApplicationCursorKeys;
+    terminal.onWriteParsed(() => {
+      if (nativeKeyboardInput) setTerminalNativeCursor(terminal);
+      const applicationCursorKeys = terminal.modes.applicationCursorKeysMode;
+      if (applicationCursorKeys === lastApplicationCursorKeys) return;
+      lastApplicationCursorKeys = applicationCursorKeys;
+      send({ type: 'keyboard-modes', applicationCursorKeys });
     });
     terminal.onResize(({ cols, rows }) => {
       if (!fitResizeInProgress) {
@@ -737,13 +805,15 @@ const terminalSessionHtml = `<!doctype html>
       terminal.write('\u001bc');
     };
     let renderDrop = false;
-    const reportTracePhase = (type, inboundCookie) => {
-      if (Number.isInteger(inboundCookie)) send({ type, inboundCookie });
+    const reportTracePhase = (type, inboundCookie, localMs, base64Ms) => {
+      if (Number.isInteger(inboundCookie)) send({ type, inboundCookie, sentAt: Date.now(), localMs, base64Ms });
     };
     const reportTraceRendered = (inputCookie, resizeCookie, inboundCookie) => {
       if (!Number.isInteger(inputCookie) && !Number.isInteger(resizeCookie) && !Number.isInteger(inboundCookie)) return;
+      const written = performance.now();
       requestAnimationFrame(() => requestAnimationFrame(() => {
-        send({ type: 'trace-rendered', inputCookie, resizeCookie, inboundCookie });
+        send({ type: 'trace-rendered', inputCookie, resizeCookie, inboundCookie,
+          sentAt: Date.now(), visibleMs: performance.now() - written });
       }));
     };
     window.herdrWrite = (data, inputCookie, resizeCookie, inboundCookie) => {
@@ -768,9 +838,7 @@ const terminalSessionHtml = `<!doctype html>
         return;
       }
       prepareLiveWrite();
-      const binary = atob(data);
-      const bytes = new Uint8Array(binary.length);
-      for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+      const bytes = decodeTerminalBase64(data);
       terminal.write(bytes, () => {
         offlineCache.markDirty();
         reportTracePhase('trace-xterm-written', inboundCookie);
@@ -780,7 +848,8 @@ const terminalSessionHtml = `<!doctype html>
     const pendingFrames = new Map();
     window.herdrWriteBase64Chunk = (sequence, data, final, inputCookie, resizeCookie, inboundCookie) => {
       const pending = pendingFrames.get(sequence);
-      const encoded = (pending?.encoded || '') + data;
+      const chunks = pending?.chunks || [];
+      chunks.push(data);
       const pendingInputCookie = Number.isInteger(inputCookie)
         ? inputCookie
         : pending?.inputCookie;
@@ -792,7 +861,7 @@ const terminalSessionHtml = `<!doctype html>
         : pending?.inboundCookie;
       if (!final) {
         pendingFrames.set(sequence, {
-          encoded,
+          chunks,
           inputCookie: pendingInputCookie,
           resizeCookie: pendingResizeCookie,
           inboundCookie: pendingInboundCookie,
@@ -800,9 +869,82 @@ const terminalSessionHtml = `<!doctype html>
         return;
       }
       pendingFrames.delete(sequence);
-      window.herdrWriteBase64(encoded, pendingInputCookie, pendingResizeCookie, pendingInboundCookie);
+      window.herdrWriteBase64(chunks.join(''), pendingInputCookie, pendingResizeCookie, pendingInboundCookie);
     };
     window.herdrSetRenderDrop = enabled => { renderDrop = enabled === true; };
+    ${TerminalFrameSequence.toString()}
+    ${decodeTerminalBase64.toString()}
+    ${createTerminalBatchWriter.toString()}
+    let deliveryContext = null;
+    let deliveryBusy = false;
+    let pendingDelivery = null;
+    const batchWriter = createTerminalBatchWriter({
+      sequence: new TerminalFrameSequence(),
+      decode: data => {
+        const context = deliveryContext;
+        if (!context?.tracing && !Number.isInteger(context?.inboundCookie)) return decodeTerminalBase64(data);
+        const started = performance.now();
+        const bytes = decodeTerminalBase64(data);
+        context.base64Ms += performance.now() - started;
+        context.payloadBytes += bytes.byteLength;
+        return bytes;
+      },
+      write: (bytes, done) => {
+        prepareLiveWrite();
+        if (renderDrop) done();
+        else {
+          const context = deliveryContext;
+          if (!context?.tracing && !Number.isInteger(context?.inboundCookie)) { terminal.write(bytes, done); return; }
+          const started = performance.now();
+          terminal.write(bytes, () => { context.writeMs += performance.now() - started; done(); });
+        }
+      },
+      reset: done => {
+        const apply = () => { if (!disposed) { window.herdrReset(); done(); } };
+        // Drain queued offline/legacy writes before resetting the parser. RIS
+        // alone cannot recover a parser inside an incomplete OSC/DCS sequence.
+        if (renderDrop) apply();
+        else terminal.write('', apply);
+      },
+      requestFull: () => send({ type: 'terminal-sequence-gap', ...deliveryContext }),
+    });
+    window.herdrDeliverBatch = (packet, shouldReset, inputCookie, resizeCookie, inboundCookie, native = false, tracing = false, traceUi = false) => {
+      if (disposed) return;
+      if (deliveryBusy) {
+        // A replacement generation may arrive before the previous xterm write
+        // completes. Keep only the newest generation and serialize its reset.
+        pendingDelivery = [packet, shouldReset, inputCookie, resizeCookie, inboundCookie, native, tracing, traceUi];
+        return;
+      }
+      deliveryBusy = true;
+      const [, identity, generation, batchId, outputs, source] = packet;
+      const sourceChanged = deliveryContext && deliveryContext.source !== source;
+      if (deliveryContext?.generation !== generation || sourceChanged) batchWriter.reset();
+      if (sourceChanged && !localScrollback) shouldReset = true;
+      deliveryContext = { identity, generation, source, inboundCookie, tracing, base64Ms: 0, writeMs: 0, payloadBytes: 0 };
+      reportTracePhase('trace-write-received', inboundCookie);
+      batchWriter.write(outputs, shouldReset, fullFrame => {
+        deliveryBusy = false;
+        if (disposed) return;
+        offlineCache.markDirty();
+        reportTraceRendered(inputCookie, resizeCookie, inboundCookie);
+        send({ type: native ? 'native-batch-written' : 'terminal-batch-written', identity, generation, batchId,
+          fullFrame, inboundCookie, localMs: deliveryContext.writeMs, base64Ms: deliveryContext.base64Ms,
+          writeMs: deliveryContext.writeMs,
+          payloadBytes: deliveryContext.payloadBytes,
+          tracing,
+          sentAt: Number.isInteger(inboundCookie) ? Date.now() : undefined });
+        if (native && (tracing || traceUi)) {
+          const written = performance.now();
+          requestAnimationFrame(() => requestAnimationFrame(() => {
+            if (!disposed) send({ type: 'native-batch-visible', generation, batchId, tracing, traceUi, visibleMs: performance.now() - written });
+          }));
+        }
+        const pending = pendingDelivery;
+        pendingDelivery = null;
+        if (pending) window.herdrDeliverBatch(...pending);
+      });
+    };
     window.herdrSnapshot = reason => offlineCache.snapshot(reason || 'lifecycle', true);
     window.herdrReset = () => {
       pendingFrames.clear();
@@ -849,6 +991,7 @@ const terminalSessionHtml = `<!doctype html>
       terminal.options.fontSize = Math.max(8, Math.min(24, Number(options.fontSize) || 8));
       terminal.options.scrollback = Math.max(1000, Math.min(20000, Number(options.scrollback) || 5000));
       terminal.options.cursorBlink = options.cursorBlink !== false;
+      if (nativeKeyboardInput) setTerminalNativeCursor(terminal);
       doubleTapAction = ['none', 'paste', 'tab', 'escape'].includes(options.doubleTapAction) ? options.doubleTapAction : 'tab';
       const nextOfflineScrollback = options.offlineScrollback === true;
       if (offlineScrollback && !nextOfflineScrollback) terminal.scrollToBottom();
@@ -878,7 +1021,6 @@ const terminalSessionHtml = `<!doctype html>
       send({ type: 'font-size-change', fontSize });
     };
     const terminalMouseCaptured = () => applicationMouseCapture || terminal.modes.mouseTrackingMode !== 'none';
-    const terminalMouseInputEnabled = () => forcedMouseInput || terminalMouseCaptured();
     const terminalMouseCell = point => {
       const screen = terminal.element?.querySelector('.xterm-screen');
       if (!screen) return null;
@@ -890,9 +1032,6 @@ const terminalSessionHtml = `<!doctype html>
         col: Math.max(0, Math.min(terminal.cols - 1, Math.floor((clientX - bounds.left) / bounds.width * terminal.cols))),
         row: Math.max(0, Math.min(terminal.rows - 1, Math.floor((clientY - bounds.top) / bounds.height * terminal.rows))),
       };
-    };
-    window.herdrSetForcedMouseInput = enabled => {
-      forcedMouseInput = enabled === true;
     };
     window.herdrSetApplicationMouseCapture = enabled => {
       applicationMouseCapture = enabled === true;
@@ -920,15 +1059,6 @@ const terminalSessionHtml = `<!doctype html>
       return true;
     };
     const dispatchTerminalClick = point => {
-      if (forcedMouseInput) {
-        const cell = terminalMouseCell(point);
-        if (!cell) return false;
-        send({
-          type: 'input',
-          data: terminalMouseClickInput(cell.col, cell.row),
-        });
-        return true;
-      }
       if (!dispatchTerminalMouse('down', point)) return false;
       dispatchTerminalMouse('up', point);
       if (!keyboardEnabled) terminal.blur();
@@ -936,7 +1066,7 @@ const terminalSessionHtml = `<!doctype html>
     };
     const dispatchTerminalWheel = (direction, count, point) => {
       if (offlineScrollback) return false;
-      if (forcedMouseInput || applicationMouseCapture) {
+      if (applicationMouseCapture) {
         const cell = terminalMouseCell(point);
         if (!cell) return false;
         send({
@@ -975,7 +1105,7 @@ const terminalSessionHtml = `<!doctype html>
         || terminal.buffer.active.type === 'alternate';
       // An interactive application owns scrolling. Convert the complete swipe
       // to wheel input before terminal history or boundary reveal consumes it.
-      if (!offlineScrollback && (terminalMouseInputEnabled() || alternateScreen)) {
+      if (!offlineScrollback && (terminalMouseCaptured() || alternateScreen)) {
         terminalBoundaryScrollState = {
           ...terminalBoundaryScrollState,
           boundary: null,
@@ -1106,7 +1236,7 @@ const terminalSessionHtml = `<!doctype html>
       reportOfflineScroll();
     };
     window.herdrPaste = data => { pasteBridge.paste(data); hideToolbar(); };
-    window.herdrSubmitPastes = parts => {
+    const encodePastes = parts => {
       const values = [];
       for (const part of Array.isArray(parts) ? parts : []) {
         if (typeof part !== 'string' || !part) continue;
@@ -1115,7 +1245,14 @@ const terminalSessionHtml = `<!doctype html>
         values.push(bufferedInput);
       }
       bufferedInput = null;
-      send({ type: 'buffered-submit', parts: values });
+      return values;
+    };
+    window.herdrEncodePastes = (requestId, parts) => {
+      send({ type: 'encoded-paste', requestId, parts: encodePastes(parts) });
+      hideToolbar();
+    };
+    window.herdrSubmitPastes = parts => {
+      send({ type: 'buffered-submit', parts: encodePastes(parts) });
       hideToolbar();
     };
     ${createTerminalSearch.toString()}
@@ -1221,11 +1358,14 @@ const terminalSessionHtml = `<!doctype html>
       scheduleCursorGeometry();
     };
     window.herdrFocus = () => {
-      if (keyboardEnabled) terminal.focus();
+      if (keyboardEnabled) focusTerminal();
     };
-    window.herdrBlur = () => terminal.blur();
+    window.herdrBlur = () => {
+      if (nativeKeyboardInput) setTerminalNativeCursor(terminal, false);
+      terminal.blur();
+    };
     window.herdrSetKeyboardEnabled = enabled => {
-      keyboardEnabled = setTerminalKeyboardInputEnabled(terminal, enabled);
+      keyboardEnabled = setTerminalKeyboardInputEnabled(terminal, enabled, nativeKeyboardInput);
       clearInteractiveSelection(true);
     };
     window.herdrFit = resize;
@@ -1462,7 +1602,10 @@ const terminalSessionHtml = `<!doctype html>
       applyTerminalVisualInsets();
     });
     terminal.onCursorMove(scheduleCursorGeometry);
-    terminal.onRender(scheduleCursorGeometry);
+    terminal.onRender(() => {
+      if (nativeKeyboardInput) setTerminalNativeCursor(terminal);
+      scheduleCursorGeometry();
+    });
     terminal.buffer.onBufferChange(buffer => {
       clearInteractiveSelection(true);
       searchController.refresh();
@@ -1521,7 +1664,7 @@ const terminalSessionHtml = `<!doctype html>
     document.getElementById('terminal').addEventListener('touchstart', event => {
       reportScrollActivity(false);
       if (event.target.closest?.('#selection-toolbar')) return;
-      if (keyboardEnabled && event.touches.length === 1) terminal.focus();
+      if (keyboardEnabled && event.touches.length === 1) focusTerminal();
       if (!keyboardEnabled) {
         event.preventDefault();
         event.stopPropagation();
@@ -1662,7 +1805,7 @@ const terminalSessionHtml = `<!doctype html>
         handleKeyboardClosedStationaryTap({
           point,
           urlAtPoint,
-          terminalMouseInputEnabled,
+          terminalMouseCaptured,
           dispatchTerminalClick,
           send,
           clearInteractiveSelection,
@@ -1672,7 +1815,7 @@ const terminalSessionHtml = `<!doctype html>
         return;
       }
       if (!touch.moved && !touch.longPressed && point) {
-        terminal.focus();
+        focusTerminal();
         const now = { time: Date.now(), x: point.clientX, y: point.clientY };
         if (doubleTapAction !== 'none' && lastTap && now.time - lastTap.time <= doubleTapTimeoutMs && Math.hypot(now.x - lastTap.x, now.y - lastTap.y) <= doubleTapDistancePx) {
           event.preventDefault();
@@ -1761,6 +1904,8 @@ const terminalSessionScript = terminalSessionHtml
     }
     api.herdrDispose = () => {
       disposed = true;
+      batchWriter.dispose();
+      pendingDelivery = null;
       if (cursorGeometryFrame) cancelAnimationFrame(cursorGeometryFrame);
       offlineCache.dispose();
       pasteBridge.dispose();
@@ -1830,6 +1975,8 @@ const terminalHtml = `<!doctype html>
     const terminals = new Map();
     let activeKey = null;
     const send = value => window.ReactNativeWebView.postMessage(JSON.stringify(value));
+    ${postNativeTerminalMessage.toString()}
+    ${createNativeTerminalDelivery.toString()}
     const call = (key, method, args = []) => {
       const entry = terminals.get(key);
       if (!entry) return;
@@ -1846,13 +1993,19 @@ const terminalHtml = `<!doctype html>
       if (data) send({ type: 'input', data, key: entry.key });
     };
     const receive = (entry, value) => {
+      if (terminals.get(entry.key) !== entry) return;
       if (!value || typeof value.type !== 'string') return;
+      if (value.type === 'native-batch-written' || value.type === 'native-batch-visible') {
+        nativeDelivery.receive(entry, value);
+        return;
+      }
+      if (value.type === 'terminal-sequence-gap') nativeDelivery.gap(entry);
       if (value.type === 'ready') {
         entry.ready = true;
         const pending = entry.pending;
         entry.pending = [];
         for (const [method, args] of pending) call(entry.key, method, args);
-        send({ type: 'terminal-ready', key: entry.key });
+        send({ type: 'terminal-ready', key: entry.key, identity: entry.identity });
         if (entry.key === activeKey) call(entry.key, 'herdrFit');
         return;
       }
@@ -1873,13 +2026,18 @@ const terminalHtml = `<!doctype html>
       }
       send({ ...value, key: entry.key });
     };
-    const create = key => {
-      if (!key || terminals.has(key)) return terminals.get(key);
+    const create = (key, identity = null) => {
+      if (!key) return;
+      const previous = terminals.get(key);
+      if (previous && identity !== null && previous.identity !== identity) window.herdrRemove(key);
+      else if (previous) return previous;
       const root = document.createElement('div');
       root.className = 'terminal-session';
       root.innerHTML = terminalMarkup;
       const entry = {
         key,
+        identity,
+        generation: null,
         root,
         api: null,
         ready: false,
@@ -1904,10 +2062,24 @@ const terminalHtml = `<!doctype html>
       }
     };
 
-    window.herdrCreate = key => { create(key); };
+    const nativeDelivery = createNativeTerminalDelivery({ terminals, call, post: postNativeTerminalMessage, report: send });
+    window.herdrBindNative = (...args) => nativeDelivery.bind(...args);
+    window.herdrTraceNextNative = key => nativeDelivery.armTrace(key);
+    window.herdrNativeBound = (...args) => nativeDelivery.bound(...args);
+    window.herdrDeliverNative = (...args) => nativeDelivery.deliver(...args);
+    window.herdrCreate = (key, identity) => { create(key, identity); };
+    window.herdrDeliverBatch = (packet, reset, inputCookie, resizeCookie, inboundCookie) => {
+      const [key, identity, generation] = packet;
+      const entry = terminals.get(key);
+      if (!entry || entry.identity !== identity || !entry.ready) return;
+      if (entry.generation !== null && BigInt(generation) < BigInt(entry.generation)) return;
+      entry.generation = generation;
+      call(key, 'herdrDeliverBatch', [packet, reset, inputCookie, resizeCookie, inboundCookie]);
+    };
     window.herdrRemove = key => {
       const entry = terminals.get(key);
       if (!entry) return;
+      nativeDelivery.release(entry);
       if (entry.inputTimer !== null) {
         clearTimeout(entry.inputTimer);
         flushInput(entry);
@@ -1945,6 +2117,7 @@ const terminalHtml = `<!doctype html>
     window.herdrScroll = (key, direction, lines) => call(key, 'herdrScroll', [direction, lines]);
     window.herdrScrollToVisualBottom = key => call(key, 'herdrScrollToVisualBottom');
     window.herdrPaste = (key, data) => call(key, 'herdrPaste', [data]);
+    window.herdrEncodePastes = (key, requestId, parts) => call(key, 'herdrEncodePastes', [requestId, parts]);
     window.herdrSelectionCopied = (key, requestId, text) => call(key, 'herdrSelectionCopied', [requestId, text]);
     window.herdrClipboardWrite = (key, text) => call(key, 'herdrClipboardWrite', [text]);
     window.herdrSubmitPastes = (key, parts) => call(key, 'herdrSubmitPastes', [parts]);
@@ -1955,7 +2128,6 @@ const terminalHtml = `<!doctype html>
     window.herdrFocus = key => call(key, 'herdrFocus');
     window.herdrBlur = key => call(key, 'herdrBlur');
     window.herdrSetKeyboardEnabled = (key, enabled) => call(key, 'herdrSetKeyboardEnabled', [enabled]);
-    window.herdrSetForcedMouseInput = (key, enabled) => call(key, 'herdrSetForcedMouseInput', [enabled]);
     window.herdrSetApplicationMouseCapture = (key, enabled) => call(key, 'herdrSetApplicationMouseCapture', [enabled]);
     window.herdrSetRenderDrop = (key, enabled) => call(key, 'herdrSetRenderDrop', [enabled]);
     window.herdrSnapshot = (key, reason) => call(key, 'herdrSnapshot', [reason]);

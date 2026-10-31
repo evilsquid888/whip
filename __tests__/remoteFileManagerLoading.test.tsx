@@ -1,5 +1,5 @@
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
-import { StrictMode } from 'react';
+import { StrictMode, type ReactNode } from 'react';
 import { AppState, FlatList, PanResponder, Modal, Pressable } from 'react-native';
 import type { RuntimeGitRepository, RuntimeGitStatusEntry, RuntimeRemoteDirectoryListing, RuntimeRemoteFileEntry } from 'react-native-whip-ssh';
 import Clipboard from '@react-native-clipboard/clipboard';
@@ -13,6 +13,9 @@ import { ConfirmationPopup } from '../src/components/ConfirmationPopup';
 import type { HerdrClient } from '../src/services/HerdrClient';
 import { loadRemoteGitCollapsedPaths, loadRemoteGitMode, saveRemoteGitCollapsedPaths, saveRemoteGitMode } from '../src/services/remoteGitPreferences';
 import { reportBackgroundFailure } from '../src/services/backgroundOperations';
+import * as remoteGit from '../src/lib/remoteGit';
+import { useRemoteFileViewPreferences } from '../src/hooks/useRemoteFileViewPreferences';
+import { loadGitReviewState } from '../src/services/gitReviewState';
 
 jest.mock('react-native-css-interop/jsx-runtime', () => jest.requireActual('react/jsx-runtime'));
 jest.mock('react-native-css-interop', () => {
@@ -35,11 +38,12 @@ jest.mock('react-native-reanimated', () => ({
 }));
 jest.mock('react-native', () => {
   const native = jest.requireActual<typeof import('react-native')>('react-native');
-  // Use RN's actual FlatList/VirtualizedList so row-count checks exercise its
-  // render window rather than duplicating virtualization in a test mock.
+  // Load RN's real list during setup so lazy imports do not consume the first
+  // test's timeout, while row-count checks still exercise its render window.
   return Object.setPrototypeOf({
     ActivityIndicator: 'ActivityIndicator', Alert: {},
     AppState: { currentState: 'active', addEventListener: jest.fn(() => ({ remove: jest.fn() })) },
+    FlatList: native.FlatList,
     Modal: 'Modal', Pressable: 'Pressable', View: 'View',
     KeyboardAvoidingView: 'KeyboardAvoidingView', Keyboard: { dismiss: jest.fn() },
     PanResponder: { create: jest.fn(() => ({ panHandlers: {} })) },
@@ -48,8 +52,13 @@ jest.mock('react-native', () => {
 jest.mock('react-i18next', () => ({ useTranslation: () => ({
   t: (key: string, values?: { name?: string }) => values?.name ? `${key}:${values.name}` : key,
 }) }));
-jest.mock('../src/theme', () => ({ useTheme: () => ({ colors: {} }), colorWithAlpha: () => '#000' }));
-jest.mock('../src/components/GlassSurface', () => ({ GlassSurface: 'GlassSurface', useAppGlassEnabled: () => false }));
+jest.mock('../src/theme', () => ({ useTheme: () => ({ colors: { canvas: '#101218' } }), colorWithAlpha: () => '#000' }));
+jest.mock('../src/components/GlassSurface', () => ({
+  GlassOverlayHost: ({ children, overlays }: { children: ReactNode; overlays?: ReactNode }) =>
+    jest.requireActual<typeof import('react')>('react').createElement('GlassOverlayHost', null, children, overlays),
+  GlassSurface: 'GlassSurface',
+  useAppGlassEnabled: () => mockAppGlassEnabled,
+}));
 jest.mock('../src/components/app-ui', () => ({ hapticPress: (callback: () => unknown) => callback }));
 jest.mock('../src/components/ui/button', () => ({ Button: 'Button' }));
 jest.mock('../src/components/ui/text', () => ({ Text: 'Text' }));
@@ -79,10 +88,10 @@ jest.mock('../src/services/remoteGitPreferences', () => ({
   loadRemoteGitMode: jest.fn(), loadRemoteGitCollapsedPaths: jest.fn(),
   saveRemoteGitMode: jest.fn(), saveRemoteGitCollapsedPaths: jest.fn(),
 }));
-jest.mock('../src/services/gitReviewState', () => ({}));
-jest.mock('../src/hooks/useRemoteFileViewPreferences', () => ({ useRemoteFileViewPreferences: () => ({
-  showHiddenFiles: true, sortField: 'name', sortDirection: 'ascending',
-}) }));
+jest.mock('../src/services/gitReviewState', () => ({
+  gitReviewKey: jest.fn(), loadGitReviewState: jest.fn(), rememberGitReviewState: jest.fn(),
+}));
+jest.mock('../src/hooks/useRemoteFileViewPreferences', () => ({ useRemoteFileViewPreferences: jest.fn() }));
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -101,6 +110,7 @@ const changes: RuntimeGitStatusEntry[] = [{
   indexStatus: ' ', worktreeStatus: 'M',
 }];
 let tree: ReactTestRenderer;
+let mockAppGlassEnabled = false;
 let native: {
   status: jest.Mock;
   listDirectory: jest.Mock;
@@ -112,6 +122,7 @@ let native: {
   renameRemotePath: jest.Mock;
   discoverGitRepository: jest.Mock;
   gitStatus: jest.Mock;
+  gitDiff: jest.Mock;
 };
 let client: HerdrClient;
 let props: React.ComponentProps<typeof RemoteFileManager>;
@@ -128,11 +139,16 @@ async function navigate(path: string) {
 
 beforeEach(() => {
   jest.clearAllMocks();
+  mockAppGlassEnabled = false;
   jest.mocked(cacheRemoteFile).mockReset();
   jest.mocked(loadRemoteGitMode).mockResolvedValue(false);
   jest.mocked(loadRemoteGitCollapsedPaths).mockResolvedValue([]);
   jest.mocked(saveRemoteGitCollapsedPaths).mockResolvedValue(undefined);
   jest.mocked(saveRemoteGitMode).mockReset().mockResolvedValue(undefined);
+  jest.mocked(useRemoteFileViewPreferences).mockReturnValue({
+    showHiddenFiles: true, sortField: 'name', sortDirection: 'ascending',
+    setShowHiddenFiles: jest.fn(), selectSortField: jest.fn(),
+  });
   native = {
     status: jest.fn(() => ({ state: 'connected', generation: 1n })),
     listDirectory: jest.fn(async (path: string) => listing(path)),
@@ -144,11 +160,12 @@ beforeEach(() => {
     renameRemotePath: jest.fn().mockResolvedValue(undefined),
     discoverGitRepository: jest.fn().mockResolvedValue(null),
     gitStatus: jest.fn().mockResolvedValue(changes),
+    gitDiff: jest.fn().mockResolvedValue({ kind: 'empty', rows: [], additions: 0, deletions: 0, hunkRows: [], truncated: false, revision: 'test' }),
   };
   client = { native, activeNative: native } as unknown as HerdrClient;
   props = { visible: true, client, hostId: 'host', initialPath: '/repo', onPathChange: jest.fn(), onClose: jest.fn() };
 });
-afterEach(() => { act(() => tree?.unmount()); });
+afterEach(() => { act(() => tree?.unmount()); jest.restoreAllMocks(); });
 
 it('opens a 10 MiB text file without starting a full-file download or enabling editing', async () => {
   const entry: RuntimeRemoteFileEntry = { name: 'notes', path: '/repo/notes', kind: 'file', size: 10 * 1024 * 1024 };
@@ -159,6 +176,46 @@ it('opens a 10 MiB text file without starting a full-file download or enabling e
   expect(preview.props.progressIdentity.remotePath).toBe(entry.path);
   expect(cacheRemoteFile).not.toHaveBeenCalled();
   expect(hasButton('files.edit')).toBe(false);
+});
+
+it.each(['close', 'back'] as const)('remembers the open file on %s and releases its preview resources', async action => {
+  const entry: RuntimeRemoteFileEntry = { name: 'clip.mp4', path: '/repo/clip.mp4', kind: 'file', size: 100 };
+  native.listDirectory.mockResolvedValue({ path: '/repo', entries: [entry] });
+  props.onFileChange = jest.fn();
+  await mount();
+  await act(async () => { button('files.openFile:clip.mp4').props.onPress(); });
+  expect(props.onFileChange).toHaveBeenLastCalledWith(entry.path);
+  jest.mocked(props.onFileChange).mockClear();
+
+  await act(async () => { button(action === 'close' ? 'files.close' : 'files.backToDirectory').props.onPress(); });
+  expect(native.stopPreview).toHaveBeenCalledWith('file-preview');
+  if (action === 'close') {
+    expect(props.onFileChange).not.toHaveBeenCalled();
+    expect(props.onClose).toHaveBeenCalledTimes(1);
+  } else {
+    expect(props.onFileChange).toHaveBeenCalledWith(null);
+    expect(props.onClose).not.toHaveBeenCalled();
+  }
+});
+
+it('opens a remembered file without a line override and forgets it if it has disappeared', async () => {
+  const entry: RuntimeRemoteFileEntry = { name: 'notes', path: '/repo/notes', kind: 'file', size: 10 * 1024 * 1024 };
+  native.listDirectory.mockResolvedValue({ path: '/repo', entries: [entry] });
+  props.initialFilePath = entry.path;
+  props.onFileChange = jest.fn();
+  await mount();
+  const preview = tree.root.find(node => String(node.type) === 'PagedRemoteTextPreview');
+  expect(preview.props.progressIdentity.remotePath).toBe(entry.path);
+  expect(preview.props.initialLine).toBeUndefined();
+  expect(props.onFileChange).toHaveBeenLastCalledWith(entry.path);
+
+  act(() => { tree.unmount(); });
+  native.listDirectory.mockResolvedValue(listing('/repo'));
+  await mount();
+  expect(props.onFileChange).toHaveBeenLastCalledWith(null);
+  expect(text()).toContain(`Remote file not found: ${entry.path}`);
+  await act(async () => { await button('files.refresh').props.onPress(); });
+  expect(hasButton('files.openDirectory:child')).toBe(true);
 });
 
 it('opens an extensionless UTF-8 file as editable plain text', async () => {
@@ -175,6 +232,36 @@ it('opens an extensionless UTF-8 file as editable plain text', async () => {
   const preview = tree.root.find(node => String(node.type) === 'RemoteTextPreview');
   expect(preview.props.content).toBe(content);
   expect(button('files.edit').props.disabled).toBe(false);
+});
+
+it.each(['file.ts', 'notes.md'])('isolates %s code editing from the native app while keeping directory glass', async filename => {
+  mockAppGlassEnabled = true;
+  const entry: RuntimeRemoteFileEntry = { name: filename, path: `/repo/${filename}`, kind: 'file', size: 100 };
+  native.listDirectory.mockResolvedValue({ path: '/repo', entries: [entry] });
+  jest.mocked(cacheRemoteFile).mockResolvedValue({
+    file: { text: jest.fn().mockResolvedValue('const value = 1;') },
+    uri: 'file:///cache/source', nativePath: '/cache/source', dispose: jest.fn(),
+  } as unknown as Awaited<ReturnType<typeof cacheRemoteFile>>);
+  const surfaces = () => tree.root.findAll(node => String(node.type) === 'GlassSurface');
+  const opaqueShell = () => tree.root.findAll(node => String(node.type) === 'View' && node.props.style?.backgroundColor === '#101218');
+  await mount();
+  expect(surfaces()).toHaveLength(1);
+  await act(async () => { button(`files.openFile:${filename}`).props.onPress(); });
+  if (filename.endsWith('.ts')) {
+    expect(tree.root.find(node => String(node.type) === 'CodePreview')).toBeDefined();
+    expect(surfaces()).toHaveLength(0);
+    expect(opaqueShell()).toHaveLength(1);
+  } else {
+    expect(surfaces()).toHaveLength(1);
+  }
+  await act(async () => { button('files.edit').props.onPress(); });
+  expect(tree.root.find(node => String(node.type) === 'CodeEditor')).toBeDefined();
+  expect(surfaces()).toHaveLength(0);
+  expect(opaqueShell()).toHaveLength(1);
+  await act(async () => { button('files.cancelEdit').props.onPress(); });
+  await act(async () => { button('files.backToDirectory').props.onPress(); });
+  expect(surfaces()).toHaveLength(1);
+  expect(opaqueShell()).toHaveLength(0);
 });
 
 it('shows invalid UTF-8 errors without displaying replacement text or an editor', async () => {
@@ -420,6 +507,94 @@ it('persists each Git tree press once in Strict Mode, including batched presses'
   expect(saveRemoteGitCollapsedPaths).toHaveBeenNthCalledWith(2, 'host', '/repo', ['src']);
   expect(saveRemoteGitCollapsedPaths).toHaveBeenNthCalledWith(3, 'host', '/repo', []);
   expect(button('files.gitCollapseFolder').props.accessibilityState.expanded).toBe(true);
+});
+
+it('only flattens the existing Git tree when expanding and collapsing folders', async () => {
+  const build = jest.spyOn(remoteGit, 'buildRemoteGitTree');
+  const flatten = jest.spyOn(remoteGit, 'flattenRemoteGitTree');
+  const collect = jest.spyOn(remoteGit, 'collectRemoteGitFiles');
+  native.discoverGitRepository.mockResolvedValue(repository);
+  jest.mocked(loadRemoteGitMode).mockResolvedValue(true);
+  jest.mocked(loadRemoteGitCollapsedPaths).mockResolvedValue(['src']);
+  await mount();
+  expect(build.mock.calls.filter(([statuses]) => statuses.length)).toHaveLength(1);
+  const constructedTree: remoteGit.RemoteGitTree = build.mock.results.at(-1)!.value;
+  build.mockClear();
+  flatten.mockClear();
+  collect.mockClear();
+
+  await act(async () => { button('files.gitExpandFolder').props.onPress(); });
+  expect(tree.root.findByType(FlatList).props.data).toHaveLength(2);
+  await act(async () => { button('files.gitCollapseFolder').props.onPress(); });
+  expect(tree.root.findByType(FlatList).props.data).toHaveLength(1);
+  expect(build).not.toHaveBeenCalled();
+  expect(collect).not.toHaveBeenCalled();
+  expect(flatten).toHaveBeenCalledTimes(2);
+  for (const [reusedTree] of flatten.mock.calls) expect(reusedTree).toBe(constructedTree);
+  expect(native.gitStatus).toHaveBeenCalledTimes(1);
+});
+
+it('rebuilds the shared Git tree when hidden-file filtering or status changes', async () => {
+  const build = jest.spyOn(remoteGit, 'buildRemoteGitTree');
+  const collect = jest.spyOn(remoteGit, 'collectRemoteGitFiles');
+  const hidden = { ...changes[0], path: 'src/.hidden/file.ts', absolutePath: '/repo/src/.hidden/file.ts' };
+  native.gitStatus.mockResolvedValue([...changes, hidden]);
+  native.discoverGitRepository.mockResolvedValue(repository);
+  jest.mocked(loadRemoteGitMode).mockResolvedValue(true);
+  await mount();
+  build.mockClear();
+  collect.mockClear();
+
+  const preferences = jest.mocked(useRemoteFileViewPreferences).mock.results.at(-1)!.value as ReturnType<typeof useRemoteFileViewPreferences>;
+  jest.mocked(useRemoteFileViewPreferences).mockReturnValue({ ...preferences, showHiddenFiles: false });
+  await act(async () => { tree.update(<RemoteFileManager {...props} />); });
+  expect(build).toHaveBeenCalledTimes(1);
+  expect(build).toHaveBeenLastCalledWith(changes);
+  expect(collect.mock.results.at(-1)!.value).toEqual(changes);
+  expect(tree.root.findByType(FlatList).props.data).toEqual([
+    expect.objectContaining({ path: 'src', changeCount: 1 }),
+    expect.objectContaining({ status: changes[0] }),
+  ]);
+  expect(native.gitStatus).toHaveBeenCalledTimes(1);
+
+  build.mockClear();
+  collect.mockClear();
+  const added = { ...changes[0], path: 'new.ts', absolutePath: '/repo/new.ts', indexStatus: '?', worktreeStatus: '?' };
+  native.gitStatus.mockResolvedValue([...changes, hidden, added]);
+  await act(async () => { await button('files.refresh').props.onPress(); });
+  expect(build).toHaveBeenCalledTimes(1);
+  expect(build).toHaveBeenLastCalledWith([...changes, added]);
+  expect(collect).toHaveBeenCalledTimes(1);
+  expect(collect.mock.results[0].value).toEqual([...changes, added]);
+});
+
+it('navigates previous and next diffs in tree order through collapsed folders and excludes hidden files', async () => {
+  const entries = ['README.md', 'src/file10.ts', 'src/nested/file2.ts', 'src/file2.ts', 'src/.hidden/file.ts', '.env']
+    .map(path => ({ ...changes[0], path, absolutePath: `/repo/${path}` }));
+  native.gitStatus.mockResolvedValue(entries);
+  native.discoverGitRepository.mockResolvedValue(repository);
+  jest.mocked(loadRemoteGitMode).mockResolvedValue(true);
+  jest.mocked(loadRemoteGitCollapsedPaths).mockResolvedValue(['src']);
+  jest.mocked(loadGitReviewState).mockResolvedValue({ context: 'compact', expansions: [], anchor: null });
+  await mount();
+  const preferences = jest.mocked(useRemoteFileViewPreferences).mock.results.at(-1)!.value as ReturnType<typeof useRemoteFileViewPreferences>;
+  jest.mocked(useRemoteFileViewPreferences).mockReturnValue({ ...preferences, showHiddenFiles: false });
+  await act(async () => { tree.update(<RemoteFileManager {...props} />); });
+  expect(tree.root.findByType(FlatList).props.data).toHaveLength(2);
+
+  await act(async () => { await button('files.gitOpenChange').props.onPress(); });
+  expect(button('files.gitNextFile').props.disabled).toBe(true);
+  for (let index = 0; index < 3; index += 1) {
+    await act(async () => { await button('files.gitPreviousFile').props.onPress(); });
+  }
+  expect(button('files.gitPreviousFile').props.disabled).toBe(true);
+  await act(async () => { await button('files.gitNextFile').props.onPress(); });
+  expect(native.gitDiff.mock.calls.map(call => call[1])).toEqual([
+    entries[0], entries[1], entries[3], entries[2], entries[3],
+  ]);
+  expect(native.gitDiff.mock.calls[0][1]).toBe(entries[0]);
+  expect(native.gitDiff.mock.calls[3][1]).toBe(entries[2]);
+  expect(native.gitStatus).toHaveBeenCalledTimes(1);
 });
 
 it.each(['success', 'failure'] as const)('ignores old Git status %s after navigation', async result => {

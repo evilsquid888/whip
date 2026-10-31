@@ -3,6 +3,18 @@
 Whip includes or adapts work from the projects listed below. Those portions
 remain subject to their original licenses.
 
+## Tailcat
+
+Whip's [whip-tailcat client crate](crates/whip-tailcat/README.md) implements the
+[Tailcat](https://github.com/tailscale/tailcat) transport in Rust, adapting
+BSD-3-Clause code from spullara/tailcat-rs. Tailcat is copyright Tailscale Inc &
+contributors. Original license and provenance are retained in the crate's
+[notices](crates/whip-tailcat/THIRD_PARTY_NOTICES.md) and the bundled
+[Tailcat attribution](assets/licenses/tailcat-dependencies.txt).
+Rust transport dependency licenses are bundled with the Cargo notices.
+Regenerate attribution with
+`nix develop -c node scripts/check-tailcat-license-notices.ts --write`.
+
 ## OpenCode Web
 
 Whip's Chat View is inspired by and adapted from the conversation design of
@@ -47,17 +59,33 @@ SOFTWARE.
   copyright (c) 2014 Ryan L McIntyre, is distributed under the [MIT
   License](assets/licenses/nerd-fonts-MIT.txt).
 
-## Mermaid
+## Pele and CodeMirror
 
-Whip uses [Mermaid](https://github.com/mermaid-js/mermaid) to render diagrams
-in remote file previews. Mermaid is copyright (c) 2014–2022 Knut Sveidqvist
-and distributed under the [MIT License](assets/licenses/mermaid-MIT.txt).
+Whip uses [Pele](https://github.com/obsidianmd/pele) to render Mermaid diagrams
+in chat and remote file previews. Pele is copyright (c) 2026 kepano. Its
+[MIT and ISC notices](assets/licenses/pele-MIT-and-ISC.txt) are included with Whip.
+
+Remote code previews and editing use [CodeMirror](https://codemirror.net),
+distributed under the MIT License. CodeMirror and its bundled language packages
+are included in the generated npm license notices available in the app.
 
 ## xterm.js
 
 Whip's terminal renderer uses [xterm.js](https://github.com/xtermjs/xterm.js)
 and its addons. The complete copyright notice and [MIT
 License](assets/licenses/xterm-MIT.txt) are included with Whip.
+
+## Turso
+
+Whip embeds the official [Turso Rust database](https://docs.rs/turso/0.8.3),
+distributed under the MIT License, for local conversation checkpoints and durable application data. The FTS
+crate feature is enabled for future indexing; current persistence operations use
+ordinary tables. Turso's MIT notice and the Android/iOS production transitive
+dependency notices, including Tantivy, are bundled in Whip's generated license
+registry. `npm run generate:license-notices` audits that graph against the exact
+Cargo lockfile using `licenses/cargo/turso-about.toml`. The audit chooses
+permissive alternatives where dependencies offer multiple licenses; it also
+includes the Unicode and Zlib licenses required by the resolved graph.
 
 ## Lucide Icons
 

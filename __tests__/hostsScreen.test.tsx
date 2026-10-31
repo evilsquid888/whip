@@ -28,6 +28,7 @@ jest.mock('react-i18next', () => ({
 }));
 jest.mock('lucide-react-native', () => ({
   Globe2: 'Globe2',
+  KeyRound: 'KeyRound',
   Plus: 'Plus',
   Server: 'Server',
 }));
@@ -44,6 +45,10 @@ jest.mock('../src/components/GlassSurface', () => ({ GlassSurface: 'GlassSurface
 jest.mock('../src/components/ui/button', () => ({ Button: 'Button' }));
 jest.mock('../src/components/ui/icon', () => ({ Icon: 'Icon' }));
 jest.mock('../src/components/ui/text', () => ({ Text: 'Text' }));
+jest.mock('../src/services/remoteNotifications', () => ({
+  remoteNotificationStates: jest.fn().mockResolvedValue([]),
+  subscribeRemoteNotifications: jest.fn(() => jest.fn()),
+}));
 
 test('the Hosts header opens and reuses a browser without any connected hosts', async () => {
   const onAdd = jest.fn();
@@ -61,6 +66,7 @@ test('the Hosts header opens and reuses a browser without any connected hosts', 
           onDelete={jest.fn()}
           onDisconnect={jest.fn()}
           onEdit={jest.fn()}
+          onManageGlobalKeychain={jest.fn()}
           onUnlockCredentials={jest.fn()}
         />,
       );

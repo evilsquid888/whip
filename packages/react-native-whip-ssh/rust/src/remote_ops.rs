@@ -602,10 +602,21 @@ pub(crate) fn git_diff_command_lines(
             "if git -C {root} rev-parse --verify HEAD >/dev/null 2>&1; then git -C {root} diff {common} HEAD -- {path}; else git -C {root} diff {common} --cached -- {path}; fi"
         )
     };
-    Ok(format!("{command} | head -c {}", GIT_DIFF_MAX_BYTES + 1))
+    // SSH executes commands through the user's login shell, which may be Fish.
+    // Keep the HEAD check and its pipeline inside an explicit POSIX shell.
+    let script = format!("{command} | head -c {}", GIT_DIFF_MAX_BYTES + 1);
+    Ok(format!("sh -c {}", shell_quote(&script)))
 }
 
 pub(crate) fn parse_git_diff(bytes: &[u8]) -> Result<GitDiff, String> {
+    parse_diff(bytes, false)
+}
+
+pub(crate) fn parse_chat_diff(bytes: &[u8]) -> Result<GitDiff, String> {
+    parse_diff(bytes, true)
+}
+
+fn parse_diff(bytes: &[u8], fragment: bool) -> Result<GitDiff, String> {
     let byte_limited = bytes.len() > GIT_DIFF_MAX_BYTES;
     let bytes = &bytes[..bytes.len().min(GIT_DIFF_MAX_BYTES)];
     let text = std::str::from_utf8(bytes)
@@ -644,8 +655,8 @@ pub(crate) fn parse_git_diff(bytes: &[u8]) -> Result<GitDiff, String> {
     let mut additions = 0;
     let mut deletions = 0;
     let mut hunk_rows = Vec::new();
-    let mut old_line = 0u32;
-    let mut new_line = 0u32;
+    let mut old_line = None;
+    let mut new_line = None;
     let mut in_hunk = false;
     let mut row_limited = false;
     for line in text.replace("\r\n", "\n").lines() {
@@ -653,10 +664,11 @@ pub(crate) fn parse_git_diff(bytes: &[u8]) -> Result<GitDiff, String> {
             row_limited = true;
             break;
         }
-        if let Some((old, new)) = parse_hunk_header(line) {
+        let numbered_hunk = parse_hunk_header(line);
+        if numbered_hunk.is_some() || fragment && (line == "@@" || line.starts_with("@@ ")) {
             hunk_rows.push(u32::try_from(rows.len()).map_err(|_| "Too many diff rows")?);
-            old_line = old;
-            new_line = new;
+            old_line = numbered_hunk.map(|(old, _)| old);
+            new_line = numbered_hunk.map(|(_, new)| new);
             in_hunk = true;
             rows.push(diff_row(
                 rows.len(),
@@ -666,7 +678,19 @@ pub(crate) fn parse_git_diff(bytes: &[u8]) -> Result<GitDiff, String> {
                 None,
                 None,
             ));
-        } else if !in_hunk {
+            continue;
+        }
+        if fragment
+            && !in_hunk
+            && (line.starts_with('+') && !line.starts_with("+++ ")
+                || line.starts_with('-') && !line.starts_with("--- ")
+                || line.starts_with(' '))
+        {
+            // Tool patches and before/after snippets often omit source ranges.
+            // Keep their line numbers unknown rather than inventing file positions.
+            in_hunk = true;
+        }
+        if !in_hunk {
             rows.push(diff_row(
                 rows.len(),
                 GitDiffRowKind::Header,
@@ -683,9 +707,9 @@ pub(crate) fn parse_git_diff(bytes: &[u8]) -> Result<GitDiff, String> {
                 content,
                 "+",
                 None,
-                Some(new_line),
+                new_line,
             ));
-            new_line = new_line.saturating_add(1);
+            new_line = new_line.map(|line| line.saturating_add(1));
         } else if let Some(content) = line.strip_prefix('-') {
             deletions += 1;
             rows.push(diff_row(
@@ -693,21 +717,21 @@ pub(crate) fn parse_git_diff(bytes: &[u8]) -> Result<GitDiff, String> {
                 GitDiffRowKind::Deletion,
                 content,
                 "-",
-                Some(old_line),
+                old_line,
                 None,
             ));
-            old_line = old_line.saturating_add(1);
+            old_line = old_line.map(|line| line.saturating_add(1));
         } else if let Some(content) = line.strip_prefix(' ') {
             rows.push(diff_row(
                 rows.len(),
                 GitDiffRowKind::Context,
                 content,
                 " ",
-                Some(old_line),
-                Some(new_line),
+                old_line,
+                new_line,
             ));
-            old_line = old_line.saturating_add(1);
-            new_line = new_line.saturating_add(1);
+            old_line = old_line.map(|line| line.saturating_add(1));
+            new_line = new_line.map(|line| line.saturating_add(1));
         } else {
             rows.push(diff_row(
                 rows.len(),
@@ -847,14 +871,6 @@ mod tests {
     }
 
     #[test]
-    fn shell_quote_blocks_metacharacter_interpretation() {
-        let value = "a b'$(touch /tmp/pwn);$HOME";
-        assert_eq!(shell_quote(value), "'a b'\"'\"'$(touch /tmp/pwn);$HOME'");
-        let command = git_status_command(value);
-        assert!(command.contains("'a b'\"'\"'$(touch /tmp/pwn);$HOME'"));
-    }
-
-    #[test]
     fn parses_ordinary_modified_git_status_entries() {
         let entries = parse_git_status(b" M src/App.tsx\0M  Cargo.toml\0", "/repo").unwrap();
 
@@ -964,6 +980,8 @@ mod tests {
 
     #[test]
     fn context_modes_reveal_real_git_source_without_changing_the_patch_totals() {
+        const FILE_NAME: &str = "file space'$HOME.txt";
+
         let directory = tempfile::tempdir().unwrap();
         let git = |args: &[&str]| {
             let output = std::process::Command::new("git")
@@ -983,9 +1001,17 @@ mod tests {
         for line in 1..=100 {
             writeln!(contents, "line {line}").unwrap();
         }
-        let file = directory.path().join("file space.txt");
+        let file = directory.path().join(FILE_NAME);
         std::fs::write(&file, &contents).unwrap();
-        git(&["add", "--", "file space.txt"]);
+        git(&["add", "--", FILE_NAME]);
+        let mut shells = vec!["sh"];
+        if std::process::Command::new("fish")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+        {
+            shells.push("fish");
+        }
         let repository = GitRepository {
             root: directory.path().to_str().unwrap().to_owned(),
             has_head: false,
@@ -993,18 +1019,24 @@ mod tests {
         let mut status = GitStatusEntry {
             index_status: "A".into(),
             worktree_status: " ".into(),
-            path: "file space.txt".into(),
+            path: FILE_NAME.into(),
             original_path: None,
             absolute_path: file.to_str().unwrap().to_owned(),
         };
         let command = git_diff_command(&repository, &status, GitDiffContext::Compact).unwrap();
-        let output = std::process::Command::new("sh")
-            .args(["-c", &command])
-            .output()
-            .unwrap();
-        assert!(output.status.success());
-        let diff = parse_git_diff(&output.stdout).unwrap();
-        assert_eq!((diff.additions, diff.deletions), (100, 0));
+        for shell in &shells {
+            let output = std::process::Command::new(shell)
+                .args(["-c", &command])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{shell}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let diff = parse_git_diff(&output.stdout).unwrap();
+            assert_eq!((diff.additions, diff.deletions), (100, 0));
+        }
         git(&[
             "-c",
             "user.name=Whip Test",
@@ -1027,20 +1059,26 @@ mod tests {
             (GitDiffContext::Full, 99),
         ] {
             let command = git_diff_command(&repository, &status, context).unwrap();
-            let output = std::process::Command::new("sh")
-                .args(["-c", &command])
-                .output()
-                .unwrap();
-            assert!(output.status.success());
-            let diff = parse_git_diff(&output.stdout).unwrap();
-            assert_eq!((diff.additions, diff.deletions), (1, 1));
-            assert_eq!(
-                diff.rows
-                    .iter()
-                    .filter(|row| row.kind == GitDiffRowKind::Context)
-                    .count(),
-                expected_context
-            );
+            for shell in &shells {
+                let output = std::process::Command::new(shell)
+                    .args(["-c", &command])
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{shell}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let diff = parse_git_diff(&output.stdout).unwrap();
+                assert_eq!((diff.additions, diff.deletions), (1, 1));
+                assert_eq!(
+                    diff.rows
+                        .iter()
+                        .filter(|row| row.kind == GitDiffRowKind::Context)
+                        .count(),
+                    expected_context
+                );
+            }
         }
     }
 

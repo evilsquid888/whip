@@ -2,6 +2,7 @@
 
 const LEGACY_TERMINAL_ATTACH_LAUNCH_MODE = 1;
 let latestMockControl;
+let nextUuid = 0;
 
 function unavailable(error) {
   const value = String(error?.message || error || '').toLowerCase();
@@ -21,6 +22,9 @@ class MockNativeHostProfileStore {
       port: profile.port.trim() || '22', username: profile.username.trim(),
       jumpHostId: profile.jumpHostId?.trim() || undefined,
       forwardAgent: profile.authMode === 'key' && Boolean(profile.forwardAgent),
+      tailcatEnabled: Boolean(profile.tailcatEnabled),
+      tailcatSshServer: Boolean(profile.tailcatSshServer),
+      herdrEnabled: profile.herdrEnabled !== false,
       herdrCommand: profile.herdrCommand.trim() || 'herdr',
       herdrSocketPath: profile.herdrSocketPath.trim(), sessionName: profile.sessionName.trim(),
       agentInstructions: profile.agentInstructions || '',
@@ -234,6 +238,9 @@ function createMockWhipSshModule() {
 
     const runtime = {
       runtimeId: config.runtimeId,
+      herdrEnabled: config.herdrEnabled !== false,
+      tailcatEnabled: config.ssh.tailcatAddress !== undefined,
+      matchesSshConfig: value => [...new Set([...Object.keys(config.ssh), ...Object.keys(value)])].every(key => config.ssh[key] === value[key]),
       controlClient: undefined,
       async connect() {
         await connectChain();
@@ -591,10 +598,24 @@ function createMockWhipSshModule() {
 
   return {
     __esModule: true,
+    createSecureId: jest.fn(prefix => {
+      nextUuid += 1;
+      return `${prefix}-00000000-0000-4000-8000-${nextUuid.toString().padStart(12, '0')}`;
+    }),
+    publicKeyVerificationCode: jest.fn(),
+    generateTailcatIdentity: jest.fn(() => {
+      nextUuid += 1;
+      return { privateKey: `privkey:${nextUuid.toString(16).padStart(64, '0')}`, publicKey: `nodekey:${nextUuid.toString(16).padStart(64, '0')}` };
+    }),
     createHostRuntime: api.createHostRuntime,
     getHostRuntime: api.getHostRuntime,
     disconnectHostRuntime: api.disconnectHostRuntime,
-    readCachedAgentTranscript: jest.fn(),
+    readSavedAgentTranscript: jest.fn(async () => undefined),
+    listSavedAgentTranscripts: jest.fn(async () => []),
+    deleteAgentTranscriptsForHost: jest.fn(async () => undefined),
+    clearAgentTranscriptCache: jest.fn(async () => undefined),
+    getAgentTranscriptCacheSize: jest.fn(async () => 0),
+    highlightCode: jest.fn(async () => ({ dark: [], light: [] })),
     HerdrAgentKind: { Claude: 0, Codex: 1, OpenCode: 2 },
     ReverseControlState: { Off: 0, RestartRequired: 1, Recovering: 2, Connected: 3 },
     subscribeReverseControlEvents: jest.fn(() => () => {}),

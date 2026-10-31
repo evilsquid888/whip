@@ -1,4 +1,5 @@
 jest.mock('../packages/react-native-whip-ssh/src/generated-entry', () => ({
+  ...require('../test-support/nativeGithubEnums').nativeGithubEnums,
   closeHerdrEventSubscription: jest.fn(),
   closeAllHerdrTerminalBridges: jest.fn(),
   closeHerdrTerminalBridge: jest.fn(),
@@ -7,6 +8,11 @@ jest.mock('../packages/react-native-whip-ssh/src/generated-entry', () => ({
   herdrTerminalScroll: jest.fn(),
   herdrControlRequest: jest.fn().mockResolvedValue({ tag: 'Ok' }),
   createHostRuntime: jest.fn(),
+  listSavedAgentTranscripts: jest.fn(),
+  readSavedAgentTranscript: jest.fn(),
+  deleteAgentTranscriptsForHost: jest.fn(),
+  clearAgentTranscriptCache: jest.fn(),
+  agentTranscriptCacheSize: jest.fn(),
   AppCore: jest.fn(),
   AppConnectionStatus: { Connecting: 0, Connected: 1, Ready: 2, Reconnecting: 3, Disconnected: 4, Error: 5 },
   ReverseControlState: { Off: 0, RestartRequired: 1, Recovering: 2, Connected: 3 },
@@ -26,6 +32,8 @@ jest.mock('../packages/react-native-whip-ssh/src/generated-entry', () => ({
     NeedsRepair: 3,
     Unknown: 4,
   },
+  HerdrInstallationStatus: { Installed: 0, Missing: 1, CustomCommandMissing: 2 },
+  HerdrInstallOutcome: { Succeeded: 0, Cancelled: 1 },
   AgentTranscriptKind: { Claude: 0, Codex: 1, OpenCode: 2 },
   AgentChatOpenResult_Tags: { Bound: 'Bound', NoChat: 'NoChat' },
   AgentChatStartResult_Tags: {
@@ -103,6 +111,7 @@ jest.mock('../packages/react-native-whip-ssh/src/generated-entry', () => ({
   },
   RuntimeDiagnosticOutcome: { Succeeded: 0, Failed: 1, Started: 2 },
   HerdrControlRequest: {
+    IntegrationList: { new: jest.fn(() => ({ tag: 'IntegrationList' })) },
     PaneGet: { new: jest.fn(inner => ({ tag: 'PaneGet', inner })) },
     WorkspaceFocus: {
       new: jest.fn(inner => ({ tag: 'WorkspaceFocus', inner })),
@@ -122,10 +131,17 @@ jest.mock('../packages/react-native-whip-ssh/src/generated-entry', () => ({
     AgentInfo: 'AgentInfo',
     AgentPrompted: 'AgentPrompted',
     IntegrationInstalled: 'IntegrationInstalled',
+    IntegrationList: 'IntegrationList',
     PaneZoom: 'PaneZoom',
     Ok: 'Ok',
   },
   HerdrAgentKind: { Claude: 0, Codex: 1, OpenCode: 2 },
+  HerdrIntegrationState: {
+    NotInstalled: 0,
+    Current: 1,
+    Outdated: 2,
+    NeedsRepair: 3,
+  },
   HerdrAgentSessionKind: { Id: 0, Path: 1 },
   HerdrAgentStatus: { Idle: 0, Working: 1, Blocked: 2, Done: 3, Unknown: 4 },
   HostSyncStatus: { Idle: 0, Syncing: 1, Synced: 2, Error: 3 },
@@ -226,7 +242,7 @@ jest.mock('../packages/react-native-whip-ssh/src/generated-entry', () => ({
   startHerdrTerminalBridge: jest.fn().mockResolvedValue(undefined),
 }));
 
-import { createHostRuntime, NativeAppCore, HerdrAgentKind, ReverseControlState } from '../packages/react-native-whip-ssh/src';
+import { createHostRuntime, NativeAppCore, HerdrAgentKind, ReverseControlState, pairHost, listSavedAgentTranscripts, readSavedAgentTranscript, deleteAgentTranscriptsForHost, getAgentTranscriptCacheSize, clearAgentTranscriptCache } from '../packages/react-native-whip-ssh/src';
 import {
   AgentTurnStatus,
   type AgentTranscriptTurn,
@@ -235,6 +251,39 @@ import {
 const mockGenerated = jest.requireMock(
   '../packages/react-native-whip-ssh/src/generated-entry',
 );
+
+test('cache controls expose native file size without truncating large caches', async () => {
+  const bytes = 5n * 1024n ** 3n;
+  mockGenerated.agentTranscriptCacheSize.mockResolvedValueOnce(bytes);
+  expect(await getAgentTranscriptCacheSize()).toBe(Number(bytes));
+  mockGenerated.clearAgentTranscriptCache.mockResolvedValueOnce(undefined);
+  await clearAgentTranscriptCache();
+  expect(mockGenerated.clearAgentTranscriptCache).toHaveBeenCalledTimes(1);
+});
+
+test('saved conversations expose typed metadata and offline projections directly from Rust', async () => {
+  mockGenerated.listSavedAgentTranscripts.mockResolvedValueOnce([{
+    key: 'opaque-key', namespace: 'host', agent: 1, sessionId: 'session',
+    updatedAt: 123n, cacheBytes: 456n,
+  }]);
+  expect(await listSavedAgentTranscripts()).toEqual([{
+    key: 'opaque-key', namespace: 'host', agent: 'codex', sessionId: 'session',
+    updatedAt: 123, cacheBytes: 456,
+  }]);
+  mockGenerated.readSavedAgentTranscript.mockResolvedValueOnce({
+    sessionId: 'session', agent: 1, revision: 2n, status: 2,
+    messages: [], turns: [],
+  });
+  expect(await readSavedAgentTranscript('host', 'codex', 'session')).toMatchObject({
+    agent: 'codex', sessionId: 'session', revision: 2, status: 'stale',
+  });
+  expect(mockGenerated.readSavedAgentTranscript).toHaveBeenCalledWith('host', 1, 'session');
+  mockGenerated.readSavedAgentTranscript.mockResolvedValueOnce(undefined);
+  expect(await readSavedAgentTranscript('host', 'codex', 'missing')).toBeUndefined();
+  mockGenerated.deleteAgentTranscriptsForHost.mockResolvedValueOnce(undefined);
+  await deleteAgentTranscriptsForHost('host');
+  expect(mockGenerated.deleteAgentTranscriptsForHost).toHaveBeenCalledWith('host');
+});
 const mockRuntimeEventSink =
   mockGenerated.setHostRuntimeEventSink.mock.calls[0][0];
 const mockAgentEventSink =
@@ -243,6 +292,95 @@ const mockAgentEventSink =
 describe('native HostRuntime adapter', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+  });
+
+  it.each([undefined, 'tc-secret-address'])('passes the Tailcat transport to Rust while preserving SSH identity: %s', address => {
+    const rustRuntime = {
+      runtimeId: () => `tailcat-mode-${Boolean(address)}`,
+      runtimeIncarnation: () => 1n,
+      tailcatEnabled: () => address !== undefined,
+    };
+    mockGenerated.createHostRuntime.mockReturnValueOnce(rustRuntime);
+    const runtime = createHostRuntime({
+      runtimeId: rustRuntime.runtimeId(),
+      ssh: { host: 'host.test', port: 2222, username: 'me', authMode: 'password', secret: 'secret', tailcatAddress: address },
+      jumpHosts: [], sessionName: '', herdrCommand: 'herdr',
+    });
+    expect(mockGenerated.createHostRuntime).toHaveBeenCalledWith(expect.objectContaining({
+      ssh: expect.objectContaining({ host: 'host.test', port: 2222, username: 'me', tailcatAddress: address }),
+    }));
+    expect(runtime.tailcatEnabled).toBe(address !== undefined);
+  });
+
+  it.each([undefined, true, false])('passes the Herdr mode to Rust with an enabled default: %s', enabled => {
+    const rustRuntime = {
+      runtimeId: () => `herdr-mode-${enabled}`,
+      runtimeIncarnation: () => 1n,
+      herdrEnabled: () => enabled !== false,
+    };
+    mockGenerated.createHostRuntime.mockReturnValueOnce(rustRuntime);
+    const runtime = createHostRuntime({
+      runtimeId: rustRuntime.runtimeId(),
+      ssh: { host: 'host.test', port: 22, username: 'me', authMode: 'password', secret: 'secret' },
+      jumpHosts: [], sessionName: '', herdrCommand: 'herdr', herdrEnabled: enabled,
+    });
+    expect(mockGenerated.createHostRuntime).toHaveBeenCalledWith(expect.objectContaining({ herdrEnabled: enabled !== false }));
+    expect(runtime.herdrEnabled).toBe(enabled !== false);
+  });
+
+  it('preserves the reviewed command and prepares the chosen terminal before waiting for completion', async () => {
+    const command = 'download installer\nrun installer';
+    const rustRuntime = {
+      runtimeId: () => 'installer-host',
+      runtimeIncarnation: () => 1n,
+      herdrSetup: jest.fn(async () => ({ status: mockGenerated.HerdrInstallationStatus.Missing, installCommand: command })),
+      prepareHerdrInstallation: jest.fn(),
+      installHerdr: jest.fn(async () => mockGenerated.HerdrInstallOutcome.Succeeded),
+    };
+    mockGenerated.createHostRuntime.mockReturnValueOnce(rustRuntime);
+    const runtime = createHostRuntime({ runtimeId: 'installer-host', ssh: { host: 'host', port: 22, username: 'me', authMode: 'password', secret: 'test' }, jumpHosts: [], sessionName: 'main', herdrCommand: 'herdr' });
+    await expect(runtime.herdrSetup()).resolves.toEqual({ status: 'missing', installCommand: command });
+    expect(rustRuntime.installHerdr).not.toHaveBeenCalled();
+    runtime.prepareHerdrInstallation('install-one');
+    expect(rustRuntime.prepareHerdrInstallation).toHaveBeenCalledWith('install-one');
+    await expect(runtime.installHerdr('install-one')).resolves.toBe('succeeded');
+    expect(rustRuntime.installHerdr).toHaveBeenCalledWith('install-one');
+    expect(rustRuntime.installHerdr).toHaveBeenCalledTimes(1);
+  });
+  it('passes pairing jump credentials through the typed bridge and preserves host trust challenges', async () => {
+    const challenge = { host: 'jump.test', port: 22, keyType: 'ssh-ed25519', publicKey: 'ssh-ed25519 AAAA', fingerprint: 'SHA256:test' };
+    mockGenerated.pairHost.mockRejectedValueOnce({ tag: 'HostKeyUnknown', inner: [challenge] });
+    await expect(pairHost('code', 'key', 'phone', [{ host: 'jump.test', port: 22, username: 'alice', authMode: 'password', secret: 'password' }])).rejects.toMatchObject({ code: 'HOST_KEY_UNKNOWN', details: challenge });
+    expect(mockGenerated.pairHost).toHaveBeenCalledWith('code', 'key', 'phone', [{ host: 'jump.test', port: 22, username: 'alice', credential: { tag: 'Password', inner: { password: 'password' } }, forwardAgent: false, tailcatSshServer: false }]);
+  });
+
+  it('preserves the underlying Git failure when opening a changed file', async () => {
+    const detail = 'git diff failed: fish: Missing end to balance this if statement';
+    const rustRuntime = {
+      runtimeId: () => 'git-error-runtime',
+      runtimeIncarnation: () => 1n,
+      gitDiffReview: jest.fn().mockRejectedValue(Object.assign(
+        new Error('HostRuntimeError.GitFailure'),
+        { tag: 'GitFailure', inner: Object.freeze([detail]) },
+      )),
+    };
+    mockGenerated.createHostRuntime.mockReturnValueOnce(rustRuntime);
+    const runtime = createHostRuntime({
+      runtimeId: 'git-error-runtime',
+      ssh: { host: 'host.test', port: 22, username: 'me', authMode: 'password', secret: 'secret' },
+      jumpHosts: [], sessionName: 'main', herdrCommand: 'herdr',
+    });
+    try {
+      await expect(runtime.gitDiff(
+        { root: '/repo', hasHead: true },
+        { path: 'src/file.tsx', absolutePath: '/repo/src/file.tsx', originalPath: null, indexStatus: ' ', worktreeStatus: 'M' },
+        'compact',
+      )).rejects.toMatchObject({
+        name: 'HostRuntimeError', message: detail, nativeTag: 'GitFailure',
+      });
+    } finally {
+      runtime.detach();
+    }
   });
 
   it.each(['agentIntegrationStatus', 'installAgentIntegration'] as const)(
@@ -280,6 +418,45 @@ describe('native HostRuntime adapter', () => {
       }
     },
   );
+
+  it('preserves repair status in integration lists and agent status lookups', async () => {
+    const rustRuntime = {
+      runtimeId: () => 'integration-repair-runtime',
+      runtimeIncarnation: () => 1n,
+      agentIntegrationStatus: jest.fn().mockResolvedValue(
+        mockGenerated.AgentIntegrationStatus.NeedsRepair,
+      ),
+      controlRequest: jest.fn().mockResolvedValue({
+        tag: 'IntegrationList',
+        inner: {
+          integrations: [{
+            target: 'codex', label: 'Codex', command: 'codex', available: true,
+            state: mockGenerated.HerdrIntegrationState.NeedsRepair,
+          }],
+        },
+      }),
+    };
+    mockGenerated.createHostRuntime.mockReturnValueOnce(rustRuntime);
+    const runtime = createHostRuntime({
+      runtimeId: 'integration-repair-runtime',
+      ssh: { host: 'host.test', port: 22, username: 'me', authMode: 'password', secret: 'secret' },
+      jumpHosts: [], sessionName: 'main', herdrCommand: 'herdr',
+    });
+    try {
+      await expect(runtime.agentIntegrationStatus('codex')).resolves.toBe('needs-repair');
+      expect(rustRuntime.agentIntegrationStatus).toHaveBeenCalledWith(HerdrAgentKind.Codex);
+      await expect(runtime.requestHerdrApi({ method: 'integration.list', params: {} })).resolves.toEqual({
+        type: 'integration_list',
+        integrations: [{
+          target: 'codex', label: 'Codex', command: 'codex', available: true,
+          state: 'needs_repair',
+        }],
+      });
+      expect(rustRuntime.controlRequest).toHaveBeenCalledWith({ tag: 'IntegrationList' });
+    } finally {
+      runtime.detach();
+    }
+  });
 
   it('gets one pane and its scroll metadata without refreshing host state', async () => {
     const rustRuntime = {
@@ -867,7 +1044,7 @@ describe('native HostRuntime adapter', () => {
     });
   });
 
-  it.each([[1, 'codex'], [2, 'opencode'], [0, 'claude']] as const)('projects native %s (%s) snapshots and callbacks without JSON', (nativeAgent, agent) => {
+  it.each([[1, 'codex'], [2, 'opencode'], [0, 'claude']] as const)('projects native %s (%s) snapshots and callbacks without JSON', async (nativeAgent, agent) => {
     const nativeState = {
       sessionId: 'session-1',
       agent: nativeAgent,
@@ -964,7 +1141,6 @@ describe('native HostRuntime adapter', () => {
       agentTranscript: jest.fn(() => nativeState),
       detachAgentChat: jest.fn(() => undefined),
       acceptsAgentTranscriptEvent: jest.fn(() => true),
-      confirmAgentTranscriptCache: jest.fn(() => true),
     };
     mockGenerated.createHostRuntime.mockReturnValueOnce(rustRuntime);
     const runtime = createHostRuntime({
@@ -984,7 +1160,7 @@ describe('native HostRuntime adapter', () => {
     const result = runtime.openAgentChat('terminal-1', handler);
     if (result.type !== 'bound') throw new Error('expected binding');
     const current = runtime.currentAgentChat('terminal-1', handler);
-    const started = runtime.startAgentChat(result.binding.bindingToken);
+    const started = await runtime.startAgentChat(result.binding.bindingToken);
 
     expect(current?.bindingToken).toBe('binding-1');
     expect(runtime.agentChatBindingIsCurrent('terminal-1', 'binding-1', 1)).toBe(true);
@@ -1049,12 +1225,6 @@ describe('native HostRuntime adapter', () => {
         revision: 4n,
         deltas: [{ tag: 'Reset', inner: { state: nativeState } }],
       },
-      cacheWrite: {
-        namespace: 'runtime-agent',
-        key: 'cache',
-        blob: new Uint8Array([1, 2]).buffer,
-        confirmationToken: 'token',
-      },
     });
     expect(handler).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -1063,7 +1233,6 @@ describe('native HostRuntime adapter', () => {
         deltas: [
           { type: 'reset', state: expect.objectContaining({ revision: 4 }) },
         ],
-        cacheWrite: expect.objectContaining({ confirmationToken: 'token' }),
       }),
     );
     handler.mockClear();
@@ -1074,14 +1243,12 @@ describe('native HostRuntime adapter', () => {
       runtimeId: 'runtime-agent', runtimeIncarnation: 7n, operationEpoch: 1n,
       key: 'codex:session-1',
       update: { revision: 99n, deltas: [{ tag: 'StatusChanged', inner: { status: 5 } }] },
-      cacheWrite: { namespace: 'runtime-agent', key: 'cache', blob: new Uint8Array([9]).buffer, confirmationToken: 'old' },
     });
     expect(handler).not.toHaveBeenCalled();
     mockAgentEventSink.event({
       runtimeId: 'runtime-agent',
       runtimeIncarnation: 7n,
       key: 'codex:session-1',
-      cacheWrite: undefined,
       update: {
         revision: 5n,
         deltas: [
@@ -1093,7 +1260,6 @@ describe('native HostRuntime adapter', () => {
       runtimeId: 'runtime-agent',
       runtimeIncarnation: 7n,
       key: 'codex:session-1',
-      cacheWrite: undefined,
       update: { revision: 6n, deltas: [] },
     });
     expect(handler).toHaveBeenCalledTimes(1);
@@ -1159,7 +1325,6 @@ describe('native HostRuntime adapter', () => {
       runtimeId: 'runtime-agent-reused',
       runtimeIncarnation: 11n,
       key: 'codex:session-1',
-      cacheWrite: undefined,
       update: { revision: 2n, deltas: [] },
     });
     expect(oldHandler).toHaveBeenCalledTimes(1);
@@ -1170,14 +1335,12 @@ describe('native HostRuntime adapter', () => {
       runtimeId: 'runtime-agent-reused',
       runtimeIncarnation: 11n,
       key: 'codex:session-1',
-      cacheWrite: undefined,
       update: { revision: 3n, deltas: [] },
     });
     mockAgentEventSink.event({
       runtimeId: 'runtime-agent-reused',
       runtimeIncarnation: 12n,
       key: 'codex:session-1',
-      cacheWrite: undefined,
       update: { revision: 2n, deltas: [] },
     });
     expect(oldHandler).toHaveBeenCalledTimes(1);
@@ -1189,7 +1352,7 @@ describe('native HostRuntime adapter', () => {
 test('AppCore and Herd retain typed native agent controls in their projections', () => {
   const control = {
     terminalId: 'terminal-1', kind: HerdrAgentKind.Codex, sessionId: 'conversation',
-    reverseControl: true, connected: false,
+    reverseControl: true, shizukuAccess: false, connected: false,
     reverseControlState: ReverseControlState.Recovering,
   };
   const nativeCore = {

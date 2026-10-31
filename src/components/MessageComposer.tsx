@@ -6,10 +6,14 @@ import {
   findNodeHandle,
   View,
   type ColorValue,
-  type TextInput as TextInputHandle,
+  type TextInputInstance,
 } from 'react-native';
 
-import { APP_GLASS_FLOATING_CONTROL_CLASS } from '../lib/appGlass';
+import {
+  APP_GLASS_BORDER_CLASS_NAME,
+  APP_GLASS_FLOATING_CONTROL_CLASS,
+  COMPOSER_GLASS_SURFACE_PROPS,
+} from '../lib/appGlass';
 import { cn } from '../lib/utils';
 import { hapticSend } from '../services/interactionFeedback';
 import { watchComposerFont } from '../services/composerFont';
@@ -45,7 +49,7 @@ export function ComposerInput({
   ...props
 }: ComposerInputProps) {
   const nativeInitialValue = useRef(initialValue).current;
-  const input = useRef<TextInputHandle | null>(null);
+  const input = useRef<TextInputInstance | null>(null);
   const laidOut = useRef(false);
   const fontBinding = useRef<{ tag: number; stop: () => void } | null>(null);
   const binding = useRef<{ tag: number; stop: () => void } | null>(null);
@@ -55,7 +59,7 @@ export function ComposerInput({
   const connect = useCallback(() => {
     if (!laidOut.current) return;
     const tag = findNodeHandle(input.current);
-    if (tag === null) return;
+    if (tag == null) return;
     if (fontBinding.current?.tag !== tag) {
       fontBinding.current?.stop();
       fontBinding.current = { tag, stop: watchComposerFont(tag) };
@@ -90,7 +94,7 @@ export function ComposerInput({
       binding.current = null;
     };
   }, [connect]);
-  const setInputRef = useCallback((handle: TextInputHandle | null) => {
+  const setInputRef = useCallback((handle: TextInputInstance | null) => {
     input.current = handle;
     if (typeof ref === 'function') ref(handle);
     else if (ref) ref.current = handle;
@@ -150,7 +154,7 @@ interface MessageComposerProps extends ComposerInputProps {
   className?: string;
   glass?: boolean;
   inputClassName?: string;
-  inputRef?: Ref<TextInputHandle>;
+  inputRef?: Ref<TextInputInstance>;
   surfaceClassName?: string;
 }
 
@@ -180,7 +184,7 @@ export function MessageComposer({
       <ComposerInput
         {...inputProps}
         ref={inputRef}
-        className={cn('rounded-none border-0 bg-transparent shadow-none', inputClassName)}
+        className={cn('rounded-none border-0 bg-transparent dark:bg-transparent shadow-none', inputClassName)}
       />
     </>
   );
@@ -219,10 +223,11 @@ export function MessageComposer({
       {glass ? (
         <GlassSurface
           className={cn(
-            'min-w-0 flex-1 overflow-hidden rounded-[38px] border border-white/30 dark:border-white/10',
+            'min-w-0 flex-1 overflow-hidden rounded-[38px]',
+            APP_GLASS_BORDER_CLASS_NAME,
             surfaceClassName,
           )}
-          intensity={44}
+          {...COMPOSER_GLASS_SURFACE_PROPS}
         >
           {surfaceContent}
         </GlassSurface>

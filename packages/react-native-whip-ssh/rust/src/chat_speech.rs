@@ -71,6 +71,29 @@ impl ChatSpeechQueue {
     pub fn next(&self) -> Option<String> {
         self.state.lock().pending.pop_front()
     }
+
+    /// Read all assistant prose in the selected response, in transcript order.
+    /// Tool calls and reasoning never enter the prose adapter.
+    pub fn read_response(
+        &self,
+        agent: AgentTranscriptKind,
+        messages: Vec<ChatSpeechMessage>,
+    ) -> bool {
+        let mut state = self.state.lock();
+        state.pending.clear();
+        for message in messages {
+            if !message.assistant || (agent != AgentTranscriptKind::Codex && !message.completed) {
+                continue;
+            }
+            state.pending.extend(
+                message
+                    .prose
+                    .iter()
+                    .flat_map(|part| speech_chunks(&spoken_prose(&part.text))),
+            );
+        }
+        !state.pending.is_empty()
+    }
 }
 
 // Keep each utterance below Android's 4,000 UTF-16-unit limit, including emoji.
@@ -244,6 +267,49 @@ mod tests {
             vec![user, message("tool", true, "")],
         );
         assert_eq!(queue.next(), None);
+    }
+
+    #[test]
+    fn manual_reading_reads_all_selected_prose_in_order_and_can_replay_it() {
+        for agent in [
+            AgentTranscriptKind::Claude,
+            AgentTranscriptKind::Codex,
+            AgentTranscriptKind::OpenCode,
+        ] {
+            let queue = ChatSpeechQueue::new();
+            let messages = || {
+                let mut user = message("user", true, "User prompt");
+                user.assistant = false;
+                vec![
+                    message("progress", true, "First part of the response"),
+                    message("reply", true, "**Final** [reply](https://example.com)"),
+                    message("tool-only", true, ""),
+                    message("code-only", true, "```sh\nsecret\n```"),
+                    user,
+                ]
+            };
+            for _ in 0..2 {
+                assert!(queue.read_response(agent, messages()));
+                assert_eq!(queue.next().as_deref(), Some("First part of the response"));
+                assert_eq!(queue.next().as_deref(), Some("Final reply"));
+                assert_eq!(queue.next(), None);
+            }
+        }
+    }
+
+    #[test]
+    fn manual_reading_waits_for_completion_except_finalized_codex_parts() {
+        for agent in [AgentTranscriptKind::Claude, AgentTranscriptKind::OpenCode] {
+            let queue = ChatSpeechQueue::new();
+            assert!(!queue.read_response(agent, vec![message("stream", false, "Partial")]));
+            assert_eq!(queue.next(), None);
+        }
+        let queue = ChatSpeechQueue::new();
+        assert!(queue.read_response(
+            AgentTranscriptKind::Codex,
+            vec![message("turn", false, "Finalized response item")]
+        ));
+        assert_eq!(queue.next().as_deref(), Some("Finalized response item"));
     }
 
     #[test]

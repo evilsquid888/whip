@@ -1,8 +1,9 @@
+/** Compatibility callback shape; native renderer output normally uses Rust batches. */
 export interface TerminalFrame {
   type: 'terminal.frame';
   /** Per terminal-ANSI client frame number; chunks of one frame share a seq. */
   seq: number;
-  /** Herdr frames are raw ANSI byte views; compatibility frames may still use strings or buffers. */
+  /** ANSI strings are already base64 encoded in Rust; binary views remain raw bytes. */
   encoding: 'ansi' | 'utf8';
   width: number;
   height: number;
@@ -24,6 +25,15 @@ export interface TerminalClosed {
   reason?: string;
 }
 
+/** Kitty graphics output is ordered with text, but has no text-frame sequence. */
+export interface TerminalGraphics {
+  type: 'terminal.graphics';
+  /** Strings contain base64; binary views contain the original protocol bytes. */
+  bytes: TerminalFrame['bytes'];
+}
+
+export type TerminalOutput = TerminalFrame | TerminalGraphics;
+
 export interface TerminalProtocolState {
   kittyKeyboardReportAll: boolean;
 }
@@ -34,4 +44,4 @@ export type TerminalControlEvent =
   | { type: 'clipboard-write'; text: string }
   | { type: 'title'; title: string };
 
-export type TerminalBridgeEvent = TerminalFrame | TerminalClosed;
+export type TerminalBridgeEvent = TerminalOutput | TerminalClosed;

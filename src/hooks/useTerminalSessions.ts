@@ -1,4 +1,5 @@
-import { useCallback, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { AppState } from 'react-native';
 import type {
   AppCoreProjection,
   NativeAppCore,
@@ -11,12 +12,10 @@ import {
   type TerminalSessionStatus,
 } from '../terminalSessions';
 import type { PaneInfo } from '../types';
-import {
-  loadPersistedTerminals,
-  PersistedTerminalsWriter,
-} from '../services/persistedTerminals';
+import { loadPersistedTerminals } from '../services/persistedTerminals';
 import { reportBackgroundFailure } from '../services/backgroundOperations';
 import { TerminalComposerStore } from '../lib/terminalComposerStore';
+import { TerminalComposerPersistence } from '../services/terminalComposerPersistence';
 
 type CoreBinding = {
   core: NativeAppCore;
@@ -27,12 +26,28 @@ type CoreBinding = {
 export function useTerminalSessions() {
   const coreBindingRef = useRef<CoreBinding | null>(null);
   const [composerStore] = useState(() => new TerminalComposerStore());
+  const [composerPersistence] = useState(
+    () => new TerminalComposerPersistence(composerStore),
+  );
   const [fontSizes, setFontSizes] = useState<ReadonlyMap<string, number>>(
     () => new Map(),
   );
   const fontSizesRef = useRef(fontSizes);
-  const restoredSessionsRef = useRef(new Set<string>());
-  const writerRef = useRef(new PersistedTerminalsWriter());
+
+  useEffect(() => {
+    composerPersistence.start();
+    const subscription = AppState.addEventListener('change', state => {
+      if (state !== 'active')
+        reportBackgroundFailure(
+          composerPersistence.flush(),
+          'terminal-composers-background-flush',
+        );
+    });
+    return () => {
+      subscription.remove();
+      composerPersistence.dispose();
+    };
+  }, [composerPersistence]);
 
   const bindAppCore = useCallback(
     (core: NativeAppCore, commit: (view: AppCoreProjection) => void) => {
@@ -71,32 +86,41 @@ export function useTerminalSessions() {
     [requireCore],
   );
 
-  const persistProjection = useCallback((view: AppCoreProjection) => {
-    for (const session of view.sessions) {
-      // Placeholders must not overwrite storage before their first restore.
-      if (!restoredSessionsRef.current.has(session.id)) continue;
-      const prefix = `${session.id}:`;
-      const sizes = new Map(
-        [...fontSizesRef.current].flatMap(([key, size]) =>
-          key.startsWith(prefix)
-            ? [[key.slice(prefix.length), size] as const]
-            : [],
-        ),
+  const persistProjection = useCallback(
+    (view: AppCoreProjection) => {
+      composerPersistence.retainSessions(
+        new Set(view.sessions.map(session => session.id)),
       );
-      reportBackgroundFailure(
-        writerRef.current.saveIfChanged(
-          session.id,
-          session.hostId,
-          session.terminalRail.resumeBlob,
-          sizes,
-        ),
-        'terminal-sessions-persist',
-      );
-    }
-    writerRef.current.retainSessions(
-      new Set(view.sessions.map(session => session.id)),
-    );
-  }, []);
+      for (const session of view.sessions) {
+        reportBackgroundFailure(
+          composerPersistence.bind(session.id, session.hostId),
+          'terminal-composers-restore',
+        );
+        if (session.connectionStatus === 'ready')
+          composerPersistence.retain(
+            session.id,
+            new Set(
+              session.terminalRail.terminals.map(
+                terminal => terminal.terminalId,
+              ),
+            ),
+          );
+        const prefix = `${session.id}:`;
+        const sizes = new Map(
+          [...fontSizesRef.current].flatMap(([key, size]) =>
+            key.startsWith(prefix)
+              ? [[key.slice(prefix.length), size] as const]
+              : [],
+          ),
+        );
+        reportBackgroundFailure(
+          requireCore().core.persistSessionTerminals(session.id, sizes),
+          'terminal-sessions-persist',
+        );
+      }
+    },
+    [composerPersistence, requireCore],
+  );
 
   const restore = useCallback(
     async (
@@ -104,7 +128,12 @@ export function useTerminalSessions() {
       hostId: string,
       isCurrent: () => boolean,
     ): Promise<TerminalSessionsState> => {
-      const persisted = await loadPersistedTerminals(hostId);
+      const composerRestore = composerPersistence.bind(sessionId, hostId);
+      reportBackgroundFailure(composerRestore, 'terminal-composers-restore');
+      const [persisted] = await Promise.all([
+        loadPersistedTerminals(hostId),
+        Promise.allSettled([composerRestore]),
+      ]);
       if (!isCurrent()) return emptyTerminalSessions;
       const next = new Map(fontSizesRef.current);
       for (const [terminalId, fontSize] of persisted.fontSizes) {
@@ -117,26 +146,25 @@ export function useTerminalSessions() {
         sessionId,
         persisted.resumeBlob ?? undefined,
       );
-      restoredSessionsRef.current.add(sessionId);
       commit(view);
       return get(sessionId, view);
     },
-    [get, requireCore],
+    [composerPersistence, get, requireCore],
   );
 
   const remove = useCallback(
     (sessionId: string) => {
       persistProjection(requireCore().core.view());
-      restoredSessionsRef.current.delete(sessionId);
       const next = new Map(fontSizesRef.current);
       for (const key of next.keys()) {
         if (key.startsWith(`${sessionId}:`)) next.delete(key);
       }
+      composerPersistence.detach(sessionId);
       composerStore.removeSession(sessionId);
       fontSizesRef.current = next;
       setFontSizes(next);
     },
-    [composerStore, persistProjection, requireCore],
+    [composerPersistence, composerStore, persistProjection, requireCore],
   );
 
   const openPane = useCallback(
@@ -148,9 +176,24 @@ export function useTerminalSessions() {
   );
 
   const openSshShell = useCallback(
-    (sessionId: string, title = 'SSH shell') => {
+    (
+      sessionId: string,
+      title = 'SSH shell',
+      prepare?: (terminalId: string) => void,
+    ) => {
       const { core, commit } = requireCore();
-      commit(core.openSshShell(sessionId, title));
+      const view = core.openSshShell(sessionId, title);
+      const terminalId = view.sessions.find(session => session.id === sessionId)
+        ?.terminalRail.activeTerminalId;
+      if (!terminalId) throw new Error('SSH terminal could not be created');
+      try {
+        prepare?.(terminalId);
+      } catch (error) {
+        commit(core.closeTerminal(sessionId, terminalId));
+        throw error;
+      }
+      commit(view);
+      return terminalId;
     },
     [requireCore],
   );
@@ -174,9 +217,18 @@ export function useTerminalSessions() {
   const close = useCallback(
     (sessionId: string, terminalId: string) => {
       const { core, commit } = requireCore();
-      commit(core.closeTerminal(sessionId, terminalId));
+      const view = core.closeTerminal(sessionId, terminalId);
+      commit(view);
+      const rail = view.sessions.find(
+        session => session.id === sessionId,
+      )?.terminalRail;
+      if (rail)
+        composerPersistence.retain(
+          sessionId,
+          new Set(rail.terminals.map(terminal => terminal.terminalId)),
+        );
     },
-    [requireCore],
+    [composerPersistence, requireCore],
   );
 
   const updateLifecycle = useCallback(
@@ -242,6 +294,14 @@ export function useTerminalSessions() {
     [persistProjection, requireCore],
   );
 
+  const selectChat = useCallback(
+    (sessionId: string, terminalId: string, selected: boolean) => {
+      const { core, commit } = requireCore();
+      commit(core.selectTerminalChat(sessionId, terminalId, selected));
+    },
+    [requireCore],
+  );
+
   return useMemo(
     () => ({
       fontSizes,
@@ -258,6 +318,7 @@ export function useTerminalSessions() {
       updateLifecycle,
       updateStatus,
       updateFontSize,
+      selectChat,
       composerStore,
     }),
     [
@@ -274,6 +335,7 @@ export function useTerminalSessions() {
       restore,
       fontSizes,
       updateFontSize,
+      selectChat,
       updateLifecycle,
       updateStatus,
     ],

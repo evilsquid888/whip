@@ -111,7 +111,7 @@ describe('floating chrome geometry', () => {
     });
   });
 
-  test('moves the terminal only when the cursor enters keyboard and control clearance', () => {
+  test('moves ordinary terminal input above the keyboard and restores the full canvas when closed', () => {
     const layout = (cursorBottom: number | null, keyboardInset = 300, composerVisible = false) =>
       terminalViewportLayout({
         composerExpanded: false,

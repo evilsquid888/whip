@@ -7,8 +7,9 @@
   <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; img-src data: https: http:; font-src 'self'">
   <style>
     /* WHIP_PREVIEW_FONT_FACES */
+    /* WHIP_DIAGRAM_STYLES */
     * { box-sizing: border-box; }
-    html { color-scheme: dark; overflow-wrap: anywhere; }
+    html { color-scheme: dark; overflow-wrap: anywhere; background: var(--canvas, transparent); }
     body { margin: 0; padding: 20px; background: var(--canvas); color: var(--foreground); font: 15px/1.6 var(--whip-preview-font-family); }
     main > :first-child { margin-top: 0; }
     p, ul, ol, pre, table, blockquote { margin: 0 0 16px; }
@@ -36,6 +37,7 @@
   <main id="markdown"></main>
   <script src="marked.umd.js"></script>
   <script src="purify.min.js"></script>
+  <script src="diagram-renderer.js"></script>
   <script src="markdown-preview.js"></script>
 </body>
 </html>

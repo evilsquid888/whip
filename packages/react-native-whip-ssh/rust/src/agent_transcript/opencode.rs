@@ -7,8 +7,18 @@ use serde_json::{Map, Value};
 
 use super::history_gate::{InitialHistoryGate, advance_revision};
 use super::metadata::{provider_details, tool_input_json};
-use super::model::*;
-use super::projection::*;
+use super::model::{
+    AgentCacheError, AgentDiagnosticSeverity, AgentFileDiff, AgentMessageRole, AgentToolDiagnostic,
+    AgentToolState, AgentToolStatus, AgentTranscriptDelta, AgentTranscriptDetails,
+    AgentTranscriptInfo, AgentTranscriptKind, AgentTranscriptMessage, AgentTranscriptPart,
+    AgentTranscriptState, AgentTranscriptStatus, AgentTranscriptTurn, AgentTranscriptUpdate,
+    AgentTranscriptView, AgentTurnOutcome, AgentTurnStatus,
+};
+use super::projection::{
+    aggregate_turn, canonical_tool_name, detail, legacy_change_files, nonempty,
+    normalize_user_images, object, parse_tool_status, project_turns, questions_from_input,
+    timestamp_ms, tool_input, unified_diff_files,
+};
 
 mod v2;
 #[cfg(test)]
@@ -209,6 +219,18 @@ impl OpenCodeSessionCore {
         self.committed_cursor
     }
 
+    pub fn status(&self) -> AgentTranscriptStatus {
+        self.history_gate.status()
+    }
+
+    pub(crate) fn projection_view(&self) -> AgentTranscriptView<'_> {
+        AgentTranscriptView {
+            revision: self.revision,
+            messages: &self.messages,
+            turns: &self.turns,
+        }
+    }
+
     pub fn state(&self) -> AgentTranscriptState {
         let mut messages = self.messages.clone();
         for message in &mut messages {
@@ -218,7 +240,7 @@ impl OpenCodeSessionCore {
             session_id: self.session_id.clone(),
             agent: AgentTranscriptKind::OpenCode,
             revision: self.revision,
-            status: self.history_gate.status(),
+            status: self.status(),
             info: self.info.clone(),
             messages,
             turns: self.turns.clone(),
@@ -869,7 +891,10 @@ fn open_code_session_info(info: &Map<String, Value>) -> AgentTranscriptInfo {
     let time = object(info.get("time"));
     AgentTranscriptInfo {
         id: nonempty(info.get("id")).unwrap_or_default().to_owned(),
-        title: nonempty(info.get("title")).map(str::to_owned),
+        title: info
+            .get("title")
+            .and_then(Value::as_str)
+            .and_then(super::title::session_title),
         directory: nonempty(info.get("directory")).map(str::to_owned),
         created_at_ms: time.and_then(|time| timestamp_ms(time.get("created"))),
         updated_at_ms: time.and_then(|time| timestamp_ms(time.get("updated"))),
@@ -1208,6 +1233,7 @@ fn open_code_u64(value: Option<&Value>) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_transcript::projection::fields;
 
     fn text_parts(state: &AgentTranscriptState, role: AgentMessageRole) -> Vec<String> {
         state
@@ -1413,6 +1439,46 @@ mod tests {
     }
 
     #[test]
+    fn session_title_updates_are_metadata_only_and_reject_other_sessions() {
+        let mut core = OpenCodeSessionCore::new("ses_messages");
+        core.bootstrap(
+            0,
+            &serde_json::json!({
+                "info": { "id": "ses_messages", "title": "Export title" }, "messages": []
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            core.state().info.unwrap().title.as_deref(),
+            Some("Export title")
+        );
+        for (seq, id, title, expected) in [
+            (
+                1,
+                "ses_messages",
+                " Initial\n title ",
+                Some("Initial title"),
+            ),
+            (2, "ses_messages", "Updated title", Some("Updated title")),
+            (3, "ses_other", "Wrong conversation", Some("Updated title")),
+            (4, "ses_messages", " \t ", None),
+        ] {
+            core.apply_events_incremental(
+                seq,
+                &serde_json::json!([{
+                    "seq": seq, "type": "session.updated.1",
+                    "data": { "info": { "id": id, "title": title } }
+                }])
+                .to_string(),
+            )
+            .unwrap();
+            assert_eq!(core.state().info.unwrap().title.as_deref(), expected);
+            assert!(core.state().messages.is_empty());
+        }
+    }
+
+    #[test]
     fn live_user_image_paths_replace_and_remove_with_the_provider_part() {
         let mut core = open_code_message_test_core();
         for (sequence, filename) in [(1, "cat.png"), (2, "dog.png")] {
@@ -1448,7 +1514,6 @@ mod tests {
         let mut core = open_code_message_test_core();
         let before = core.state();
         let revision = core.revision();
-        let parts_ptr = core.messages[2].parts.as_ptr();
         let events = open_code_message_updated_event(
             1,
             serde_json::json!({
@@ -1460,14 +1525,12 @@ mod tests {
         assert!(core.apply_events_incremental(1, &events).unwrap().is_none());
         assert_eq!(core.revision(), revision);
         assert_eq!(core.state(), before);
-        assert_eq!(core.messages[2].parts.as_ptr(), parts_ptr);
     }
 
     #[test]
     fn opencode_message_metadata_update_preserves_existing_parts() {
         let mut core = open_code_message_test_core();
-        let before = core.messages[2].clone();
-        let parts_ptr = core.messages[2].parts.as_ptr();
+        let before = core.state().messages[2].clone();
         let events = open_code_message_updated_event(
             1,
             serde_json::json!({
@@ -1492,7 +1555,8 @@ mod tests {
                 if turn.id == "user-1" && turn.completed_at_ms == Some(20)
         ));
 
-        let current = &core.messages[2];
+        let state = core.state();
+        let current = &state.messages[2];
         assert_eq!(current.id, before.id);
         assert_eq!(current.role, before.role);
         assert_eq!(current.parent_id, before.parent_id);
@@ -1501,13 +1565,11 @@ mod tests {
         assert_eq!(current.error, before.error);
         assert_eq!(current.diffs, before.diffs);
         assert_eq!(current.parts, before.parts);
-        assert_eq!(current.parts.as_ptr(), parts_ptr);
     }
 
     #[test]
-    fn opencode_parent_change_rebuilds_turns_and_indexes() {
+    fn opencode_parent_change_moves_message_to_new_turn() {
         let mut core = open_code_message_test_core();
-        let parts_ptr = core.messages[2].parts.as_ptr();
         let events = open_code_message_updated_event(
             1,
             serde_json::json!({
@@ -1530,11 +1592,9 @@ mod tests {
             &update.deltas[1],
             AgentTranscriptDelta::TurnsTruncated { length: 0 }
         ));
-        assert_eq!(core.turns[0].assistant_message_ids, Vec::<String>::new());
-        assert_eq!(core.turns[1].assistant_message_ids, ["assistant"]);
-        assert_eq!(core.message_indexes.get("assistant"), Some(&2));
-        assert_eq!(core.message_turns.get("assistant"), Some(&1));
-        assert_eq!(core.messages[2].parts.as_ptr(), parts_ptr);
+        let state = core.state();
+        assert!(state.turns[0].assistant_message_ids.is_empty());
+        assert_eq!(state.turns[1].assistant_message_ids, ["assistant"]);
     }
 
     #[test]

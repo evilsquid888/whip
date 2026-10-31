@@ -1,5 +1,9 @@
+const projectBuildDirectories = require('./scripts/project-build-directories.cjs');
+const workerProjects = require('./scripts/worker-projects.cjs');
+
 module.exports = {
   modulePathIgnorePatterns: [
+    ...projectBuildDirectories.map(directory => `<rootDir>/${directory}/`),
     '<rootDir>/.codex-',
     '<rootDir>/.codex/',
     '<rootDir>/.worktrees/',
@@ -7,9 +11,9 @@ module.exports = {
   ],
   moduleNameMapper: {
     '^@/(.*)$': '<rootDir>/$1',
-    '^expo-crypto$': '<rootDir>/__mocks__/expo-crypto.js',
   },
   preset: '@react-native/jest-preset',
+  setupFilesAfterEnv: ['<rootDir>/jest.setup.js'],
   // jsdom's encoding, HTML parser, and CSS dependencies now ship ES modules.
   transform: {
     '^.+\\.mjs$': 'babel-jest',
@@ -17,9 +21,10 @@ module.exports = {
   // Match the innermost node_modules to transform nested ES modules while
   // leaving jsdom's CommonJS internals untouched.
   transformIgnorePatterns: [
-    'node_modules/(?!((jest-)?react-native|@react-native(-community)?|@exodus/bytes|parse5|entities|@asamuzakjp|@csstools)/)(?!.*node_modules/)',
+    'node_modules/(?!((jest-)?react-native|react-native-css-interop|react-native-keyboard-controller|nativewind|@react-native(-community)?|@rn-primitives/(portal|slot)|expo/virtual|@exodus/bytes|parse5|entities|@asamuzakjp|@csstools)/)(?!.*node_modules/)',
   ],
   testPathIgnorePatterns: [
+    ...workerProjects.testIgnorePatterns,
     '<rootDir>/.codex-',
     '<rootDir>/__tests__/mockWhipSsh.js',
   ],

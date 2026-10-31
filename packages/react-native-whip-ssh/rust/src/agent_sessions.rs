@@ -1,7 +1,13 @@
 //! Rust-owned lifecycle for remote coding-agent transcript sessions.
 
 mod codex_history;
+mod codex_title;
+pub(crate) mod ids;
+mod pi;
+use pi::{pi_transcript_find_command, resolve_pi_path, validate_pi_session};
 mod opencode_v2;
+#[cfg(test)]
+mod row_restore_tests;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -11,15 +17,18 @@ use std::time::{Duration, Instant};
 use chrono::NaiveDateTime;
 use parking_lot::{Mutex, RwLock};
 
+use ids::{PaneId, SessionId, TerminalId, TranscriptKey};
+
 use crate::agent_transcript::{
     AgentCacheError, AgentTranscriptDelta, AgentTranscriptKind, AgentTranscriptState,
-    AgentTranscriptStatus, AgentTranscriptUpdate, AgentTurnStatus, ClaudeSessionCore,
-    CodexInheritedHistory, CodexSessionCore, FileTranscriptCore, OpenCodeProtocol,
-    OpenCodeSessionCore, OpenCodeV2Page, OpenCodeV2Snapshot, OpenCodeV2Sync,
-    parse_open_code_cursor,
+    AgentTranscriptStatus, AgentTranscriptUpdate, AgentTranscriptView, AgentTurnStatus,
+    ClaudeSessionCore, CodexInheritedHistory, CodexSessionCore, FileTranscriptCore,
+    OpenCodeProtocol, OpenCodeSessionCore, OpenCodeV2Page, OpenCodeV2Snapshot, OpenCodeV2Sync,
+    PiSessionCore, parse_open_code_cursor,
 };
 use crate::herdr_api::HerdrAgentStatus;
 use crate::herdr_connection::{ConnectionExecStream, HerdrConnection};
+use crate::transcript_database::{TranscriptDatabase, TranscriptIdentity};
 
 const RETRY_DELAY: Duration = Duration::from_millis(1_500);
 const CODEX_DISCOVERY_RETRY_DELAYS: [Duration; 4] = [
@@ -51,22 +60,6 @@ fn event_sink() -> &'static RwLock<Option<Arc<dyn AgentTranscriptEventSink>>> {
     EVENT_SINK.get_or_init(|| RwLock::new(None))
 }
 
-#[derive(Clone, Debug, PartialEq, uniffi::Record)]
-pub struct AgentTranscriptCacheWrite {
-    pub namespace: String,
-    pub key: String,
-    pub blob: Vec<u8>,
-    pub confirmation_token: String,
-}
-
-/// Final checkpoint returned synchronously before an inactive session is freed.
-#[derive(Clone, Debug, PartialEq, uniffi::Record)]
-pub struct AgentTranscriptArchive {
-    pub namespace: String,
-    pub key: String,
-    pub blob: Vec<u8>,
-}
-
 /// Opaque cache identities still present in a fresh authoritative host projection.
 #[derive(Clone, Debug, PartialEq, uniffi::Record)]
 pub struct AgentTranscriptRetention {
@@ -83,7 +76,6 @@ pub struct AgentTranscriptEvent {
     pub operation_epoch: u64,
     pub key: String,
     pub update: AgentTranscriptUpdate,
-    pub cache_write: Option<AgentTranscriptCacheWrite>,
 }
 
 #[derive(Clone, Debug, PartialEq, uniffi::Record)]
@@ -97,6 +89,35 @@ pub struct AgentChatBinding {
     pub session_id: String,
     pub transcript_key: String,
     pub state: AgentTranscriptState,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct BoundAgentChat {
+    pub runtime_incarnation: u64,
+    pub binding_token: String,
+    pub binding_generation: u64,
+    pub terminal_id: TerminalId,
+    pub pane_id: PaneId,
+    pub agent: AgentTranscriptKind,
+    pub session_id: SessionId,
+    pub transcript_key: TranscriptKey,
+    pub state: AgentTranscriptState,
+}
+
+impl From<BoundAgentChat> for AgentChatBinding {
+    fn from(binding: BoundAgentChat) -> Self {
+        Self {
+            runtime_incarnation: binding.runtime_incarnation,
+            binding_token: binding.binding_token,
+            binding_generation: binding.binding_generation,
+            terminal_id: binding.terminal_id.into(),
+            pane_id: binding.pane_id.into(),
+            agent: binding.agent,
+            session_id: binding.session_id.into(),
+            transcript_key: binding.transcript_key.into(),
+            state: binding.state,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
@@ -133,10 +154,10 @@ pub enum AgentChatStartResult {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AuthoritativeAgentChatIdentity {
-    pub terminal_id: String,
-    pub pane_id: String,
+    pub terminal_id: TerminalId,
+    pub pane_id: PaneId,
     pub agent: AgentTranscriptKind,
-    pub session_id: String,
+    pub session_id: SessionId,
 }
 
 #[uniffi::export(with_foreign)]
@@ -172,6 +193,8 @@ pub enum AgentSessionError {
     ReadFailed(String),
     #[error("agent transcript cache is corrupt: {0}")]
     CorruptedCache(String),
+    #[error("agent transcript storage failed: {0}")]
+    CacheStorage(String),
     #[error("agent transcript session is closed: {0}")]
     SessionClosed(String),
     #[error("agent transcript operation is stale: {0}")]
@@ -188,8 +211,7 @@ impl From<AgentCacheError> for AgentSessionError {
 
 /// Restore a saved conversation without opening a host transport or a live
 /// session. The cache decoder still validates its agent and session identity.
-#[uniffi::export]
-pub fn read_cached_agent_transcript(
+pub(crate) fn decode_cached_agent_transcript(
     agent: AgentTranscriptKind,
     session_id: String,
     cache_blob: Vec<u8>,
@@ -198,6 +220,7 @@ pub fn read_cached_agent_transcript(
         AgentTranscriptKind::Claude => {
             ClaudeSessionCore::new(session_id).restore_cache(&cache_blob)?
         }
+        AgentTranscriptKind::Pi => PiSessionCore::new(session_id).restore_cache(&cache_blob)?,
         AgentTranscriptKind::Codex => {
             let mut core = CodexSessionCore::new(session_id);
             core.restore_cache(&cache_blob)?
@@ -216,9 +239,9 @@ pub fn read_cached_agent_transcript(
 
 #[derive(Debug)]
 struct SessionRuntime {
-    key: String,
-    session_id: String,
-    terminals: HashSet<String>,
+    key: TranscriptKey,
+    session_id: SessionId,
+    terminals: HashSet<TerminalId>,
     core: AgentSessionCore,
     operation_epoch: u64,
     stream_context: Option<u64>,
@@ -281,8 +304,8 @@ impl TranscriptActivity {
 }
 
 fn transcript_active(
-    terminals: &HashSet<String>,
-    statuses: &HashMap<String, HerdrAgentStatus>,
+    terminals: &HashSet<TerminalId>,
+    statuses: &HashMap<TerminalId, HerdrAgentStatus>,
 ) -> bool {
     terminals.iter().any(|terminal| {
         matches!(
@@ -326,15 +349,16 @@ enum OpenCodeSync<'a> {
 struct TerminalBinding {
     token: String,
     generation: u64,
-    key: String,
-    pane_id: String,
+    key: TranscriptKey,
+    pane_id: PaneId,
     agent: AgentTranscriptKind,
-    session_id: String,
+    session_id: SessionId,
 }
 
 #[derive(Debug)]
 enum AgentSessionCore {
     Claude(Box<ClaudeSessionCore>),
+    Pi(Box<PiSessionCore>),
     Codex(Box<CodexSessionCore>),
     OpenCode(Box<OpenCodeSessionCore>),
 }
@@ -342,6 +366,7 @@ enum AgentSessionCore {
 impl AgentSessionCore {
     fn file(&mut self) -> Option<&mut dyn FileTranscriptCore> {
         match self {
+            Self::Pi(core) => Some(core.as_mut()),
             Self::Claude(core) => Some(core.as_mut()),
             Self::Codex(core) => Some(core.as_mut()),
             Self::OpenCode(_) => None,
@@ -351,21 +376,41 @@ impl AgentSessionCore {
     fn kind(&self) -> AgentTranscriptKind {
         match self {
             Self::Claude(_) => AgentTranscriptKind::Claude,
+            Self::Pi(_) => AgentTranscriptKind::Pi,
             Self::Codex(_) => AgentTranscriptKind::Codex,
             Self::OpenCode(_) => AgentTranscriptKind::OpenCode,
         }
     }
 
+    fn status(&self) -> AgentTranscriptStatus {
+        match self {
+            Self::Pi(core) => core.status(),
+            Self::Claude(core) => core.status(),
+            Self::Codex(core) => core.status(),
+            Self::OpenCode(core) => core.status(),
+        }
+    }
+
     fn state(&self) -> AgentTranscriptState {
         match self {
+            Self::Pi(core) => core.state(),
             Self::Claude(core) => core.state(),
             Self::Codex(core) => core.state(),
             Self::OpenCode(core) => core.state(),
         }
     }
 
+    fn projection_view(&self) -> Option<AgentTranscriptView<'_>> {
+        match self {
+            Self::Claude(_) | Self::Pi(_) => None,
+            Self::Codex(core) => core.projection_view(),
+            Self::OpenCode(core) => Some(core.projection_view()),
+        }
+    }
+
     fn revision(&self) -> u64 {
         match self {
+            Self::Pi(core) => core.revision(),
             Self::Claude(core) => core.revision(),
             Self::Codex(core) => core.revision(),
             Self::OpenCode(core) => core.revision(),
@@ -375,6 +420,7 @@ impl AgentSessionCore {
     fn mark_stale_update(&mut self, reason: impl Into<String>) -> AgentTranscriptUpdate {
         let reason = reason.into();
         match self {
+            Self::Pi(core) => core.mark_stale_update(reason),
             Self::Claude(core) => core.mark_stale_update(reason),
             Self::Codex(core) => core.mark_stale_update(reason),
             Self::OpenCode(core) => core.mark_stale_update(reason),
@@ -384,6 +430,7 @@ impl AgentSessionCore {
     fn mark_restarting_update(&mut self, reason: impl Into<String>) -> AgentTranscriptUpdate {
         let reason = reason.into();
         match self {
+            Self::Pi(core) => core.mark_restarting_update(reason),
             Self::Claude(core) => core.mark_restarting_update(reason),
             Self::Codex(core) => core.mark_restarting_update(reason),
             Self::OpenCode(core) => core.mark_restarting_update(reason),
@@ -393,6 +440,7 @@ impl AgentSessionCore {
     fn mark_unavailable_update(&mut self, reason: impl Into<String>) -> AgentTranscriptUpdate {
         let reason = reason.into();
         match self {
+            Self::Pi(core) => core.mark_unavailable_update(reason),
             Self::Claude(core) => core.mark_unavailable_update(reason),
             Self::Codex(core) => core.mark_unavailable_update(reason),
             Self::OpenCode(core) => core.mark_unavailable_update(reason),
@@ -401,6 +449,7 @@ impl AgentSessionCore {
 
     fn close_update(&mut self) -> AgentTranscriptUpdate {
         match self {
+            Self::Pi(core) => core.close_update(),
             Self::Claude(core) => core.close_update(),
             Self::Codex(core) => core.close_update(),
             Self::OpenCode(core) => core.close_update(),
@@ -409,6 +458,7 @@ impl AgentSessionCore {
 
     fn restore_cache(&mut self, bytes: &[u8]) -> Result<AgentTranscriptState, AgentCacheError> {
         match self {
+            Self::Pi(core) => core.restore_cache(bytes),
             Self::Claude(core) => core.restore_cache(bytes),
             Self::Codex(core) => core.restore_cache(bytes),
             Self::OpenCode(core) => core.restore_cache(bytes),
@@ -417,16 +467,26 @@ impl AgentSessionCore {
 
     fn confirm_cache(&mut self, source_generation: u64, position: u64) -> bool {
         match self {
+            Self::Pi(core) => core.confirm_cache(source_generation, position),
             Self::Claude(core) => core.confirm_cache(source_generation, position),
             Self::Codex(core) => core.confirm_cache(source_generation, position),
             Self::OpenCode(core) => core.confirm_cache(source_generation, position),
+        }
+    }
+
+    fn source_generation(&self) -> u64 {
+        match self {
+            Self::Pi(core) => core.source_generation(),
+            Self::Claude(core) => core.source_generation(),
+            Self::Codex(core) => core.source_generation(),
+            Self::OpenCode(core) => core.source_generation(),
         }
     }
 }
 
 #[derive(Clone, Debug)]
 struct PendingCheckpoint {
-    session_key: String,
+    session_key: TranscriptKey,
     source_generation: u64,
     offset: u64,
 }
@@ -441,14 +501,14 @@ struct ManagerState {
     // - authoritative HostState replacement invalidates or replaces bindings;
     // - release closes resources, while only explicit bind/start reopens them.
     connected: bool,
-    sessions: HashMap<String, SessionRuntime>,
-    terminal_bindings: HashMap<String, TerminalBinding>,
+    sessions: HashMap<TranscriptKey, SessionRuntime>,
+    terminal_bindings: HashMap<TerminalId, TerminalBinding>,
     checkpoints: HashMap<String, PendingCheckpoint>,
     next_checkpoint: u64,
     next_binding_generation: u64,
     closed: bool,
     retention_revision: Option<u64>,
-    agent_statuses: HashMap<String, HerdrAgentStatus>,
+    agent_statuses: HashMap<TerminalId, HerdrAgentStatus>,
     activity_revision: u64,
 }
 
@@ -458,6 +518,8 @@ struct AgentSessionManagerInner {
     runtime_incarnation: u64,
     connection: Arc<HerdrConnection>,
     state: Mutex<ManagerState>,
+    database: Option<TranscriptDatabase>,
+    rows: Mutex<HashMap<TranscriptKey, Vec<Weak<crate::AgentChatRows>>>>,
 }
 
 #[derive(Clone)]
@@ -468,7 +530,7 @@ pub(crate) struct AgentSessionManager {
 #[derive(Clone)]
 struct StreamContext {
     manager: Weak<AgentSessionManagerInner>,
-    session_key: String,
+    session_key: TranscriptKey,
     source_generation: u64,
     operation_epoch: u64,
 }
@@ -480,17 +542,72 @@ enum SessionFailureKind {
 }
 
 impl AgentSessionManager {
+    pub(crate) fn register_rows(&self, key: &TranscriptKey, owner: &Arc<crate::AgentChatRows>) {
+        let mut registry = self.inner.rows.lock();
+        let owners = registry.entry(key.to_owned()).or_default();
+        owners.retain(|owner| owner.strong_count() != 0);
+        owners.push(Arc::downgrade(owner));
+        drop(registry);
+    }
+
+    pub(crate) fn restore_rows(
+        &self,
+        key: &TranscriptKey,
+        owner: &crate::AgentChatRows,
+    ) -> Result<(), AgentSessionError> {
+        let state = self.inner.state.lock();
+        let session = state.sessions.get(key).ok_or_else(|| {
+            AgentSessionError::SessionClosed("chat projection session is closed".into())
+        })?;
+        // Borrow materialized history. Claude and legacy Codex still reconstruct
+        // snapshots; keep that work outside the viewport lock so disposal does
+        // not wait for transcript reconstruction.
+        let snapshot;
+        let view = match session.core.projection_view() {
+            Some(view) => view,
+            None => {
+                snapshot = session.core.state();
+                (&snapshot).into()
+            }
+        };
+        let mut projection = owner.projection.lock();
+        if !projection.disposed {
+            projection.restore_view(view);
+        }
+        drop(projection);
+        drop(state);
+        Ok(())
+    }
+
+    pub(crate) fn unregister_rows(&self, key: &TranscriptKey, owner: &crate::AgentChatRows) {
+        let mut registry = self.inner.rows.lock();
+        if let Some(owners) = registry.get_mut(key) {
+            owners.retain(|entry| {
+                entry.as_ptr() != std::ptr::from_ref(owner) && entry.strong_count() != 0
+            });
+            if owners.is_empty() {
+                registry.remove(key);
+            }
+        }
+    }
+
     pub(crate) fn new(
         runtime_id: String,
         runtime_incarnation: u64,
         connection: Arc<HerdrConnection>,
     ) -> Self {
+        let database = crate::transcript_database::database().ok();
+        if let Some(database) = &database {
+            database.activate(runtime_id.clone(), runtime_incarnation);
+        }
         Self {
             inner: Arc::new(AgentSessionManagerInner {
+                rows: Mutex::default(),
                 reconciliation: Mutex::new(()),
                 runtime_id,
                 runtime_incarnation,
                 connection,
+                database,
                 state: Mutex::new(ManagerState {
                     connected: false,
                     sessions: HashMap::new(),
@@ -551,7 +668,7 @@ impl AgentSessionManager {
             emissions
         };
         for (key, operation_epoch, update) in emissions {
-            emit(&self.inner, key, operation_epoch, update, None);
+            emit(&self.inner, key, operation_epoch, update);
         }
     }
 
@@ -560,12 +677,12 @@ impl AgentSessionManager {
         &self,
         terminal_id: String,
         session_id: String,
-    ) -> Result<AgentChatBinding, AgentSessionError> {
+    ) -> Result<BoundAgentChat, AgentSessionError> {
         self.bind_authoritative(AuthoritativeAgentChatIdentity {
-            pane_id: format!("pane-{terminal_id}"),
-            terminal_id,
+            pane_id: format!("pane-{terminal_id}").into(),
+            terminal_id: terminal_id.into(),
             agent: AgentTranscriptKind::Codex,
-            session_id,
+            session_id: session_id.into(),
         })
     }
 
@@ -574,19 +691,19 @@ impl AgentSessionManager {
         &self,
         terminal_id: String,
         session_id: String,
-    ) -> Result<AgentChatBinding, AgentSessionError> {
+    ) -> Result<BoundAgentChat, AgentSessionError> {
         self.bind_authoritative(AuthoritativeAgentChatIdentity {
-            pane_id: format!("pane-{terminal_id}"),
-            terminal_id,
+            pane_id: format!("pane-{terminal_id}").into(),
+            terminal_id: terminal_id.into(),
             agent: AgentTranscriptKind::OpenCode,
-            session_id,
+            session_id: session_id.into(),
         })
     }
 
     pub(crate) fn bind_authoritative(
         &self,
         identity: AuthoritativeAgentChatIdentity,
-    ) -> Result<AgentChatBinding, AgentSessionError> {
+    ) -> Result<BoundAgentChat, AgentSessionError> {
         let _reconciliation = self.inner.reconciliation.lock();
         self.bind_authoritative_inner(identity)
     }
@@ -594,11 +711,16 @@ impl AgentSessionManager {
     fn bind_authoritative_inner(
         &self,
         identity: AuthoritativeAgentChatIdentity,
-    ) -> Result<AgentChatBinding, AgentSessionError> {
+    ) -> Result<BoundAgentChat, AgentSessionError> {
         match identity.agent {
-            AgentTranscriptKind::Claude => validate_claude_session_id(&identity.session_id)?,
-            AgentTranscriptKind::Codex => validate_codex_session_id(&identity.session_id)?,
-            AgentTranscriptKind::OpenCode => validate_opencode_session_id(&identity.session_id)?,
+            AgentTranscriptKind::Pi => validate_pi_session(identity.session_id.as_str())?,
+            AgentTranscriptKind::Claude => {
+                validate_claude_session_id(identity.session_id.as_str())?;
+            }
+            AgentTranscriptKind::Codex => validate_codex_session_id(identity.session_id.as_str())?,
+            AgentTranscriptKind::OpenCode => {
+                validate_opencode_session_id(identity.session_id.as_str())?;
+            }
         }
         let key = self.transcript_key(&identity);
         let (binding, state_snapshot, orphaned) = {
@@ -646,6 +768,9 @@ impl AgentSessionManager {
             );
             let session = state.sessions.entry(key.clone()).or_insert_with(|| {
                 let core = match identity.agent {
+                    AgentTranscriptKind::Pi => AgentSessionCore::Pi(Box::new(PiSessionCore::new(
+                        identity.session_id.clone(),
+                    ))),
                     AgentTranscriptKind::Claude => AgentSessionCore::Claude(Box::new(
                         ClaudeSessionCore::new(identity.session_id.clone()),
                     )),
@@ -675,7 +800,7 @@ impl AgentSessionManager {
                 }
             });
             session.terminals.insert(identity.terminal_id.clone());
-            if session.closed || session.core.state().status == AgentTranscriptStatus::Closed {
+            if session.closed || session.core.status() == AgentTranscriptStatus::Closed {
                 session.closed = false;
                 session.explicit_restart_pending = true;
                 let _ = session
@@ -692,7 +817,7 @@ impl AgentSessionManager {
         if let Some(orphaned) = orphaned {
             self.release_session(&orphaned);
         }
-        Ok(AgentChatBinding {
+        Ok(BoundAgentChat {
             runtime_incarnation: self.inner.runtime_incarnation,
             binding_token: binding.token,
             binding_generation: binding.generation,
@@ -705,7 +830,47 @@ impl AgentSessionManager {
         })
     }
 
-    pub(crate) fn start_bound(
+    pub(crate) async fn start_bound(
+        &self,
+        binding_token: &str,
+    ) -> Result<AgentChatStartResult, AgentSessionError> {
+        let restore = {
+            let state = self.inner.state.lock();
+            state
+                .terminal_bindings
+                .values()
+                .find(|binding| binding.token == binding_token)
+                .and_then(|binding| {
+                    state
+                        .sessions
+                        .get(&binding.key)
+                        .map(|session| (binding.key.clone(), !session.started))
+                })
+        };
+        let Some((key, first_start)) = restore else {
+            return Ok(AgentChatStartResult::StaleBinding);
+        };
+        let blob = if first_start && let Some(database) = &self.inner.database {
+            match database.load(key.into()).await {
+                Ok(blob) => blob,
+                Err(error) => {
+                    crate::host_runtime::record_transcript_cache_failure(&error.to_string());
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let manager = self.clone();
+        let token = binding_token.to_owned();
+        crate::runtime()
+            .map_err(AgentSessionError::CacheStorage)?
+            .spawn_blocking(move || manager.start_restored(&token, blob))
+            .await
+            .map_err(|error| AgentSessionError::CacheStorage(error.to_string()))?
+    }
+
+    fn start_restored(
         &self,
         binding_token: &str,
         cache_blob: Option<Vec<u8>>,
@@ -756,6 +921,7 @@ impl AgentSessionManager {
         if should_start {
             let label = match kind {
                 AgentTranscriptKind::Claude => "Opening Claude transcript",
+                AgentTranscriptKind::Pi => "Opening Pi transcript",
                 AgentTranscriptKind::Codex => "Opening Codex transcript",
                 AgentTranscriptKind::OpenCode => "Opening OpenCode transcript",
             };
@@ -766,7 +932,7 @@ impl AgentSessionManager {
         })
     }
 
-    pub(crate) fn state(&self, key: &str) -> Option<AgentTranscriptState> {
+    pub(crate) fn state(&self, key: &TranscriptKey) -> Option<AgentTranscriptState> {
         self.inner
             .state
             .lock()
@@ -775,9 +941,24 @@ impl AgentSessionManager {
             .map(|session| session.core.state())
     }
 
+    /// Search only clones history when the native projection has changed.
+    pub(crate) fn search_snapshot(
+        &self,
+        key: &TranscriptKey,
+        revision: Option<u64>,
+    ) -> Result<Option<AgentTranscriptState>, AgentSessionError> {
+        let state = self.inner.state.lock();
+        let session = state.sessions.get(key).ok_or_else(|| {
+            AgentSessionError::SessionClosed("chat search session is closed".into())
+        })?;
+        let snapshot = (revision != Some(session.core.revision())).then(|| session.core.state());
+        drop(state);
+        Ok(snapshot)
+    }
+
     pub(crate) fn update_agent_statuses(
         &self,
-        statuses: HashMap<String, HerdrAgentStatus>,
+        statuses: HashMap<TerminalId, HerdrAgentStatus>,
         revision: u64,
     ) {
         let wake = {
@@ -794,7 +975,7 @@ impl AgentSessionManager {
                 let was_paused = session.activity.set_active(active, now);
                 let unavailable = became_active
                     && matches!(
-                        session.core.state().status,
+                        session.core.status(),
                         AgentTranscriptStatus::Unavailable | AgentTranscriptStatus::Error
                     );
                 if was_paused || unavailable {
@@ -820,7 +1001,7 @@ impl AgentSessionManager {
             let keys = state
                 .terminal_bindings
                 .values()
-                .filter(|binding| binding.pane_id == pane_id)
+                .filter(|binding| binding.pane_id.as_str() == pane_id)
                 .map(|binding| binding.key.clone())
                 .collect::<HashSet<_>>();
             let now = Instant::now();
@@ -842,7 +1023,7 @@ impl AgentSessionManager {
         }
     }
 
-    pub(crate) fn accepts_event(&self, key: &str, operation_epoch: u64) -> bool {
+    pub(crate) fn accepts_event(&self, key: &TranscriptKey, operation_epoch: u64) -> bool {
         self.inner
             .state
             .lock()
@@ -859,19 +1040,19 @@ impl AgentSessionManager {
             .contains_key(terminal_id)
     }
 
-    pub(crate) fn terminal_binding(&self, terminal_id: &str) -> Option<AgentChatBinding> {
+    pub(crate) fn terminal_binding(&self, terminal_id: &str) -> Option<BoundAgentChat> {
         let state = self.inner.state.lock();
         let binding = state.terminal_bindings.get(terminal_id)?.clone();
         let transcript_state = state.sessions.get(&binding.key)?.core.state();
         drop(state);
-        Some(AgentChatBinding {
+        Some(BoundAgentChat {
             runtime_incarnation: self.inner.runtime_incarnation,
             binding_token: binding.token.clone(),
             binding_generation: binding.generation,
-            terminal_id: terminal_id.to_owned(),
-            pane_id: binding.pane_id.clone(),
+            terminal_id: terminal_id.into(),
+            pane_id: binding.pane_id,
             agent: binding.agent,
-            session_id: binding.session_id.clone(),
+            session_id: binding.session_id,
             transcript_key: binding.key,
             state: transcript_state,
         })
@@ -880,7 +1061,7 @@ impl AgentSessionManager {
     /// Check the UI's projection without cloning or serializing its history.
     pub(crate) fn terminal_binding_is_current(
         &self,
-        terminal_id: &str,
+        terminal_id: &TerminalId,
         binding_token: &str,
         revision: u64,
     ) -> bool {
@@ -898,29 +1079,30 @@ impl AgentSessionManager {
     }
 
     #[cfg(test)]
-    pub(crate) fn close_terminal(&self, terminal_id: &str) -> Option<String> {
+    pub(crate) fn close_terminal(&self, terminal_id: &TerminalId) -> Option<TranscriptKey> {
         let _reconciliation = self.inner.reconciliation.lock();
         self.close_terminal_inner(terminal_id)
     }
 
     pub(crate) fn detach_terminal(
         &self,
-        terminal_id: &str,
-    ) -> Result<Option<AgentTranscriptArchive>, AgentSessionError> {
+        terminal_id: &TerminalId,
+    ) -> Result<(), AgentSessionError> {
         let _reconciliation = self.inner.reconciliation.lock();
-        let archive = {
+        let admitted = {
             let mut state = self.inner.state.lock();
             let Some(binding) = state.terminal_bindings.get(terminal_id) else {
-                return Ok(None);
+                return Ok(());
             };
             let key = binding.key.clone();
             let Some(session) = state.sessions.get_mut(&key) else {
-                return Err(AgentSessionError::SessionClosed(key));
+                return Err(AgentSessionError::SessionClosed(key.into()));
             };
-            let blob = if session.terminals.len() == 1 {
-                // Freeze callbacks before taking the final checkpoint. Incomplete
-                // JSONL tails are intentionally replayed from the remote cursor.
+            let archive = if session.terminals.len() == 1 {
                 let blob = match &session.core {
+                    AgentSessionCore::Pi(core) if core.committable_offset() > 0 => {
+                        Some(core.cache_blob()?)
+                    }
                     AgentSessionCore::Claude(core) if core.committable_offset() > 0 => {
                         Some(core.cache_blob()?)
                     }
@@ -932,23 +1114,42 @@ impl AgentSessionManager {
                     }
                     _ => None,
                 };
+                // Freeze stream callbacks before admission; a late callback
+                // cannot overwrite the final checkpoint after session eviction.
                 session.operation_epoch = NEXT_OPERATION_EPOCH.fetch_add(1, Ordering::Relaxed);
-                blob
+                blob.map(|blob| {
+                    (
+                        TranscriptIdentity {
+                            namespace: self.inner.runtime_id.clone(),
+                            agent: session.core.kind(),
+                            session_id: session.session_id.clone().into(),
+                        },
+                        blob,
+                    )
+                })
             } else {
                 None
             };
+            let admitted = match (archive, &self.inner.database) {
+                (Some((identity, blob)), Some(database)) => {
+                    database.save(identity, self.inner.runtime_incarnation, blob, |result| {
+                        if let Err(error) = result {
+                            crate::host_runtime::record_transcript_cache_failure(
+                                &error.to_string(),
+                            );
+                        }
+                    })
+                }
+                _ => Ok(()),
+            };
             drop(state);
-            blob.map(|blob| AgentTranscriptArchive {
-                namespace: self.inner.runtime_id.clone(),
-                key,
-                blob,
-            })
+            admitted
         };
         self.close_terminal_inner(terminal_id);
-        Ok(archive)
+        admitted
     }
 
-    fn close_terminal_inner(&self, terminal_id: &str) -> Option<String> {
+    fn close_terminal_inner(&self, terminal_id: &TerminalId) -> Option<TranscriptKey> {
         let close = {
             let mut state = self.inner.state.lock();
             let binding = state.terminal_bindings.remove(terminal_id)?;
@@ -966,7 +1167,7 @@ impl AgentSessionManager {
         None
     }
 
-    fn release_session(&self, key: &str) {
+    fn release_session(&self, key: &TranscriptKey) {
         let mut state = self.inner.state.lock();
         let Some(session) = state.sessions.get_mut(key) else {
             return;
@@ -988,25 +1189,36 @@ impl AgentSessionManager {
         let _ = session.core.close_update();
         state
             .checkpoints
-            .retain(|_, value| value.session_key != key);
-        // Inactive transcript memory budget: zero. SQLite owns durable history;
+            .retain(|_, value| &value.session_key != key);
+        // Inactive transcript memory budget: zero. Turso owns durable history;
         // reopening creates a core and restores its persisted checkpoint.
         state.sessions.remove(key);
     }
 
     pub(crate) fn reconcile_authoritative_bindings(
         &self,
-        identities: &HashMap<String, AuthoritativeAgentChatIdentity>,
+        identities: &HashMap<TerminalId, AuthoritativeAgentChatIdentity>,
         revision: u64,
     ) -> Option<AgentTranscriptRetention> {
         let _reconciliation = self.inner.reconciliation.lock();
+        let retained: HashSet<_> = identities
+            .values()
+            .map(|identity| self.transcript_key(identity))
+            .collect();
         let changes = {
             let mut state = self.inner.state.lock();
-            if state.closed
-                || state
-                    .retention_revision
-                    .is_some_and(|last| last >= revision)
-            {
+            if state.closed || state.retention_revision.is_some_and(|last| last > revision) {
+                return None;
+            }
+            if state.retention_revision == Some(revision) {
+                if let Some(database) = &self.inner.database {
+                    database.retain(
+                        self.inner.runtime_id.clone(),
+                        self.inner.runtime_incarnation,
+                        revision,
+                        retained.into_iter().map(Into::into).collect(),
+                    );
+                }
                 return None;
             }
             state.retention_revision = Some(revision);
@@ -1041,19 +1253,23 @@ impl AgentSessionManager {
         }
         // Include unopened agents: absence of a local binding is not evidence
         // that a remote session disappeared. This also reconciles caches from
-        // previous application runs, whose keys are only known to SQLite.
-        let retained: HashSet<_> = identities
-            .values()
-            .map(|identity| self.transcript_key(identity))
-            .collect();
+        // previous application runs, whose keys are only known to the database.
         let mut state = self.inner.state.lock();
         state.sessions.retain(|key, _| retained.contains(key));
         state
             .checkpoints
             .retain(|_, checkpoint| retained.contains(&checkpoint.session_key));
         drop(state);
-        let mut retained_keys: Vec<_> = retained.into_iter().collect();
+        let mut retained_keys: Vec<String> = retained.into_iter().map(Into::into).collect();
         retained_keys.sort_unstable();
+        if let Some(database) = &self.inner.database {
+            database.retain(
+                self.inner.runtime_id.clone(),
+                self.inner.runtime_incarnation,
+                revision,
+                retained_keys.iter().cloned().collect(),
+            );
+        }
         Some(AgentTranscriptRetention {
             namespace: self.inner.runtime_id.clone(),
             runtime_incarnation: self.inner.runtime_incarnation,
@@ -1062,16 +1278,14 @@ impl AgentSessionManager {
         })
     }
 
-    fn transcript_key(&self, identity: &AuthoritativeAgentChatIdentity) -> String {
-        let agent = match identity.agent {
-            AgentTranscriptKind::Claude => "claude",
-            AgentTranscriptKind::Codex => "codex",
-            AgentTranscriptKind::OpenCode => "opencode",
-        };
-        format!(
-            "{}\n{agent}\n{}",
-            self.inner.runtime_id, identity.session_id
-        )
+    fn transcript_key(&self, identity: &AuthoritativeAgentChatIdentity) -> TranscriptKey {
+        TranscriptIdentity {
+            namespace: self.inner.runtime_id.clone(),
+            agent: identity.agent,
+            session_id: identity.session_id.clone().into(),
+        }
+        .key()
+        .into()
     }
 
     pub(crate) fn confirm_cache(&self, token: &str) -> bool {
@@ -1096,16 +1310,16 @@ impl AgentSessionManager {
         confirmed
     }
 
-    fn restart(&self, key: String, reason: String) {
+    fn restart(&self, key: TranscriptKey, reason: String) {
         self.restart_operation(key, reason, None);
     }
 
     fn prepare_restart(
         &self,
-        key: &str,
+        key: &TranscriptKey,
         reason: String,
         expected_epoch: Option<u64>,
-    ) -> Option<(u64, String, AgentTranscriptUpdate, AgentTranscriptKind)> {
+    ) -> Option<(u64, SessionId, AgentTranscriptUpdate, AgentTranscriptKind)> {
         let operation = {
             let mut state = self.inner.state.lock();
             if !state.connected {
@@ -1150,16 +1364,18 @@ impl AgentSessionManager {
         Some(operation)
     }
 
-    fn restart_operation(&self, key: String, reason: String, expected_epoch: Option<u64>) {
+    fn restart_operation(&self, key: TranscriptKey, reason: String, expected_epoch: Option<u64>) {
         let Some(operation) = self.prepare_restart(&key, reason, expected_epoch) else {
             return;
         };
-        emit(&self.inner, key.clone(), operation.0, operation.2, None);
+        emit(&self.inner, key.clone(), operation.0, operation.2);
         let manager = self.clone();
         if let Ok(runtime) = crate::runtime() {
             runtime.spawn(async move {
                 match operation.3 {
-                    AgentTranscriptKind::Claude | AgentTranscriptKind::Codex => {
+                    AgentTranscriptKind::Claude
+                    | AgentTranscriptKind::Codex
+                    | AgentTranscriptKind::Pi => {
                         manager
                             .resolve_and_open(key, operation.0, operation.1, operation.3)
                             .await;
@@ -1174,45 +1390,54 @@ impl AgentSessionManager {
 
     async fn resolve_and_open(
         &self,
-        key: String,
+        key: TranscriptKey,
         operation_epoch: u64,
-        session_id: String,
+        session_id: SessionId,
         agent: AgentTranscriptKind,
     ) {
         let connection = self.inner.connection.clone();
         let result = async {
-            let command = if agent == AgentTranscriptKind::Claude {
-                claude_transcript_find_command(&session_id)
-            } else {
-                codex_rollout_find_command(&session_id)
+            let command = match agent {
+                AgentTranscriptKind::Pi => pi_transcript_find_command(session_id.as_str()),
+                AgentTranscriptKind::Claude => claude_transcript_find_command(session_id.as_str()),
+                _ => codex_rollout_find_command(session_id.as_str()),
             };
             let output = execute(&connection, command).await.map_err(|error| {
                 AgentSessionError::ReadFailed(format!(
                     "{agent:?} transcript discovery failed: {error}"
                 ))
             })?;
-            let path = if agent == AgentTranscriptKind::Claude {
-                resolve_claude_path(&output, &session_id)?
-            } else {
-                resolve_rollout_path(&output, &session_id)?
+            let path = match agent {
+                AgentTranscriptKind::Pi => resolve_pi_path(&output, session_id.as_str())?,
+                AgentTranscriptKind::Claude => resolve_claude_path(&output, session_id.as_str())?,
+                _ => resolve_rollout_path(&output, session_id.as_str())?,
             };
             let Some(path) = path else {
                 return Err(AgentSessionError::SourceUnavailable(
                     if agent == AgentTranscriptKind::Codex {
                         "Codex has not created this rollout yet.".to_owned()
                     } else {
-                        "Claude has not created this transcript yet.".to_owned()
+                        format!("{agent:?} has not created this transcript yet.")
                     },
                 ));
             };
-            let metadata = execute(&connection, file_metadata_command(&path))
+            let metadata_command = file_metadata_command(&path);
+            let metadata_command = if agent == AgentTranscriptKind::Codex {
+                codex_title::with_title_read(metadata_command, &path, session_id.as_str(), None)
+            } else {
+                metadata_command
+            };
+            let metadata = execute(&connection, metadata_command)
                 .await
                 .map_err(|error| {
                     AgentSessionError::ReadFailed(format!(
                         "{agent:?} transcript metadata lookup failed: {error}"
                     ))
                 })?;
-            let (file_id, size) = parse_metadata(&metadata)?;
+            let metadata = parse_file_source_poll(
+                &metadata,
+                (agent == AgentTranscriptKind::Codex).then_some(session_id.as_str()),
+            )?;
             let history = if agent == AgentTranscriptKind::Codex {
                 codex_history::load(
                     &path,
@@ -1234,10 +1459,10 @@ impl AgentSessionManager {
             } else {
                 None
             };
-            Ok::<_, AgentSessionError>((path, file_id, size, history))
+            Ok::<_, AgentSessionError>((path, metadata, history))
         }
         .await;
-        let (path, file_id, size, history) = match result {
+        let (path, metadata, history) = match result {
             Ok(result) => result,
             Err(error) => {
                 let kind = if matches!(error, AgentSessionError::SourceUnavailable(_)) {
@@ -1253,8 +1478,8 @@ impl AgentSessionManager {
             &key,
             operation_epoch,
             &path,
-            &file_id,
-            size,
+            &metadata.file_id,
+            metadata.size,
             history,
         ) {
             Ok(Some(opened)) => opened,
@@ -1270,8 +1495,12 @@ impl AgentSessionManager {
             }
         };
         if let Some(update) = opened.2 {
-            emit(&self.inner, key.clone(), operation_epoch, update, None);
+            emit(&self.inner, key.clone(), operation_epoch, update);
         }
+        if let Some(title) = &metadata.codex_title {
+            self.update_codex_title(&key, operation_epoch, &session_id, title.title.as_deref());
+        }
+        let size = metadata.size;
         let command = file_stream_command(&path, opened.1);
         let context = opened.0;
         let data = Arc::new(move |bytes| stream_data(context, bytes));
@@ -1309,8 +1538,7 @@ impl AgentSessionManager {
                 key.clone(),
                 operation_epoch,
                 path,
-                file_id,
-                size,
+                metadata,
                 (agent == AgentTranscriptKind::Codex).then_some(session_id),
             );
         }
@@ -1325,7 +1553,7 @@ impl AgentSessionManager {
                 })
             };
             if let Some(update) = emission {
-                emit(&self.inner, key, operation_epoch, update, None);
+                emit(&self.inner, key, operation_epoch, update);
             }
         }
     }
@@ -1333,7 +1561,7 @@ impl AgentSessionManager {
     #[cfg(test)]
     fn bind_discovered_file(
         &self,
-        key: &str,
+        key: &TranscriptKey,
         operation_epoch: u64,
         path: &str,
         file_id: &str,
@@ -1346,7 +1574,7 @@ impl AgentSessionManager {
 
     fn bind_discovered_file_with_history(
         &self,
-        key: &str,
+        key: &TranscriptKey,
         operation_epoch: u64,
         path: &str,
         file_id: &str,
@@ -1409,15 +1637,16 @@ impl AgentSessionManager {
 
     fn monitor_file_source(
         &self,
-        key: String,
+        key: TranscriptKey,
         epoch: u64,
         path: String,
-        file_id: String,
-        mut previous_size: u64,
-        rollout_session_id: Option<String>,
+        metadata: FileSourceMetadata,
+        rollout_session_id: Option<SessionId>,
     ) {
         let manager = self.clone();
-        let command = file_source_poll_command(&path, rollout_session_id.as_deref());
+        let file_id = metadata.file_id;
+        let mut previous_size = metadata.size;
+        let mut title_stamp = metadata.codex_title.map(|title| title.stamp);
         if let Ok(runtime) = crate::runtime() {
             runtime.spawn(async move {
                 loop {
@@ -1444,11 +1673,29 @@ impl AgentSessionManager {
                         };
                         (core.received_offset(), session.activity.paused)
                     };
-                    let metadata = execute(&manager.inner.connection, command.clone())
-                        .await
-                        .and_then(|output| {
-                            parse_file_source_poll(&output, rollout_session_id.as_deref())
-                        });
+                    let command = file_source_poll_command(
+                        &path,
+                        rollout_session_id.as_ref().map(SessionId::as_str),
+                    );
+                    let command = if let Some(session_id) = &rollout_session_id {
+                        codex_title::with_title_read(
+                            command,
+                            &path,
+                            session_id.as_str(),
+                            title_stamp.as_deref(),
+                        )
+                    } else {
+                        command
+                    };
+                    let metadata =
+                        execute(&manager.inner.connection, command)
+                            .await
+                            .and_then(|output| {
+                                parse_file_source_poll(
+                                    &output,
+                                    rollout_session_id.as_ref().map(SessionId::as_str),
+                                )
+                            });
                     let Ok(metadata) = metadata else {
                         manager.fail_session(
                             key,
@@ -1483,6 +1730,12 @@ impl AgentSessionManager {
                         }
                         return;
                     }
+                    if let (Some(session_id), Some(title)) =
+                        (&rollout_session_id, metadata.codex_title)
+                    {
+                        manager.update_codex_title(&key, epoch, session_id, title.title.as_deref());
+                        title_stamp = Some(title.stamp);
+                    }
                     previous_size = metadata.size;
                     let mut state = manager.inner.state.lock();
                     if let Some(session) = current_session_mut(&mut state, &key, epoch) {
@@ -1493,7 +1746,29 @@ impl AgentSessionManager {
         }
     }
 
-    async fn sync_opencode(&self, key: String, operation_epoch: u64, session_id: String) {
+    fn update_codex_title(
+        &self,
+        key: &TranscriptKey,
+        epoch: u64,
+        session_id: &SessionId,
+        title: Option<&str>,
+    ) {
+        let update = {
+            let mut state = self.inner.state.lock();
+            let Some(session) = current_session_mut(&mut state, key, epoch) else {
+                return;
+            };
+            let AgentSessionCore::Codex(core) = &mut session.core else {
+                return;
+            };
+            core.update_native_title(session_id.as_str(), title)
+        };
+        if let Some(update) = update {
+            emit(&self.inner, key.to_owned(), epoch, update);
+        }
+    }
+
+    async fn sync_opencode(&self, key: TranscriptKey, operation_epoch: u64, session_id: SessionId) {
         let protocol = match self.resolve_opencode_protocol(&key, operation_epoch).await {
             Ok(protocol) => protocol,
             Err(error) => {
@@ -1537,7 +1812,7 @@ impl AgentSessionManager {
         let connection = self.inner.connection.clone();
         let cursor_output = match execute(
             &connection,
-            opencode_login_command(&opencode_cursor_command(&session_id)),
+            opencode_login_command(&opencode_cursor_command(session_id.as_str())),
         )
         .await
         {
@@ -1581,13 +1856,15 @@ impl AgentSessionManager {
                 current_session_mut(&mut state, &key, operation_epoch).and_then(|session| {
                     match &mut session.core {
                         AgentSessionCore::OpenCode(core) => Some(core.mark_live_update()),
-                        AgentSessionCore::Claude(_) | AgentSessionCore::Codex(_) => None,
+                        AgentSessionCore::Claude(_)
+                        | AgentSessionCore::Codex(_)
+                        | AgentSessionCore::Pi(_) => None,
                     }
                 })
             };
             if let Some(update) = update {
                 if let Some(update) = update {
-                    emit(&self.inner, key.clone(), operation_epoch, update, None);
+                    emit(&self.inner, key.clone(), operation_epoch, update);
                 }
                 self.schedule_opencode_poll(key, operation_epoch, session_id);
             }
@@ -1596,9 +1873,9 @@ impl AgentSessionManager {
 
         let needs_full = local_cursor.is_none_or(|cursor| remote_cursor < cursor);
         let command = if needs_full {
-            opencode_export_command(&session_id)
+            opencode_export_command(session_id.as_str())
         } else {
-            opencode_events_command(&session_id, local_cursor.unwrap_or_default())
+            opencode_events_command(session_id.as_str(), local_cursor.unwrap_or_default())
         };
         let payload = match execute(&connection, opencode_login_command(&command)).await {
             Ok(output) => output,
@@ -1631,7 +1908,7 @@ impl AgentSessionManager {
             }
             let export = execute(
                 &connection,
-                opencode_login_command(&opencode_export_command(&session_id)),
+                opencode_login_command(&opencode_export_command(session_id.as_str())),
             )
             .await;
             match export {
@@ -1669,13 +1946,13 @@ impl AgentSessionManager {
 
     async fn resolve_opencode_protocol(
         &self,
-        key: &str,
+        key: &TranscriptKey,
         operation_epoch: u64,
     ) -> Result<OpenCodeProtocol, AgentSessionError> {
         {
             let mut state = self.inner.state.lock();
             let session = current_session_mut(&mut state, key, operation_epoch)
-                .ok_or_else(|| AgentSessionError::StaleGeneration(key.to_owned()))?;
+                .ok_or_else(|| AgentSessionError::StaleGeneration(key.to_string()))?;
             let protocol = session.opencode_protocol;
             drop(state);
             if let Some(protocol) = protocol {
@@ -1690,7 +1967,7 @@ impl AgentSessionManager {
         let protocol = parse_opencode_protocol(&version)?;
         let mut state = self.inner.state.lock();
         let session = current_session_mut(&mut state, key, operation_epoch)
-            .ok_or_else(|| AgentSessionError::StaleGeneration(key.to_owned()))?;
+            .ok_or_else(|| AgentSessionError::StaleGeneration(key.to_string()))?;
         if let AgentSessionCore::OpenCode(core) = &mut session.core {
             core.set_protocol(protocol);
         }
@@ -1701,27 +1978,27 @@ impl AgentSessionManager {
 
     async fn read_opencode_v2_sync(
         &self,
-        key: &str,
+        key: &TranscriptKey,
         operation_epoch: u64,
-        session_id: &str,
+        session_id: &SessionId,
     ) -> Result<OpenCodeV2Sync, AgentSessionError> {
         let cached = {
             let mut state = self.inner.state.lock();
             let session = current_session_mut(&mut state, key, operation_epoch)
-                .ok_or_else(|| AgentSessionError::StaleGeneration(key.to_owned()))?;
+                .ok_or_else(|| AgentSessionError::StaleGeneration(key.to_string()))?;
             let cached = match &session.core {
                 AgentSessionCore::OpenCode(core) => core.v2_read_state(),
-                _ => return Err(AgentSessionError::StaleGeneration(key.to_owned())),
+                _ => return Err(AgentSessionError::StaleGeneration(key.to_string())),
             };
             drop(state);
             cached
         };
-        opencode_v2::fetch(session_id, cached, |command| async move {
+        opencode_v2::fetch(session_id.as_str(), cached, |command| async move {
             // Don't keep paging a transcript after the user switches sessions.
             {
                 let mut state = self.inner.state.lock();
                 if current_session_mut(&mut state, key, operation_epoch).is_none() {
-                    return Err(AgentSessionError::StaleGeneration(key.to_owned()));
+                    return Err(AgentSessionError::StaleGeneration(key.to_string()));
                 }
             }
             execute(&self.inner.connection, opencode_login_command(&command)).await
@@ -1731,7 +2008,7 @@ impl AgentSessionManager {
 
     fn finish_opencode_sync(
         &self,
-        key: &str,
+        key: &TranscriptKey,
         operation_epoch: u64,
         sync: OpenCodeSync<'_>,
     ) -> Result<(), String> {
@@ -1783,7 +2060,7 @@ impl AgentSessionManager {
                     || checkpoint_base.is_none_or(|base| {
                         cursor.saturating_sub(base) >= OPENCODE_CHECKPOINT_EVENTS
                     });
-                // A checkpoint serializes the entire transcript. Wait for SQLite
+                // A checkpoint serializes the entire transcript. Wait for database
                 // confirmation before producing another full copy of it.
                 let new_checkpoint = session.pending_cache_offset.is_none()
                     && checkpoint_due
@@ -1795,15 +2072,9 @@ impl AgentSessionManager {
                         session.pending_cache_offset = Some(cursor);
                         (blob, core.source_generation(), cursor)
                     });
-                let update = update.or_else(|| {
-                    cache.is_some().then(|| AgentTranscriptUpdate {
-                        revision: core.revision(),
-                        deltas: Vec::new(),
-                    })
-                });
                 (update, cache)
             };
-            let cache = cache_candidate.map(|(blob, source_generation, cursor)| {
+            if let Some((blob, source_generation, cursor)) = cache_candidate {
                 let checkpoint = state.next_checkpoint;
                 state.next_checkpoint = state.next_checkpoint.saturating_add(1);
                 let token = format!("checkpoint-{checkpoint}");
@@ -1815,24 +2086,24 @@ impl AgentSessionManager {
                         offset: cursor,
                     },
                 );
-                AgentTranscriptCacheWrite {
-                    namespace: self.inner.runtime_id.clone(),
-                    key: key.to_owned(),
-                    blob,
-                    confirmation_token: token,
-                }
-            });
-            let emission = update.map(|update| (update, cache));
+                persist_checkpoint(&self.inner, &state, key, token, blob);
+            }
+            let emission = update;
             drop(state);
             emission
         };
-        if let Some((update, cache)) = emission {
-            emit(&self.inner, key.to_owned(), operation_epoch, update, cache);
+        if let Some(update) = emission {
+            emit(&self.inner, key.to_owned(), operation_epoch, update);
         }
         Ok(())
     }
 
-    fn schedule_opencode_poll(&self, key: String, operation_epoch: u64, session_id: String) {
+    fn schedule_opencode_poll(
+        &self,
+        key: TranscriptKey,
+        operation_epoch: u64,
+        session_id: SessionId,
+    ) {
         let delay = {
             let mut state = self.inner.state.lock();
             let Some(session) = current_session_mut(&mut state, &key, operation_epoch) else {
@@ -1873,7 +2144,7 @@ impl AgentSessionManager {
 
     fn fail_session(
         &self,
-        key: String,
+        key: TranscriptKey,
         operation_epoch: u64,
         reason: String,
         kind: SessionFailureKind,
@@ -1883,7 +2154,7 @@ impl AgentSessionManager {
 
     fn fail_session_inner(
         &self,
-        key: String,
+        key: TranscriptKey,
         operation_epoch: u64,
         reason: String,
         kind: SessionFailureKind,
@@ -1921,7 +2192,7 @@ impl AgentSessionManager {
             drop(state);
             result
         };
-        emit(&self.inner, key.clone(), operation_epoch, emission, None);
+        emit(&self.inner, key.clone(), operation_epoch, emission);
         let Some(retry_delay) = retry_delay else {
             return;
         };
@@ -1956,7 +2227,7 @@ fn should_restart_on_start(
 
 fn current_session_mut<'a>(
     state: &'a mut ManagerState,
-    key: &str,
+    key: &TranscriptKey,
     operation_epoch: u64,
 ) -> Option<&'a mut SessionRuntime> {
     if !state.connected {
@@ -1995,13 +2266,95 @@ fn completes_turn(update: &AgentTranscriptUpdate) -> bool {
     })
 }
 
+fn persist_checkpoint(
+    manager: &Arc<AgentSessionManagerInner>,
+    state: &ManagerState,
+    key: &TranscriptKey,
+    token: String,
+    blob: Vec<u8>,
+) {
+    let Some(database) = &manager.database else {
+        return;
+    };
+    let Some(session) = state.sessions.get(key) else {
+        return;
+    };
+    let identity = TranscriptIdentity {
+        namespace: manager.runtime_id.clone(),
+        agent: session.core.kind(),
+        session_id: session.session_id.clone().into(),
+    };
+    let weak = Arc::downgrade(manager);
+    let _ = database.save(identity, manager.runtime_incarnation, blob, move |result| {
+        let Some(inner) = weak.upgrade() else {
+            return;
+        };
+        let manager = AgentSessionManager { inner };
+        match result {
+            Ok(true) => {
+                manager.confirm_cache(&token);
+            }
+            Ok(false) | Err(_) => {
+                let failure = {
+                    let mut state = manager.inner.state.lock();
+                    let checkpoint = state.checkpoints.remove(&token);
+                    let failure = checkpoint.and_then(|checkpoint| {
+                        let session = state.sessions.get_mut(&checkpoint.session_key)?;
+                        if session.pending_cache_offset != Some(checkpoint.offset)
+                            || session.core.source_generation() != checkpoint.source_generation
+                        {
+                            return None;
+                        }
+                        session.pending_cache_offset = None;
+                        result.err().map(|error| {
+                            let update = session.core.mark_stale_update(format!(
+                                "Could not persist transcript: {error}"
+                            ));
+                            (checkpoint.session_key, session.operation_epoch, update)
+                        })
+                    });
+                    drop(state);
+                    failure
+                };
+                if let Some((key, epoch, update)) = failure {
+                    emit(&manager.inner, key, epoch, update);
+                }
+            }
+        }
+    });
+}
+
 fn emit(
     manager: &Arc<AgentSessionManagerInner>,
-    key: String,
+    key: TranscriptKey,
     operation_epoch: u64,
     update: AgentTranscriptUpdate,
-    cache_write: Option<AgentTranscriptCacheWrite>,
 ) {
+    let current = manager
+        .state
+        .lock()
+        .sessions
+        .get(&key)
+        .is_some_and(|session| session.operation_epoch == operation_epoch);
+    if current {
+        let mut registry = manager.rows.lock();
+        if let Some(owners) = registry.get_mut(&key) {
+            owners.retain(|owner| {
+                let Some(owner) = owner.upgrade() else {
+                    return false;
+                };
+                let mut projection = owner.projection.lock();
+                if projection.disposed {
+                    return false;
+                }
+                projection.accept(&update);
+                true
+            });
+            if owners.is_empty() {
+                registry.remove(&key);
+            }
+        }
+    }
     EVENT_SINK_INFLIGHT.fetch_add(1, Ordering::SeqCst);
     let sink = event_sink().read().clone();
     if let Some(sink) = sink {
@@ -2009,9 +2362,8 @@ fn emit(
             runtime_id: manager.runtime_id.clone(),
             runtime_incarnation: manager.runtime_incarnation,
             operation_epoch,
-            key,
+            key: key.into(),
             update,
-            cache_write,
         });
     }
     EVENT_SINK_INFLIGHT.fetch_sub(1, Ordering::SeqCst);
@@ -2060,9 +2412,8 @@ fn stream_data(context: u64, bytes: Vec<u8>) {
                     let checkpoint_due = update.as_ref().is_some_and(completes_turn)
                         || result.committable_offset.saturating_sub(checkpoint_base)
                             >= FILE_CHECKPOINT_BYTES;
-                    // Each cache blob contains all prior JSONL lines. Sending
-                    // another while one is crossing the bridge can retain many
-                    // large copies of the same history in native and JS memory.
+                    // Keep at most one full checkpoint in flight per session.
+                    // Its durable cursor advances only after the worker commits.
                     let new_checkpoint = core.initial_history_caught_up()
                         && session.pending_cache_offset.is_none()
                         && checkpoint_due
@@ -2074,12 +2425,6 @@ fn stream_data(context: u64, bytes: Vec<u8>) {
                             session.pending_cache_offset = Some(result.committable_offset);
                             (blob, result.committable_offset)
                         });
-                    let update = update.or_else(|| {
-                        cache.is_some().then(|| AgentTranscriptUpdate {
-                            revision: core.revision(),
-                            deltas: Vec::new(),
-                        })
-                    });
                     (update, cache)
                 }
                 Err(error) => (
@@ -2088,7 +2433,7 @@ fn stream_data(context: u64, bytes: Vec<u8>) {
                 ),
             }
         };
-        let cache = cache_candidate.map(|(blob, offset)| {
+        if let Some((blob, offset)) = cache_candidate {
             let checkpoint = state.next_checkpoint;
             state.next_checkpoint = state.next_checkpoint.saturating_add(1);
             let token = format!("checkpoint-{checkpoint}");
@@ -2100,22 +2445,17 @@ fn stream_data(context: u64, bytes: Vec<u8>) {
                     offset,
                 },
             );
-            AgentTranscriptCacheWrite {
-                namespace: manager.runtime_id.clone(),
-                key: context_value.session_key.clone(),
-                blob,
-                confirmation_token: token,
-            }
-        });
-        update.map(|update| (update, cache))
+            persist_checkpoint(&manager, &state, &context_value.session_key, token, blob);
+        }
+        drop(state);
+        update
     };
-    if let Some((update, cache)) = emission {
+    if let Some(update) = emission {
         emit(
             &manager,
             context_value.session_key,
             context_value.operation_epoch,
             update,
-            cache,
         );
     }
 }
@@ -2535,6 +2875,7 @@ struct FileSourceMetadata {
     file_id: String,
     size: u64,
     rollout_path: Option<String>,
+    codex_title: Option<codex_title::CodexTitleMetadata>,
 }
 
 impl FileSourceMetadata {
@@ -2552,6 +2893,9 @@ fn parse_file_source_poll(
     output: &str,
     rollout_session_id: Option<&str>,
 ) -> Result<FileSourceMetadata, AgentSessionError> {
+    let (output, codex_title) = rollout_session_id.map_or((output, None), |session_id| {
+        codex_title::split_output(output, session_id)
+    });
     let (metadata, paths) = if rollout_session_id.is_some() {
         output.split_once('\n').unwrap_or((output, ""))
     } else {
@@ -2566,6 +2910,7 @@ fn parse_file_source_poll(
         file_id,
         size,
         rollout_path,
+        codex_title,
     })
 }
 
@@ -2595,14 +2940,319 @@ mod tests {
     use super::*;
     use std::fmt::Write as _;
 
-    const SESSION: &str = "11111111-1111-4111-8111-111111111111";
+    pub(super) const SESSION: &str = "11111111-1111-4111-8111-111111111111";
 
-    fn test_manager(runtime_id: &str) -> AgentSessionManager {
+    #[test]
+    fn transcript_status_reads_do_not_allocate() {
+        fn assert_status(core: &AgentSessionCore, expected: AgentTranscriptStatus) {
+            let (status, _, allocations, bytes) =
+                crate::test_allocations::measured(|| std::hint::black_box(core).status());
+            assert_eq!(status, expected, "{:?}", core.kind());
+            assert_eq!(status, core.state().status);
+            assert_eq!((allocations, bytes), (0, 0), "{:?}", core.kind());
+        }
+
+        for (mut core, fixture) in [
+            (
+                AgentSessionCore::Claude(Box::new(ClaudeSessionCore::new(SESSION))),
+                &include_bytes!("../test-fixtures/claude/main.jsonl")[..],
+            ),
+            (
+                AgentSessionCore::Codex(Box::new(CodexSessionCore::new("thread-current"))),
+                &include_bytes!("../test-fixtures/codex/paginated-rollout.jsonl")[..],
+            ),
+            (
+                AgentSessionCore::OpenCode(Box::new(OpenCodeSessionCore::new(SESSION))),
+                &[][..],
+            ),
+        ] {
+            assert_status(&core, AgentTranscriptStatus::Loading);
+            core.mark_unavailable_update("missing source");
+            assert_status(&core, AgentTranscriptStatus::Unavailable);
+            core.mark_stale_update("offline");
+            assert_status(&core, AgentTranscriptStatus::Error);
+            core.mark_restarting_update("retrying");
+            assert_status(&core, AgentTranscriptStatus::Loading);
+
+            if let Some(file) = core.file() {
+                let binding =
+                    file.bind_source("/transcript".into(), "1:2".into(), fixture.len() as u64);
+                file.ingest(binding.source_generation, fixture).unwrap();
+                file.mark_live_update();
+            } else if let AgentSessionCore::OpenCode(core) = &mut core {
+                let export = serde_json::json!({
+                    "info": { "id": SESSION },
+                    "messages": [{
+                        "info": { "id": "user", "role": "user" },
+                        "parts": [{ "id": "text", "type": "text", "text": "Hello" }]
+                    }]
+                });
+                core.bootstrap(1, &export.to_string()).unwrap();
+                core.mark_live_update();
+            }
+            let snapshot = core.state();
+            assert!(!snapshot.messages.is_empty());
+            assert!(!snapshot.turns.is_empty());
+            assert_status(&core, AgentTranscriptStatus::Live);
+            core.mark_stale_update("offline");
+            assert_status(&core, AgentTranscriptStatus::Stale);
+            core.close_update();
+            assert_status(&core, AgentTranscriptStatus::Closed);
+        }
+    }
+
+    pub(super) fn test_manager(runtime_id: &str) -> AgentSessionManager {
         AgentSessionManager::new(
             runtime_id.to_owned(),
             1,
-            HerdrConnection::new(runtime_id.to_owned(), String::new(), None, None),
+            HerdrConnection::new(runtime_id.to_owned(), String::new(), None, None, true),
         )
+    }
+
+    #[test]
+    fn late_codex_title_reads_cannot_update_rebound_or_unloaded_conversations() {
+        let manager = test_manager("title-host");
+        manager.inner.state.lock().connected = true;
+        let first = manager
+            .bind_codex("terminal".into(), SESSION.into())
+            .unwrap();
+        let epoch = manager.inner.state.lock().sessions[&first.transcript_key].operation_epoch;
+        manager.update_codex_title(
+            &first.transcript_key,
+            epoch,
+            &first.session_id,
+            Some("First title"),
+        );
+        assert_eq!(
+            manager
+                .state(&first.transcript_key)
+                .unwrap()
+                .info
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("First title")
+        );
+        manager.update_codex_title(
+            &first.transcript_key,
+            epoch + 1,
+            &first.session_id,
+            Some("Stale operation"),
+        );
+        assert_eq!(
+            manager
+                .state(&first.transcript_key)
+                .unwrap()
+                .info
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("First title")
+        );
+        let next_id = "22222222-2222-4222-8222-222222222222";
+        let second = manager
+            .bind_codex("terminal".into(), next_id.into())
+            .unwrap();
+        manager.update_codex_title(
+            &first.transcript_key,
+            epoch,
+            &first.session_id,
+            Some("Late first title"),
+        );
+        assert_eq!(
+            manager
+                .state(&second.transcript_key)
+                .unwrap()
+                .info
+                .unwrap()
+                .title,
+            None
+        );
+        manager.close_terminal(&"terminal".into());
+        manager.update_codex_title(
+            &first.transcript_key,
+            epoch,
+            &first.session_id,
+            Some("Detached title"),
+        );
+        assert!(manager.state(&first.transcript_key).is_none());
+        assert!(manager.state(&second.transcript_key).is_none());
+    }
+
+    #[test]
+    fn chat_search_reads_native_history_reconciles_replacements_and_rejects_detachment() {
+        let manager = test_manager("search-host");
+        let binding = manager
+            .bind_codex("terminal".into(), SESSION.into())
+            .unwrap();
+        let index =
+            crate::ChatSearchIndex::for_live(manager.clone(), binding.transcript_key.clone());
+        let replace = |file: &str, prompt: &str| {
+            let lines = format!(
+                "{}\n{}\n",
+                serde_json::json!({"type":"session_meta","payload":{}}),
+                serde_json::json!({"type":"event_msg","payload":{"type":"user_message","message":prompt}}),
+            );
+            let mut state = manager.inner.state.lock();
+            let session = state.sessions.get_mut(&binding.transcript_key).unwrap();
+            let AgentSessionCore::Codex(core) = &mut session.core else {
+                panic!("expected Codex core");
+            };
+            let source = core.bind_source("/rollout".into(), file.into(), lines.len() as u64);
+            core.ingest(source.source_generation, lines.as_bytes())
+                .unwrap();
+            drop(state);
+        };
+        replace("1:2", "native needle");
+        let results =
+            futures::executor::block_on(index.clone().search("needle".into(), None)).unwrap();
+        assert_eq!(results.matches.len(), 1);
+        let revision = manager.state(&binding.transcript_key).unwrap().revision;
+        assert!(
+            manager
+                .search_snapshot(&binding.transcript_key, Some(revision))
+                .unwrap()
+                .is_none()
+        );
+        replace("1:3", "replacement prompt");
+        let results =
+            futures::executor::block_on(index.clone().search("needle".into(), None)).unwrap();
+        assert!(results.matches.is_empty());
+        let results =
+            futures::executor::block_on(index.clone().search("replacement".into(), None)).unwrap();
+        assert_eq!(results.matches.len(), 1);
+        manager.detach_terminal(&"terminal".into()).unwrap();
+        assert!(matches!(
+            futures::executor::block_on(index.search("replacement".into(), None)),
+            Err(AgentSessionError::SessionClosed(_))
+        ));
+    }
+
+    fn persisted_test_manager(runtime_id: &str) -> (tempfile::TempDir, AgentSessionManager) {
+        let directory = tempfile::tempdir().unwrap();
+        let mut manager = test_manager(runtime_id);
+        let database =
+            TranscriptDatabase::open(directory.path().join("conversations.db"), Vec::new())
+                .unwrap();
+        database.activate(runtime_id.to_owned(), 1);
+        Arc::get_mut(&mut manager.inner).unwrap().database = Some(database);
+        (directory, manager)
+    }
+
+    #[test]
+    fn native_chat_rows_follow_deltas_rebind_dispose_and_restore_offline() {
+        use crate::{AgentChatRowPatch, AgentChatRows};
+        let (_directory, manager) = persisted_test_manager("row-owner-test");
+        let binding = manager
+            .bind_codex("terminal".into(), SESSION.into())
+            .unwrap();
+        let (database, identity) = {
+            let mut state = manager.inner.state.lock();
+            let session = state.sessions.get_mut(&binding.transcript_key).unwrap();
+            let AgentSessionCore::Codex(core) = &mut session.core else {
+                panic!("expected Codex");
+            };
+            let lines = concat!(
+                "{\"type\":\"session_meta\",\"payload\":{}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"Initial prompt\"}}\n"
+            );
+            let source = core.bind_source("/rollout".into(), "1:2".into(), lines.len() as u64);
+            core.ingest(source.source_generation, lines.as_bytes())
+                .unwrap();
+            drop(state);
+            (
+                manager.inner.database.clone().unwrap(),
+                TranscriptIdentity {
+                    namespace: "row-owner-test".into(),
+                    agent: AgentTranscriptKind::Codex,
+                    session_id: SESSION.into(),
+                },
+            )
+        };
+        let owner = AgentChatRows::for_live(manager.clone(), binding.transcript_key.clone());
+        let initial = futures::executor::block_on(owner.clone().poll(0, 0, false, vec![])).unwrap();
+        assert!(
+            matches!(&initial.patches[..], [AgentChatRowPatch::Reset { rows }] if rows.len() == 2)
+        );
+        let (epoch, delta, blob) = {
+            let mut state = manager.inner.state.lock();
+            let session = state.sessions.get_mut(&binding.transcript_key).unwrap();
+            let AgentSessionCore::Codex(core) = &mut session.core else {
+                panic!("expected Codex");
+            };
+            let line = "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"Next prompt\"}}\n";
+            let update = core
+                .ingest(core.source_generation(), line.as_bytes())
+                .unwrap()
+                .update
+                .unwrap();
+            let emission = (session.operation_epoch, update, core.cache_blob().unwrap());
+            drop(state);
+            emission
+        };
+        let revision = delta.revision;
+        emit(&manager.inner, binding.transcript_key.clone(), epoch, delta);
+        let appended = futures::executor::block_on(owner.clone().poll(
+            initial.revision,
+            revision,
+            false,
+            vec![],
+        ))
+        .unwrap();
+        assert!(
+            appended
+                .patches
+                .iter()
+                .all(|patch| matches!(patch, AgentChatRowPatch::Splice { .. }))
+        );
+        assert!(!appended.patches.is_empty());
+        owner.dispose();
+        assert!(
+            !manager
+                .inner
+                .rows
+                .lock()
+                .contains_key(&binding.transcript_key)
+        );
+        assert!(
+            futures::executor::block_on(owner.poll(appended.revision, revision, false, vec![]))
+                .is_err()
+        );
+        let replacement = AgentChatRows::for_live(manager.clone(), binding.transcript_key.clone());
+        let reopened =
+            futures::executor::block_on(replacement.clone().poll(0, revision, false, vec![]))
+                .unwrap();
+        emit(
+            &manager.inner,
+            binding.transcript_key,
+            epoch + 1,
+            AgentTranscriptUpdate::reset(AgentTranscriptState::empty(
+                SESSION.into(),
+                AgentTranscriptKind::Codex,
+            )),
+        );
+        let stale = futures::executor::block_on(replacement.clone().poll(
+            reopened.revision,
+            revision,
+            false,
+            vec![],
+        ))
+        .unwrap();
+        assert!(stale.patches.is_empty());
+        replacement.dispose();
+        let (done, saved) = std::sync::mpsc::channel();
+        database
+            .save(identity.clone(), 1, blob, move |result| {
+                done.send(result).unwrap();
+            })
+            .unwrap();
+        assert!(saved.recv().unwrap().unwrap());
+        manager.detach_terminal(&"terminal".into()).unwrap();
+        let offline = AgentChatRows::for_checkpoint(database, identity);
+        let restored =
+            futures::executor::block_on(offline.clone().poll(0, 0, false, vec![])).unwrap();
+        assert_eq!(restored.patches, reopened.patches);
+        offline.dispose();
     }
 
     #[test]
@@ -2840,9 +3490,11 @@ mod tests {
                     3,
                 ),
                 "unknown" => manager.update_agent_statuses(HashMap::new(), 3),
-                "input" => manager.wake_pane(&binding.pane_id),
+                "input" => manager.wake_pane(binding.pane_id.as_str()),
                 "open" => {
-                    manager.start_bound(&binding.binding_token, None).unwrap();
+                    manager
+                        .start_restored(&binding.binding_token, None)
+                        .unwrap();
                 }
                 _ => unreachable!(),
             }
@@ -3052,13 +3704,16 @@ mod tests {
             .ingest(source.source_generation, codex_lines.as_bytes())
             .unwrap();
         let blob = codex.cache_blob().unwrap();
-        let saved =
-            read_cached_agent_transcript(AgentTranscriptKind::Codex, SESSION.into(), blob.clone())
-                .unwrap();
+        let saved = decode_cached_agent_transcript(
+            AgentTranscriptKind::Codex,
+            SESSION.into(),
+            blob.clone(),
+        )
+        .unwrap();
         assert_eq!(saved.status, AgentTranscriptStatus::Stale);
         assert!(!saved.messages.is_empty());
         assert!(matches!(
-            read_cached_agent_transcript(AgentTranscriptKind::Codex, "other".into(), blob),
+            decode_cached_agent_transcript(AgentTranscriptKind::Codex, "other".into(), blob),
             Err(AgentSessionError::CorruptedCache(_))
         ));
 
@@ -3066,7 +3721,7 @@ mod tests {
         opencode
             .bootstrap(1, r#"{"info":{"id":"ses_saved"},"messages":[]}"#)
             .unwrap();
-        let saved = read_cached_agent_transcript(
+        let saved = decode_cached_agent_transcript(
             AgentTranscriptKind::OpenCode,
             "ses_saved".into(),
             opencode.cache_blob().unwrap(),
@@ -3149,16 +3804,20 @@ mod tests {
         let binding = core.bind_source("/transcript".into(), "1:2".into(), fixture.len() as u64);
         core.ingest(binding.source_generation, fixture).unwrap();
         let blob = core.cache_blob().unwrap();
-        let saved =
-            read_cached_agent_transcript(AgentTranscriptKind::Claude, SESSION.into(), blob.clone())
-                .unwrap();
+        let saved = decode_cached_agent_transcript(
+            AgentTranscriptKind::Claude,
+            SESSION.into(),
+            blob.clone(),
+        )
+        .unwrap();
         assert_eq!(saved.agent, AgentTranscriptKind::Claude);
         assert_eq!(saved.status, AgentTranscriptStatus::Stale);
         assert_eq!(saved.messages.len(), 5);
         assert!(
-            read_cached_agent_transcript(AgentTranscriptKind::Codex, SESSION.into(), blob).is_err()
+            decode_cached_agent_transcript(AgentTranscriptKind::Codex, SESSION.into(), blob)
+                .is_err()
         );
-        let manager = test_manager("claude-cache");
+        let (_directory, manager) = persisted_test_manager("claude-cache");
         let identity = AuthoritativeAgentChatIdentity {
             terminal_id: "terminal".into(),
             pane_id: "pane".into(),
@@ -3174,36 +3833,27 @@ mod tests {
                 .unwrap()
                 .core = AgentSessionCore::Claude(Box::new(core));
         }
-        let archive = manager.detach_terminal("terminal").unwrap().unwrap();
-        assert_eq!(archive.key, binding.transcript_key);
+        manager.detach_terminal(&"terminal".into()).unwrap();
         assert_eq!(
-            read_cached_agent_transcript(AgentTranscriptKind::Claude, SESSION.into(), archive.blob)
-                .unwrap()
-                .messages,
-            saved.messages
-        );
-    }
-
-    #[test]
-    fn opencode_commands_use_the_official_read_only_db_interface() {
-        assert_eq!(
-            opencode_export_command("ses_abc123"),
-            "opencode export 'ses_abc123'"
-        );
-        let session_literal = "char(115,101,115,95,97,98,99,49,50,51)";
-        assert!(opencode_cursor_command("ses_abc123").contains(&format!(
-            "MAX(seq), 0) AS seq FROM event WHERE aggregate_id = {session_literal}"
-        )));
-        assert!(
-            opencode_events_command("ses_abc123", 42)
-                .contains(&format!("aggregate_id = {session_literal} AND seq > 42"))
-        );
-        assert_eq!(
-            opencode_login_command("opencode export 'ses_abc123'"),
-            concat!(
-                "exec /bin/sh -c 'exec \"${SHELL:-/bin/sh}\" -lc \"$1\"' ",
-                "whip-opencode 'opencode export '\\''ses_abc123'\\'''"
+            decode_cached_agent_transcript(
+                AgentTranscriptKind::Claude,
+                SESSION.into(),
+                crate::runtime()
+                    .unwrap()
+                    .block_on(
+                        manager
+                            .inner
+                            .database
+                            .as_ref()
+                            .unwrap()
+                            .load(binding.transcript_key.into())
+                    )
+                    .unwrap()
+                    .unwrap()
             )
+            .unwrap()
+            .messages,
+            saved.messages
         );
     }
 
@@ -3384,7 +4034,7 @@ mod tests {
                 .changed
         );
         assert_eq!(core.state(), state);
-        let saved = read_cached_agent_transcript(
+        let saved = decode_cached_agent_transcript(
             AgentTranscriptKind::Codex,
             SESSION.into(),
             core.cache_blob().unwrap(),
@@ -3433,13 +4083,6 @@ mod tests {
     }
 
     #[test]
-    fn rollout_discovery_searches_ordinary_and_reverted_names() {
-        let command = codex_rollout_find_command(SESSION);
-        assert!(command.contains(&format!("'rollout-*-{SESSION}.jsonl'")));
-        assert!(command.contains(&format!("'rollout-*-{SESSION}_*.jsonl'")));
-    }
-
-    #[test]
     fn metadata_validation_preserves_file_identity_and_size() {
         assert_eq!(
             parse_metadata("12:34 456\n").unwrap(),
@@ -3456,24 +4099,12 @@ mod tests {
     #[test]
     fn file_source_poll_preserves_stat_only_append_and_truncation_checks() {
         let path = "/claude/transcript.jsonl";
-        assert_eq!(
-            file_source_poll_command(path, None),
-            file_metadata_command(path)
-        );
         let appended = parse_file_source_poll("12:34 101\n", None).unwrap();
         assert!(!appended.changed(path, "12:34", 100, 100));
         assert!(appended.changed(path, "12:35", 100, 100));
         assert!(appended.changed(path, "12:34", 102, 100));
         assert!(appended.changed(path, "12:34", 100, 102));
         assert!(parse_file_source_poll("12:34 nope\n", None).is_err());
-    }
-
-    #[test]
-    fn stream_command_matches_the_pre_migration_binary_path() {
-        assert_eq!(
-            file_stream_command("/tmp/rollout's file.jsonl", 123),
-            "exec tail -c '+124' -F '/tmp/rollout'\\''s file.jsonl'"
-        );
     }
 
     #[test]
@@ -3484,9 +4115,9 @@ mod tests {
             .unwrap();
         let token = &binding.binding_token;
         let revision = binding.state.revision;
-        assert!(manager.terminal_binding_is_current("terminal", token, revision));
-        assert!(!manager.terminal_binding_is_current("missing", token, revision));
-        assert!(!manager.terminal_binding_is_current("terminal", "old-token", revision));
+        assert!(manager.terminal_binding_is_current(&"terminal".into(), token, revision));
+        assert!(!manager.terminal_binding_is_current(&"missing".into(), token, revision));
+        assert!(!manager.terminal_binding_is_current(&"terminal".into(), "old-token", revision));
         {
             let mut state = manager.inner.state.lock();
             state
@@ -3496,24 +4127,32 @@ mod tests {
                 .core
                 .mark_stale_update("connection interrupted");
         }
-        assert!(!manager.terminal_binding_is_current("terminal", token, revision));
+        assert!(!manager.terminal_binding_is_current(&"terminal".into(), token, revision));
         let updated = manager.terminal_binding("terminal").unwrap();
-        assert!(manager.terminal_binding_is_current("terminal", token, updated.state.revision));
+        assert!(manager.terminal_binding_is_current(
+            &"terminal".into(),
+            token,
+            updated.state.revision
+        ));
         let replacement = manager
             .bind_codex(
                 "terminal".into(),
                 "22222222-2222-4222-8222-222222222222".into(),
             )
             .unwrap();
-        assert!(!manager.terminal_binding_is_current("terminal", token, updated.state.revision));
+        assert!(!manager.terminal_binding_is_current(
+            &"terminal".into(),
+            token,
+            updated.state.revision
+        ));
         assert!(manager.terminal_binding_is_current(
-            "terminal",
+            &"terminal".into(),
             &replacement.binding_token,
             replacement.state.revision,
         ));
-        manager.close_terminal("terminal");
+        manager.close_terminal(&"terminal".into());
         assert!(!manager.terminal_binding_is_current(
-            "terminal",
+            &"terminal".into(),
             &replacement.binding_token,
             replacement.state.revision,
         ));
@@ -3530,7 +4169,7 @@ mod tests {
             .bind_codex("terminal-2".into(), second.into())
             .unwrap();
         assert_ne!(first.transcript_key, second.transcript_key);
-        manager.close_terminal("terminal-1");
+        manager.close_terminal(&"terminal-1".into());
         assert!(manager.state(&first.transcript_key).is_none());
         assert!(manager.state(&second.transcript_key).is_some());
     }
@@ -3552,8 +4191,14 @@ mod tests {
             .bind_codex("terminal-codex".into(), SESSION.into())
             .unwrap();
 
-        assert_eq!(codex.transcript_key, format!("host-a\ncodex\n{SESSION}"));
-        assert_eq!(opencode.transcript_key, "host-a\nopencode\nses_abc123");
+        assert_eq!(
+            codex.transcript_key.as_str(),
+            format!("host-a\ncodex\n{SESSION}")
+        );
+        assert_eq!(
+            opencode.transcript_key.as_str(),
+            "host-a\nopencode\nses_abc123"
+        );
         assert_ne!(codex.transcript_key, opencode.transcript_key);
         assert_ne!(codex.transcript_key, other_host.transcript_key);
 
@@ -3617,6 +4262,85 @@ mod tests {
     }
 
     #[test]
+    fn database_commit_confirms_the_cursor_and_restores_offline_without_a_platform_ack() {
+        let (_directory, manager) = persisted_test_manager("durable-host");
+        manager.inner.state.lock().connected = true;
+        let binding = manager
+            .bind_codex("terminal".into(), SESSION.into())
+            .unwrap();
+        let database = manager.inner.database.as_ref().unwrap();
+        let release = database.hold_worker();
+        let mut bytes = include_bytes!("../test-fixtures/codex/paginated-rollout.jsonl").to_vec();
+        bytes.extend_from_slice(
+            format!(
+                "{{\"type\":\"ignored\",\"data\":\"{}\"}}\n",
+                "x".repeat(usize::try_from(FILE_CHECKPOINT_BYTES).unwrap())
+            )
+            .as_bytes(),
+        );
+        let context = NEXT_STREAM_CONTEXT.fetch_add(1, Ordering::Relaxed);
+        let stream_context = {
+            let mut state = manager.inner.state.lock();
+            let session = state.sessions.get_mut(&binding.transcript_key).unwrap();
+            session.stream_context = Some(context);
+            let AgentSessionCore::Codex(core) = &mut session.core else {
+                unreachable!()
+            };
+            let source = core.bind_source("/rollout".into(), "1:2".into(), bytes.len() as u64);
+            let context = StreamContext {
+                manager: Arc::downgrade(&manager.inner),
+                session_key: binding.transcript_key.clone(),
+                source_generation: source.source_generation,
+                operation_epoch: session.operation_epoch,
+            };
+            drop(state);
+            context
+        };
+        streams().write().insert(context, stream_context);
+        stream_data(context, bytes.clone());
+        {
+            let state = manager.inner.state.lock();
+            let AgentSessionCore::Codex(core) = &state.sessions[&binding.transcript_key].core
+            else {
+                unreachable!()
+            };
+            assert_eq!(core.committed_offset(), 0);
+            assert_eq!(state.checkpoints.len(), 1);
+            drop(state);
+        }
+        release.send(()).unwrap();
+        crate::runtime().unwrap().block_on(database.list()).unwrap();
+        {
+            let state = manager.inner.state.lock();
+            let AgentSessionCore::Codex(core) = &state.sessions[&binding.transcript_key].core
+            else {
+                unreachable!()
+            };
+            assert_eq!(core.committed_offset(), bytes.len() as u64);
+            assert!(state.checkpoints.is_empty());
+            drop(state);
+        }
+        let expected = manager.state(&binding.transcript_key).unwrap().messages;
+        manager.detach_terminal(&"terminal".into()).unwrap();
+        manager.inner.state.lock().connected = false;
+        let reopened = manager
+            .bind_codex("terminal".into(), SESSION.into())
+            .unwrap();
+        let AgentChatStartResult::Started { state } = crate::runtime()
+            .unwrap()
+            .block_on(manager.start_bound(&reopened.binding_token))
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(state.messages, expected);
+        assert!(!state.messages.is_empty());
+        // Live-session readiness still requires remote boundary validation;
+        // saved offline projections independently expose this content as Stale.
+        assert_eq!(state.status, AgentTranscriptStatus::Loading);
+    }
+
+    #[test]
     fn shared_session_lives_until_its_last_terminal_detaches() {
         let manager = test_manager("host");
         let first = manager
@@ -3626,12 +4350,12 @@ mod tests {
             .bind_codex("terminal-2".into(), SESSION.into())
             .unwrap();
         assert_eq!(second.transcript_key, first.transcript_key);
-        manager.start_bound(&first.binding_token, None).unwrap();
+        manager.start_restored(&first.binding_token, None).unwrap();
 
-        assert_eq!(manager.detach_terminal("terminal-1").unwrap(), None);
+        manager.detach_terminal(&"terminal-1".into()).unwrap();
         assert!(manager.state(&first.transcript_key).is_some());
         assert_eq!(
-            manager.close_terminal("terminal-2"),
+            manager.close_terminal(&"terminal-2".into()),
             Some(first.transcript_key.clone())
         );
         assert!(manager.state(&first.transcript_key).is_none());
@@ -3639,7 +4363,7 @@ mod tests {
 
     #[test]
     fn inactive_codex_history_is_archived_and_restores_without_retaining_a_core() {
-        let manager = test_manager("host");
+        let (_directory, manager) = persisted_test_manager("host");
         let binding = manager
             .bind_codex("terminal".into(), SESSION.into())
             .unwrap();
@@ -3666,9 +4390,7 @@ mod tests {
             snapshot
         };
         assert!(!expected.messages.is_empty());
-        let archive = manager.detach_terminal("terminal").unwrap().unwrap();
-        assert_eq!(archive.namespace, "host");
-        assert_eq!(archive.key, binding.transcript_key);
+        manager.detach_terminal(&"terminal".into()).unwrap();
         assert!(manager.state(&binding.transcript_key).is_none());
         assert!(manager.state(&other.transcript_key).is_some());
         assert_eq!(manager.inner.state.lock().sessions.len(), 1);
@@ -3676,8 +4398,9 @@ mod tests {
             .bind_codex("terminal".into(), SESSION.into())
             .unwrap();
         assert_ne!(reopened.binding_token, binding.binding_token);
-        let AgentChatStartResult::Started { state } = manager
-            .start_bound(&reopened.binding_token, Some(archive.blob))
+        let AgentChatStartResult::Started { state } = crate::runtime()
+            .unwrap()
+            .block_on(manager.start_bound(&reopened.binding_token))
             .unwrap()
         else {
             panic!("expected restored session")
@@ -3699,10 +4422,12 @@ mod tests {
         let binding = manager
             .bind_codex("terminal".into(), SESSION.into())
             .unwrap();
-        assert_eq!(manager.detach_terminal("terminal").unwrap(), None);
+        manager.detach_terminal(&"terminal".into()).unwrap();
         assert!(manager.state(&binding.transcript_key).is_none());
         assert!(matches!(
-            manager.start_bound(&binding.binding_token, None).unwrap(),
+            manager
+                .start_restored(&binding.binding_token, None)
+                .unwrap(),
             AgentChatStartResult::StaleBinding
         ));
     }
@@ -3715,7 +4440,7 @@ mod tests {
             .unwrap();
         let epoch = manager.inner.state.lock().sessions[&binding.transcript_key].operation_epoch;
         assert!(manager.accepts_event(&binding.transcript_key, epoch));
-        manager.detach_terminal("terminal").unwrap();
+        manager.detach_terminal(&"terminal".into()).unwrap();
         assert!(!manager.accepts_event(&binding.transcript_key, epoch));
         manager
             .bind_codex("terminal".into(), SESSION.into())
@@ -3725,7 +4450,7 @@ mod tests {
 
     #[test]
     fn inactive_opencode_history_restores_its_messages_and_cursor() {
-        let manager = test_manager("host");
+        let (_directory, manager) = persisted_test_manager("host");
         let binding = manager
             .bind_opencode("terminal".into(), "ses_cache".into())
             .unwrap();
@@ -3755,13 +4480,14 @@ mod tests {
             drop(state);
             snapshot
         };
-        let archive = manager.detach_terminal("terminal").unwrap().unwrap();
+        manager.detach_terminal(&"terminal".into()).unwrap();
         assert!(manager.inner.state.lock().sessions.is_empty());
         let reopened = manager
             .bind_opencode("terminal".into(), "ses_cache".into())
             .unwrap();
-        let AgentChatStartResult::Started { state } = manager
-            .start_bound(&reopened.binding_token, Some(archive.blob))
+        let AgentChatStartResult::Started { state } = crate::runtime()
+            .unwrap()
+            .block_on(manager.start_bound(&reopened.binding_token))
             .unwrap()
         else {
             panic!("expected restored session")
@@ -3780,7 +4506,7 @@ mod tests {
     fn identity(terminal_id: &str, session_id: &str) -> AuthoritativeAgentChatIdentity {
         AuthoritativeAgentChatIdentity {
             terminal_id: terminal_id.into(),
-            pane_id: format!("pane-{terminal_id}"),
+            pane_id: format!("pane-{terminal_id}").into(),
             agent: AgentTranscriptKind::Codex,
             session_id: session_id.into(),
         }
@@ -3802,7 +4528,7 @@ mod tests {
         assert_eq!(
             retention.retained_keys,
             vec![
-                first.transcript_key.clone(),
+                first.transcript_key.to_string(),
                 format!("host\ncodex\n{unopened}"),
             ]
         );
@@ -3816,7 +4542,7 @@ mod tests {
         );
         assert!(manager.state(&first.transcript_key).is_some());
 
-        manager.close_terminal("second");
+        manager.close_terminal(&"second".into());
         manager.reconcile_authoritative_bindings(&identities, 3);
         assert!(
             manager.state(&first.transcript_key).is_none(),
@@ -3839,7 +4565,7 @@ mod tests {
         let first = manager
             .bind_codex("terminal".into(), SESSION.into())
             .unwrap();
-        manager.start_bound(&first.binding_token, None).unwrap();
+        manager.start_restored(&first.binding_token, None).unwrap();
         let old_epoch = {
             let mut state = manager.inner.state.lock();
             state.checkpoints.insert(
@@ -3857,12 +4583,14 @@ mod tests {
         let reopened = manager
             .bind_codex("terminal".into(), SESSION.into())
             .unwrap();
-        manager.start_bound(&reopened.binding_token, None).unwrap();
+        manager
+            .start_restored(&reopened.binding_token, None)
+            .unwrap();
         let mut state = manager.inner.state.lock();
         assert!(current_session_mut(&mut state, &reopened.transcript_key, old_epoch).is_none());
         drop(state);
         assert!(matches!(
-            manager.start_bound(&first.binding_token, None),
+            manager.start_restored(&first.binding_token, None),
             Ok(AgentChatStartResult::StaleBinding)
         ));
     }
@@ -3879,12 +4607,12 @@ mod tests {
             .unwrap();
 
         assert!(matches!(
-            manager.start_bound(&old.binding_token, None),
+            manager.start_restored(&old.binding_token, None),
             Ok(AgentChatStartResult::StaleBinding)
         ));
         assert!(manager.state(&old.transcript_key).is_none());
         assert!(matches!(
-            manager.start_bound(&new.binding_token, None),
+            manager.start_restored(&new.binding_token, None),
             Ok(AgentChatStartResult::Started { .. })
         ));
     }
@@ -3895,7 +4623,7 @@ mod tests {
         let first = manager
             .bind_codex("terminal".into(), SESSION.into())
             .unwrap();
-        manager.start_bound(&first.binding_token, None).unwrap();
+        manager.start_restored(&first.binding_token, None).unwrap();
         {
             let mut state = manager.inner.state.lock();
             let session = state.sessions.get_mut(&first.transcript_key).unwrap();
@@ -3906,7 +4634,7 @@ mod tests {
             let _ = core.mark_live_update();
             drop(state);
         }
-        manager.close_terminal("terminal");
+        manager.close_terminal(&"terminal".into());
 
         assert!(manager.state(&first.transcript_key).is_none());
         let reopened = manager
@@ -3915,7 +4643,7 @@ mod tests {
         assert_eq!(reopened.state.status, AgentTranscriptStatus::Loading);
         assert_ne!(reopened.binding_token, first.binding_token);
         assert!(matches!(
-            manager.start_bound(&reopened.binding_token, None),
+            manager.start_restored(&reopened.binding_token, None),
             Ok(AgentChatStartResult::Started { .. })
         ));
         {
@@ -3967,7 +4695,7 @@ mod tests {
         assert_eq!(manager.state(&replacement.transcript_key).unwrap(), before);
     }
 
-    fn discovery_fixture() -> (AgentSessionManager, AgentChatBinding, u64) {
+    fn discovery_fixture() -> (AgentSessionManager, BoundAgentChat, u64) {
         let manager = test_manager("discovery");
         manager.inner.state.lock().connected = true;
         let binding = manager
@@ -3984,7 +4712,7 @@ mod tests {
         (manager, binding, epoch)
     }
 
-    fn missing_rollout(manager: &AgentSessionManager, key: &str, epoch: u64) {
+    fn missing_rollout(manager: &AgentSessionManager, key: &TranscriptKey, epoch: u64) {
         manager.fail_session(
             key.to_owned(),
             epoch,
@@ -3993,7 +4721,7 @@ mod tests {
         );
     }
 
-    fn discovered_history(manager: &AgentSessionManager, key: &str, epoch: u64) {
+    fn discovered_history(manager: &AgentSessionManager, key: &TranscriptKey, epoch: u64) {
         let bytes = format!(
             "{}\n{}\n",
             serde_json::json!({"type":"session_meta","payload":{"id":SESSION}}),
@@ -4032,7 +4760,7 @@ mod tests {
             manager.inner.state.lock().sessions[&binding.transcript_key].discovery_retries,
             0
         );
-        manager.close_terminal("terminal");
+        manager.close_terminal(&"terminal".into());
     }
 
     #[test]
@@ -4101,7 +4829,7 @@ mod tests {
             assert_eq!(recovered.status, AgentTranscriptStatus::Live);
             assert_eq!(recovered.messages, usable.messages);
             assert_eq!(recovered.turns, usable.turns);
-            manager.close_terminal("terminal");
+            manager.close_terminal(&"terminal".into());
         }
     }
 
@@ -4149,13 +4877,15 @@ mod tests {
             drop(state);
             // Even retained stale history can explicitly restart an exhausted
             // discovery budget without waiting for a host reconnect.
-            manager.start_bound(&binding.binding_token, None).unwrap();
+            manager
+                .start_restored(&binding.binding_token, None)
+                .unwrap();
             let state = manager.inner.state.lock();
             let session = &state.sessions[&binding.transcript_key];
             assert_ne!(session.operation_epoch, epoch);
             assert_eq!(session.discovery_retries, 0);
             drop(state);
-            manager.close_terminal("terminal");
+            manager.close_terminal(&"terminal".into());
         }
     }
 
@@ -4165,7 +4895,9 @@ mod tests {
         missing_rollout(&manager, &binding.transcript_key, epoch);
         // start_bound invokes the same immediate restart even though the current
         // status is Loading rather than Error/Unavailable.
-        manager.start_bound(&binding.binding_token, None).unwrap();
+        manager
+            .start_restored(&binding.binding_token, None)
+            .unwrap();
         let state = manager.inner.state.lock();
         let session = &state.sessions[&binding.transcript_key];
         assert_ne!(session.operation_epoch, epoch);
@@ -4187,7 +4919,7 @@ mod tests {
             manager.inner.state.lock().sessions[&binding.transcript_key].operation_epoch,
             new_epoch
         );
-        manager.close_terminal("terminal");
+        manager.close_terminal(&"terminal".into());
     }
 
     #[test]
@@ -4197,7 +4929,7 @@ mod tests {
             missing_rollout(&manager, &binding.transcript_key, epoch);
             match action {
                 "detach" => {
-                    manager.detach_terminal("terminal").unwrap();
+                    manager.detach_terminal(&"terminal".into()).unwrap();
                 }
                 "replace" => {
                     manager
@@ -4224,7 +4956,7 @@ mod tests {
             );
             missing_rollout(&manager, &binding.transcript_key, epoch);
             assert_eq!(manager.terminal_binding("terminal"), before);
-            manager.close_terminal("terminal");
+            manager.close_terminal(&"terminal".into());
         }
     }
 
@@ -4247,7 +4979,7 @@ mod tests {
             AgentTranscriptStatus::Unavailable
         );
         assert!(!manager.inner.state.lock().sessions[&binding.transcript_key].retry_running);
-        manager.close_terminal("terminal");
+        manager.close_terminal(&"terminal".into());
     }
 
     #[test]
@@ -4255,12 +4987,12 @@ mod tests {
         let old = AgentSessionManager::new(
             "host".to_owned(),
             1,
-            HerdrConnection::new("host-old".to_owned(), String::new(), None, None),
+            HerdrConnection::new("host-old".to_owned(), String::new(), None, None, true),
         );
         let replacement = AgentSessionManager::new(
             "host".to_owned(),
             2,
-            HerdrConnection::new("host-new".to_owned(), String::new(), None, None),
+            HerdrConnection::new("host-new".to_owned(), String::new(), None, None, true),
         );
         let old_binding = old.bind_codex("terminal".into(), SESSION.into()).unwrap();
         let replacement_binding = replacement
@@ -4269,7 +5001,7 @@ mod tests {
 
         assert_ne!(old_binding.binding_token, replacement_binding.binding_token);
         assert!(matches!(
-            replacement.start_bound(&old_binding.binding_token, None),
+            replacement.start_restored(&old_binding.binding_token, None),
             Ok(AgentChatStartResult::StaleBinding)
         ));
     }

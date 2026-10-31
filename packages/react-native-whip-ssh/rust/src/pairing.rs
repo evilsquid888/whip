@@ -14,27 +14,37 @@ use sha2::{Digest, Sha256};
 use ssh_key::{PrivateKey, private::Ed25519Keypair};
 use tokio::time::timeout;
 
+use crate::host_runtime::{HostSshConfig, disconnect_sessions, ssh_config};
+use crate::ssh::{SshFailure, SshSession};
+
 const ENVELOPE_PREFIX: &str = "WP4:";
 const BASE45_ALPHABET: &[u8; 45] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:";
 const ADDRESS_IPV4: u8 = 1;
 const ADDRESS_IPV6: u8 = 2;
 const ADDRESS_HOSTNAME: u8 = 3;
+const ADDRESS_TAILCAT: u8 = 4;
 const MAX_HOSTNAME_BYTES: usize = 253;
-const MAX_BASE45_BYTES: usize = 461;
+const MAX_TAILCAT_ADDRESS_BYTES: usize = 1024;
+const MAX_BASE45_BYTES: usize = (MAX_TAILCAT_ADDRESS_BYTES + 3 + 2 + 1 + 255 + 64).div_ceil(2) * 3;
 const MAX_MESSAGE_BYTES: usize = 16 * 1024;
 const ED25519_SEED_BYTES: usize = 32;
 const SHA256_BYTES: usize = 32;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const TAILCAT_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 const APPROVAL_TIMEOUT: Duration = Duration::from_mins(10);
 
 #[derive(Debug, thiserror::Error)]
-pub enum PairingError {
+pub(crate) enum PairingError {
     #[error("pairing code has the wrong prefix or version")]
     BadPrefix,
     #[error("pairing code is not valid Base45")]
     BadEncoding,
     #[error("pairing code contains an invalid SSH profile")]
     BadPayload,
+    #[error("Tailcat pairing cannot use a jump host")]
+    TailcatJumpHost,
+    #[error("Tailcat connection failed; check the address and server")]
+    TailcatConnection,
     #[error("SSH pairing connection timed out")]
     ConnectionTimeout,
     #[error("host approval timed out")]
@@ -57,6 +67,22 @@ pub enum PairingError {
     SshKey(#[from] ssh_key::Error),
     #[error("{0}")]
     Json(#[from] serde_json::Error),
+    #[error("jump host: {0}")]
+    JumpHost(#[from] SshFailure),
+}
+
+#[derive(Default)]
+struct PairingJumpSessions(Vec<Arc<SshSession>>);
+
+impl Drop for PairingJumpSessions {
+    fn drop(&mut self) {
+        let sessions = std::mem::take(&mut self.0);
+        if !sessions.is_empty()
+            && let Ok(runtime) = crate::runtime()
+        {
+            runtime.spawn(disconnect_sessions(sessions));
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, uniffi::Record)]
@@ -69,11 +95,29 @@ pub struct PairHostResult {
     pub ssh_host_public_key: String,
     pub key_fingerprint: Option<String>,
     pub already_present: bool,
+    pub tailcat: Option<PairedTailcat>,
+}
+
+#[derive(Clone, Eq, PartialEq, uniffi::Record)]
+pub struct PairedTailcat {
+    pub address: String,
+    pub private_key: String,
+    pub public_key: String,
+}
+
+impl std::fmt::Debug for PairedTailcat {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PairedTailcat")
+            .field("public_key", &self.public_key)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct PairingPayload {
     ssh_host: String,
+    tailcat: bool,
     ssh_port: u16,
     ssh_user: String,
     temporary_private_key_seed: [u8; ED25519_SEED_BYTES],
@@ -145,12 +189,16 @@ impl client::Handler for PinnedSshHostKey {
     }
 }
 
-pub async fn pair_host(
+pub(crate) async fn pair_host(
     code: &str,
     public_key: &str,
     device_name: &str,
+    jump_hosts: &[HostSshConfig],
 ) -> Result<PairHostResult, PairingError> {
     let payload = decode_pairing_code(code.trim())?;
+    if payload.tailcat && !jump_hosts.is_empty() {
+        return Err(PairingError::TailcatJumpHost);
+    }
     let public_key = public_key.trim();
     if public_key.is_empty() || public_key.len() > 4096 || public_key.chars().any(char::is_control)
     {
@@ -167,14 +215,52 @@ pub async fn pair_host(
         nodelay: true,
         ..Default::default()
     });
-    let mut handle = timeout(
-        CONNECT_TIMEOUT,
-        client::connect(
-            config,
-            (payload.ssh_host.as_str(), payload.ssh_port),
-            handler,
-        ),
-    )
+    let mut jumps = PairingJumpSessions::default();
+    for jump in jump_hosts {
+        let mut connection = ssh_config(jump);
+        connection.forward_agent = false;
+        let session = timeout(
+            CONNECT_TIMEOUT,
+            SshSession::connect(&connection, jumps.0.last().map(Arc::as_ref)),
+        )
+        .await
+        .map_err(|_| PairingError::ConnectionTimeout)??;
+        jumps.0.push(session);
+    }
+    let tailcat_identity = payload.tailcat.then(whip_tailcat::Identity::generate);
+    let connect_timeout = if payload.tailcat {
+        TAILCAT_CONNECT_TIMEOUT
+    } else {
+        CONNECT_TIMEOUT
+    };
+    let mut handle = timeout(connect_timeout, async {
+        if let Some(identity) = &tailcat_identity {
+            let client = whip_tailcat::Client::connect(
+                &payload.ssh_host,
+                identity,
+                whip_tailcat::ClientOptions::default(),
+            )
+            .await
+            .map_err(|_| PairingError::TailcatConnection)?;
+            let stream = client
+                .dial_tcp(payload.ssh_port)
+                .await
+                .map_err(|_| PairingError::TailcatConnection)?;
+            Ok(client::connect_stream(config, stream, handler).await?)
+        } else if let Some(jump) = jumps.0.last() {
+            let stream = jump
+                .open_direct_tcpip(&payload.ssh_host, payload.ssh_port)
+                .await?;
+            Ok::<_, PairingError>(client::connect_stream(config, stream, handler).await?)
+        } else {
+            Ok(client::connect(
+                config,
+                (payload.ssh_host.as_str(), payload.ssh_port),
+                handler,
+            )
+            .await?)
+        }
+    })
     .await
     .map_err(|_| PairingError::ConnectionTimeout)??;
 
@@ -240,8 +326,19 @@ pub async fn pair_host(
         STANDARD_NO_PAD.encode(payload.ssh_host_key_sha256)
     );
 
+    let tailcat = tailcat_identity.map(|identity| PairedTailcat {
+        address: payload.ssh_host.clone(),
+        private_key: identity.private_key(),
+        public_key: identity.public_key(),
+    });
+    let ssh_host = if payload.tailcat {
+        let digest = format!("{:x}", Sha256::digest(payload.ssh_host.as_bytes()));
+        format!("tailcat-{}.invalid", &digest[..16])
+    } else {
+        payload.ssh_host
+    };
     Ok(PairHostResult {
-        ssh_host: payload.ssh_host,
+        ssh_host,
         ssh_port: payload.ssh_port,
         ssh_user: payload.ssh_user,
         ssh_host_fingerprint,
@@ -249,6 +346,7 @@ pub async fn pair_host(
         ssh_host_public_key: accepted.public_key,
         key_fingerprint: response.fingerprint,
         already_present: response.already_present.unwrap_or(false),
+        tailcat,
     })
 }
 
@@ -315,6 +413,15 @@ fn decode_pairing_code(code: &str) -> Result<PairingPayload, PairingError> {
             String::from_utf8(take_bytes(&decoded, &mut cursor, length)?.to_vec())
                 .map_err(|_| PairingError::BadEncoding)?
         }
+        ADDRESS_TAILCAT => {
+            let length = u16::from_be_bytes(
+                take_bytes(&decoded, &mut cursor, 2)?
+                    .try_into()
+                    .map_err(|_| PairingError::BadEncoding)?,
+            );
+            String::from_utf8(take_bytes(&decoded, &mut cursor, usize::from(length))?.to_vec())
+                .map_err(|_| PairingError::BadEncoding)?
+        }
         _ => return Err(PairingError::BadEncoding),
     };
     let ssh_port = u16::from_be_bytes(
@@ -336,9 +443,16 @@ fn decode_pairing_code(code: &str) -> Result<PairingPayload, PairingError> {
     let ssh_host_key_sha256 = take_bytes(&decoded, &mut cursor, SHA256_BYTES)?
         .try_into()
         .map_err(|_| PairingError::BadEncoding)?;
+    let tailcat = address_type == ADDRESS_TAILCAT;
+    if tailcat
+        && (ssh_host.len() > MAX_TAILCAT_ADDRESS_BYTES
+            || whip_tailcat::validate_address(&ssh_host).is_err())
+    {
+        return Err(PairingError::BadPayload);
+    }
     if cursor != decoded.len()
         || ssh_host.is_empty()
-        || ssh_host.len() > MAX_HOSTNAME_BYTES
+        || (!tailcat && ssh_host.len() > MAX_HOSTNAME_BYTES)
         || ssh_port == 0
         || ssh_user.is_empty()
         || !ssh_host.is_ascii()
@@ -352,6 +466,7 @@ fn decode_pairing_code(code: &str) -> Result<PairingPayload, PairingError> {
     }
     Ok(PairingPayload {
         ssh_host,
+        tailcat,
         ssh_port,
         ssh_user,
         temporary_private_key_seed,
@@ -413,10 +528,13 @@ fn base45_value(byte: u8) -> Result<usize, PairingError> {
 }
 
 #[cfg(test)]
+mod transport_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
-    fn base45_encode(bytes: &[u8]) -> String {
+    pub(super) fn base45_encode(bytes: &[u8]) -> String {
         let mut encoded = String::new();
         for chunk in bytes.chunks(2) {
             let value = if chunk.len() == 2 {
@@ -451,6 +569,33 @@ mod tests {
         assert_eq!(payload.ssh_user, "alice");
         assert_eq!(payload.temporary_private_key_seed, [7; 32]);
         assert_eq!(payload.ssh_host_key_sha256, [9; 32]);
+        assert!(!payload.tailcat);
+    }
+
+    #[test]
+    fn decodes_whipair_tailcat_qr_and_rejects_invalid_addresses() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../whipair/tests/fixtures/tailcat-pairing.json"
+        ))
+        .unwrap();
+        for (address_field, code_field) in [("address", "code"), ("longAddress", "longCode")] {
+            let payload = decode_pairing_code(fixture[code_field].as_str().unwrap()).unwrap();
+            assert!(payload.tailcat);
+            assert_eq!(payload.ssh_host, fixture[address_field].as_str().unwrap());
+            assert_eq!(payload.ssh_port, 22);
+            assert_eq!(payload.ssh_user, "alice");
+            assert_eq!(payload.temporary_private_key_seed, [7; 32]);
+            assert_eq!(payload.ssh_host_key_sha256, [9; 32]);
+        }
+        for address in ["tc!!!!", "tcYWJj", "host.example.test"] {
+            let mut bytes = vec![ADDRESS_TAILCAT];
+            bytes.extend_from_slice(&u16::try_from(address.len()).unwrap().to_be_bytes());
+            bytes.extend_from_slice(address.as_bytes());
+            assert!(matches!(
+                decode_pairing_code(&code(&bytes, "alice")),
+                Err(PairingError::BadPayload)
+            ));
+        }
     }
 
     #[test]

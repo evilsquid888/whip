@@ -1,6 +1,7 @@
 const { execFileSync } = require('node:child_process');
 const { version } = require('./scripts/app-version.cjs');
 
+const DEFAULT_NOTIFY_RELAY_URL = 'https://whip-notify.kosumi.dev';
 const COMMIT_PATTERN = /^[0-9a-f]{7,64}$/i;
 const DISTRIBUTION_CHANNELS = new Set(['app-store', 'google-play', 'github']);
 const DEVELOPMENT_REVENUECAT_TEST_PUBLIC_SDK_KEY =
@@ -55,15 +56,14 @@ module.exports = ({ config }) => {
   return {
     ...config,
     version,
-    plugins: [
-      ...(config.plugins || []),
-      ...((config.plugins || []).includes('expo-sqlite')
-        ? []
-        : ['expo-sqlite']),
-    ],
+    android: {
+      ...config.android,
+      ...(process.env.WHIP_GOOGLE_SERVICES_JSON ? {googleServicesFile: process.env.WHIP_GOOGLE_SERVICES_JSON} : {}),
+    },
     extra: {
       ...config.extra,
       ...(gitCommit ? { gitCommit } : {}),
+      notifyRelayUrl: optionalHttpsUrl(process.env.WHIP_NOTIFY_RELAY_URL) || DEFAULT_NOTIFY_RELAY_URL,
       feedbackApiUrl: process.env.WHIP_FEEDBACK_API_URL || null,
       revenueCatIosPublicSdkKey:
         optionalString(process.env.WHIP_REVENUECAT_IOS_PUBLIC_SDK_KEY),

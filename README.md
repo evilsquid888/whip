@@ -6,7 +6,7 @@
 
 <p align="center">
   <strong>Run your Herdr workflow from your phone or tablet.</strong><br>
-  Chat with Claude Code, Codex, and OpenCode, review their changes, and work in remote terminals from a native Android or iOS interface.
+  Chat with Claude Code, Codex, OpenCode, and Pi, review their changes, and work in remote terminals from a native Android or iOS interface.
 </p>
 
 <p align="center">
@@ -29,15 +29,15 @@
 </p>
 
 <p align="center">
-  <a href="https://youtu.be/dx5s3LmMErE"><img src="https://img.youtube.com/vi/dx5s3LmMErE/maxresdefault.jpg" alt="Watch the Whip launch video on YouTube" width="800"></a><br>
-  <a href="https://youtu.be/dx5s3LmMErE"><strong>Watch the Whip launch video</strong></a>
+  <a href="https://youtu.be/M7oXwtNDbpI"><img src="https://img.youtube.com/vi/M7oXwtNDbpI/maxresdefault.jpg" alt="Watch the Whip launch video on YouTube" width="800"></a><br>
+  <a href="https://youtu.be/M7oXwtNDbpI"><strong>Watch the Whip launch video</strong></a>
 </p>
 
-Whip gives [Herdr](https://github.com/herdrdev/herdr) a touch-friendly mobile interface without exposing Herdr itself to the network or requiring changes on the host. It connects to your machine over SSH—directly or through saved jump hosts, ideally over Tailscale—and rebuilds the management experience as native screens. Watch the whole herd, follow Claude Code, Codex, and OpenCode conversations, dictate a prompt, review a Git diff, or attach to a full terminal. Plain SSH hosts work too, with multiple independent shell tabs even without Herdr.
+Whip gives [Herdr](https://github.com/herdrdev/herdr) a touch-friendly mobile interface without exposing Herdr itself to the network. **No extra host software is needed when SSH and Herdr are already running.** Optional [push notifications](#get-push-notifications) use a host plugin. Whip connects to your machine over SSH—directly, through saved jump hosts, or with [Tailcat mode](#connect-with-tailcat)—and rebuilds the management experience as native screens. Watch the whole herd, follow Claude Code, Codex, OpenCode, and Pi conversations, dictate a prompt, review a Git diff, or attach to a full terminal. Plain SSH hosts work too, with multiple independent shell tabs even without Herdr.
 
 With **Reverse Control**, a remote Claude Code, Codex or OpenCode agent can also use Whip's browser and phone tools, inspect connected hosts, and coordinate other Herdr agents through the same SSH connections.
 
-**Built for blazing-fast remote work.** Watch a build, check another agent’s reply, then return to the same open terminal. Your connections keep running while you move between tasks. [See it in everyday use](#performance).
+**Native terminal delivery:** Rust sends output directly to the Android or iOS WebView running xterm.js. Normal frames and write-completion credits bypass the React Native JavaScript thread. [Architecture and measurements](#performance).
 
 The app separates connection management from daily supervision: **Hosts** manages saved SSH endpoints, saved chats, and browser access; **Herd** brings connected agents into a searchable, scoped queue; **Terminal** keeps pane sessions, SSH shells, and native Chat View within reach; and **More** holds security, notification, appearance, and terminal preferences.
 
@@ -49,12 +49,14 @@ Whip is not developed, maintained, or endorsed by the Herdr project or its autho
 - [Preview](#preview)
 - [What you can do](#what-you-can-do)
   - [Supervise Herdr](#supervise-herdr)
+  - [Get push notifications](#get-push-notifications)
   - [Use Chat View](#use-chat-view)
   - [Browse websites and remote previews](#browse-websites-and-remote-previews)
   - [Give agents Reverse Control](#give-agents-reverse-control)
   - [Work in terminals](#work-in-terminals)
   - [Move files and attachments](#move-files-and-attachments)
   - [Review Git changes](#review-git-changes)
+  - [Work with GitHub](#work-with-github)
   - [Connect securely](#connect-securely)
   - [Make it yours](#make-it-yours)
 - [Install Whip](#install-whip)
@@ -63,6 +65,7 @@ Whip is not developed, maintained, or endorsed by the Herdr project or its autho
 - [Connect your first host](#connect-your-first-host)
   - [Pair with a QR code](#pair-with-a-qr-code)
   - [Enter a host manually](#enter-a-host-manually)
+  - [Connect with Tailcat](#connect-with-tailcat)
 - [How it works](#how-it-works)
 - [Performance](#performance)
 - [Architecture](#architecture)
@@ -98,48 +101,40 @@ We will not add first-class support for **tmux, Zellij, or Mosh**. This focus le
     <td align="center"><strong>Watch the whole herd</strong><br>Focus a host, switch spaces from the rail, and follow its attention queue.</td>
   </tr>
   <tr>
-    <td align="center"><img src="assets/screenshots/ios/chat-view.webp" alt="Whip native Chat View with a remote agent conversation and tool activity" width="320"></td>
-    <td align="center"><img src="assets/screenshots/ios/chat-composer.webp" alt="Whip native chat composer with microphone, attachment, and send controls" width="320"></td>
+    <td align="center"><img src="assets/screenshots/ios/chat-view.webp" alt="Whip Native Chat View with a completed agent response and an expanded inline file diff" width="320"></td>
+    <td align="center"><img src="assets/screenshots/ios/chat-composer.webp" alt="Whip native chat composer drafting a question about saved hosts, with microphone, attachment, and send controls" width="320"></td>
   </tr>
   <tr>
-    <td align="center"><strong>Read the conversation</strong><br>Follow Claude Code, Codex, and OpenCode in native chat, with rich text, search, diagrams, and tool details.</td>
-    <td align="center"><strong>Chat naturally</strong><br>Dictate a draft, paste an image, attach a file, or bring selected text into your next prompt.</td>
+    <td align="center"><strong>Native Chat View</strong><br>Follow agent replies, inspect tool calls, and review file diffs inline.</td>
+    <td align="center"><strong>Chat naturally</strong><br>Write or dictate a prompt, attach a file, and send it to your agent.</td>
   </tr>
   <tr>
-    <td align="center"><img src="assets/screenshots/ios/reverse-control.webp" alt="Whip Codex launch sheet with Reverse Control enabled for browser and device tools" width="320"></td>
-    <td align="center"><img src="assets/screenshots/ios/chat-details.webp" alt="Whip completed chat turn with its token usage footer and expanded model, timing, and cache details" width="320"></td>
-  </tr>
-  <tr>
-    <td align="center"><strong>Give agents phone tools</strong><br>Enable Reverse Control when launching an agent so it can use Whip's browser and device tools.</td>
-    <td align="center"><strong>See what each turn used</strong><br>Inspect the token-usage footer and expand its model, timing, input, output, and cache details.</td>
-  </tr>
-  <tr>
+    <td align="center"><img src="assets/screenshots/ios/reverse-control.webp" alt="Whip agent conversation showing the hosts.list phone-tool call and its response listing four saved hosts" width="320"></td>
     <td align="center"><img src="assets/screenshots/ios/remote-files.webp" alt="Whip remote file browser showing the terminal's working directory over SFTP" width="320"></td>
-    <td align="center"><img src="assets/screenshots/ios/git-diff.webp" alt="Whip Git diff viewer with highlighted changes, line selection, and context controls" width="320"></td>
   </tr>
   <tr>
+    <td align="center"><strong>Give agents phone tools</strong><br>Let a remote agent inspect connected hosts and use Whip's browser and device tools through Reverse Control.</td>
     <td align="center"><strong>Bring the filesystem with you</strong><br>Browse, transfer, edit, and preview remote files, including large text, Markdown, diagrams, PDF, and media.</td>
+  </tr>
+  <tr>
+    <td align="center"><img src="assets/screenshots/ios/git-diff.webp" alt="Whip Git diff viewer showing a real styles.css change with line numbers and context controls" width="320"></td>
+    <td align="center"><img src="assets/screenshots/ios/browser.webp" alt="Whip in-app browser displaying a local documentation preview in desktop mode with address, tab, and page controls" width="320"></td>
+  </tr>
+  <tr>
     <td align="center"><strong>Review the changes</strong><br>Read highlighted Git diffs, expand context, and draft questions for the agent from selected lines.</td>
-  </tr>
-  <tr>
-    <td align="center"><img src="assets/screenshots/ios/browser.webp" alt="Whip in-app browser with address, tab, and page controls" width="320"></td>
-    <td align="center"><img src="assets/screenshots/ios/terminal.webp" alt="Whip remote terminal with persistent tabs and mobile input controls" width="320"></td>
-  </tr>
-  <tr>
     <td align="center"><strong>Open the preview</strong><br>Browse public websites or SSH-forwarded local services, keep tabs open, and let agents use Reverse Control.</td>
+  </tr>
+  <tr>
+    <td align="center"><img src="assets/screenshots/ios/terminal.webp" alt="Whip remote terminal with persistent tabs and mobile input controls" width="320"></td>
+    <td align="center"><img src="assets/screenshots/ios/markdown-preview.webp" alt="Whip rendering this project's README with images, formatted text, and links" width="320"></td>
+  </tr>
+  <tr>
     <td align="center"><strong>Work from anywhere</strong><br>Switch between warm Herdr panes or independent SSH shells with controls that adapt to the keyboard.</td>
-  </tr>
-  <tr>
-    <td align="center"><img src="assets/screenshots/ios/markdown-preview.webp" alt="Whip rendering this project's README with its app artwork, badges, and links" width="320"></td>
-    <td align="center"><img src="assets/screenshots/ios/settings.webp" alt="Whip More screen using glass surfaces over the configured background image" width="320"></td>
-  </tr>
-  <tr>
     <td align="center"><strong>Read your remote docs</strong><br>Preview the project's README with its images and links directly from the host.</td>
-    <td align="center"><strong>Make Whip yours</strong><br>Use a custom background and glass surfaces, then tune alerts, speech, security, and terminal behavior.</td>
   </tr>
 </table>
 
-Captured from Whip 1.8.6 on an iPhone 17 Pro simulator running iOS 26.5, with a custom background and Rancher glass appearance. See the [capture notes](assets/screenshots/README.md) to refresh them.
+Captured from Whip 1.9.1 (GitHub channel, Release build) on an iPhone 17 Pro simulator running iOS 26.5, with a custom background and glass appearance. See the [capture notes](assets/screenshots/ios/README.md) for the source recordings and refresh steps.
 
 ## What you can do
 
@@ -154,11 +149,32 @@ Captured from Whip 1.8.6 on an iPhone 17 Pro simulator running iOS 26.5, with a 
 - Launch agents and chat through a native multiline composer with mobile keyboard, dictation, selection, and suggestion support.
 - Run editable commands from the Herd screen and reuse the same persistent input history available in the terminal.
 
+### Get push notifications
+
+Whip uses local agent alerts by default. Enable optional push notifications on Android or iOS to hear when an agent needs you or finishes, even when Whip is not running. Setup is separate for each device and saved Herdr session.
+
+1. Connect to the saved host, open its **⋯** detail screen from **Hosts**, and find **Server-side push notification**.
+2. Tap **Install on host** to install and enable the `whip-notify` Herdr plugin over SSH. Installation alone does not enable push for this device.
+3. Choose **End-to-end encryption (E2EE)**, then tap **Enable / rotate keys**. Grant notification permission and keep Whip open while it verifies push delivery and registers this device.
+
+New registrations default to E2EE **off**, with readable previews showing the tab, agent, status, and task title when available. The relay and push providers can read those details. Turn E2EE **on** for generic system previews with agent details encrypted for this device. Existing encrypted registrations stay encrypted until you change the setting. Tap a notification to reconnect and open its pane, if it still exists.
+
+The plugin requires Herdr **0.9.5+**, Git, curl, and either `sha256sum` or `shasum`. Prebuilt binaries support arm64/x86_64 Linux and Apple Silicon macOS; no Rust compiler is needed on the host. Push travels through Whip's default notification relay and Expo Push Service to FCM on Android or APNs on iOS. You can select a **Custom relay** per saved host.
+
+While local alerts are enabled, notification permission is granted, and the connection and event stream are healthy, Whip renews a device lease over SSH approximately every **3 seconds**. The host suppresses remote push while that lease is younger than **10 seconds**, using its own clock. Each device/session registration has an independent lease.
+
+On iOS, backgrounding stops renewal. On Android, renewal can continue while background monitoring is enabled and the app's timer keeps running. Renewal stops if the app is suspended or terminated, the connection fails, or local alerts are disabled.
+
+The lease expires 10 seconds after its last renewal on the host; subsequent **blocked** or **done** events can trigger remote push. Expiration does not itself send a notification or replay events suppressed while the lease was fresh. A crash just after renewal can leave a suppression window of up to 10 seconds, plus any in-flight renewal; delivery is best effort.
+
+Use **Unregister** to stop push for this device on the selected host/session. **Uninstall from host** removes the plugin for the SSH account across its Herdr sessions and devices. Local alert preferences remain in **More → Settings → Notifications**. See the [remote notification guide](docs/remote-notifications.md) for setup details, encryption, delivery limits, and relay deployment.
+
 ### Use Chat View
 
-Chat View supports **Claude Code, Codex, and OpenCode (v1 and v2)** panes. Tap the book icon in the terminal controls to replace that terminal with a full-screen, native transcript; tap it again to return to the same warm terminal. Each open terminal remembers its own Terminal or Chat View when you switch between panes.
+Chat View supports **Claude Code, Codex, OpenCode (v1 and v2), and Pi** panes. Tap the book icon in the terminal controls to replace that terminal with a full-screen, native transcript; tap it again to return to the same warm terminal. Each terminal remembers its own Terminal or Chat View across tab switches and app restarts. Offline hosts restore cached Chat when available.
 
-- Read a normalized, OpenCode-style conversation instead of terminal scrollback, including user prompts, Markdown responses, plans, reasoning, live **Thinking** state, token and timing metadata, attachments, and images.
+- Read a normalized, OpenCode-style conversation instead of terminal scrollback, including user prompts, Markdown responses, plans, reasoning, an inline **Working** indicator, token and timing metadata, attachments, and images.
+- Keep the relevant user prompt pinned while reading earlier replies. Tap it to reveal the original message. When you scroll away from live output, a compact activity strip can show the agent's current tool or progress; tap it to return to the latest output and resume following. See [chat interactions](docs/agent-chat-interactions.md) for details.
 - Inspect expandable tool activity without duplicate shell rows. Related read, list, and search operations are grouped; shell commands, output, diagnostics, and changed-file diffs remain available on demand.
 - Render GitHub-flavored Markdown, highlighted code, clickable remote file references, math, Mermaid diagrams, and SVG code blocks on Android and iOS.
 - Search chat and terminal text with inline highlights, inspect per-turn metadata and expandable JSON tool output, and read agent questions and permission notices.
@@ -173,6 +189,7 @@ Chat View supports **Claude Code, Codex, and OpenCode (v1 and v2)** panes. Tap t
 
 - Open the in-app browser from Hosts, or follow a link from a terminal or conversation. Public sites open directly; localhost and private-network services use the selected host's SSH connection.
 - Keep multiple tabs with navigation history. Inactive pages can suspend and restore, and matching terminal links reuse an existing tab.
+- Switch between mobile and desktop browser profiles or choose a custom viewport size. Profile changes reload open pages immediately. Desktop mode uses a wider automatic viewport; custom dimensions take precedence.
 - Download files with the page's login session into the phone's **Downloads** library. Track progress, cancel a transfer, open completed files, and receive completion notifications.
 - Enable Reverse Control to let a supported agent operate browser tabs and phone tools. Ordinary browsing does not require it.
 
@@ -186,6 +203,8 @@ Reverse Control is available on Android and iOS for **Claude Code, Codex and Ope
 
 The preference saves immediately and survives app restarts. Turning it off revokes that pane's access immediately. **Copy** starts a new conversation in another tab with the same preference; each agent then has independent access.
 
+On Android, enabling Reverse Control also offers **Allow Shizuku access** for that session. It starts off, including for copied agents. Turn it on only for sessions that should use privileged Android tools; turning it off cancels that session's running Shizuku commands.
+
 Set a **Global AGENTS.md** in Settings and an optional **Host AGENTS.md** in each host editor. Reverse Control agents read the global instructions first, then the target host's instructions before connecting or operating on it.
 
 | Capability | What the agent can do |
@@ -194,7 +213,7 @@ Set a **Global AGENTS.md** in Settings and an optional **Host AGENTS.md** in eac
 | Downloads | Download a file using the browser's login session and transfer it to the SSH host over SFTP with `browser.download`. |
 | Hosts and agents | List and connect saved hosts, read per-host agent instructions, inspect Herdr state, and manage workspaces, tabs, panes, and agents through Whip's existing SSH connections. |
 | Phone | Read device, battery, network, location, and motion/sensor information; read or write clipboard text; trigger haptics, local notifications, and speech. |
-| Android Shizuku | Check Shizuku status and run commands on the phone as Shizuku's shell/root identity after you authorize Whip in **More → Shizuku → Pair with Shizuku**. |
+| Android Shizuku | Check Shizuku status and run commands on the phone as Shizuku's shell/root identity after you enable **Allow Shizuku access** for that session and authorize Whip in **More → Settings → Reverse Control → Shizuku → Pair with Shizuku**. |
 
 For example, ask the agent:
 
@@ -212,6 +231,7 @@ See the [browser and device tool reference](docs/reverse-control-browser.md), [a
 
 - Attach to any selected pane through an immersive, xterm-compatible terminal.
 - Open a plain SSH login shell when Herdr is stopped, unavailable, or not installed yet.
+- Turn off **Herdr** in host details to use a plain SSH host. Herdr is enabled by default; disabling it collapses its settings, skips Herdr socket discovery and connections, and opens an SSH shell. Your Herdr command, session, and socket settings are retained for later.
 - Open multiple independent SSH shell tabs on the same host, using the same tab controls to create, switch, rename, and close them.
 - Keep multiple terminal surfaces warm while switching or swiping between tabs, with a buffered composer, ANSI colors, modifier keys, touch scrolling, Page Up/Down, selection, live resizing, and configurable appearance.
 - Use controls that adapt to keyboard visibility, with text selection, copy feedback, and **Add to chat composer** for selected terminal text.
@@ -234,11 +254,23 @@ See the [browser and device tool reference](docs/reverse-control-browser.md), [a
 - Read highlighted diffs, expand surrounding context, and move between changed files while retaining your review position.
 - Select diff lines and choose **Ask agent** to draft a question with the file and line context in the chat composer.
 
+### Work with GitHub
+
+On the connected SSH host, install GitHub CLI (`gh`) and sign in with `gh auth login`. GitHub requests run on that host through the existing SSH connection using its CLI login.
+
+- Open the **GitHub** terminal control when the active directory belongs to a repository with a `github.com` remote and `gh` is available in the host's login-shell `PATH`. Discovery does not require signing in. With multiple GitHub remotes, Whip prefers `origin`, then `upstream`, then another matching remote.
+- Browse Issues, PRs, Actions, Releases, and Commits inside an opaque, full-screen viewer. Lists use Previous/Next controls with 10 entries per page and retain only the current page. Paging controls stay hidden when all results fit on one page. Search issues and PRs, filter open or closed conversations, and choose a branch for commits or workflow runs.
+- Create issues, close or reopen them, and reply to issues and PRs with a Markdown toolbar and Write/Preview editor. Submit PR approvals or change requests and inspect reviews, checks, changed files, and highlighted diffs.
+- Merge PRs using merge commits, squash, or rebase-and-merge, or close and reopen them. A Changes/Status summary shows file totals, commits, checks, and merge status. Merge confirmation pins the reviewed head commit, and GitHub enforces repository permissions and branch rules.
+- Read workflow jobs, steps, and searchable logs; cancel active runs, rerun completed runs, or rerun only failed jobs. Read release notes and download release assets to a chosen directory on the phone, including assets from private repositories.
+- See stars in the repository header. The count is cached for five minutes across viewer opens. Changing tabs, paging, refreshing lists, and posting comments leave it untouched.
+
 ### Connect securely
 
 - Import, inspect, copy, remove, or generate SSH keys, and reuse them from a biometric-protected global keychain.
 - Authorize a generated, global-keychain, or clipboard public key by scanning a one-time QR code from [`whipair`](whipair/README.md), using the host's existing SSH port without a relay.
 - Route connections through nested, OpenSSH-compatible jump hosts and optionally forward a profile's key as an SSH agent without copying the private key to the server.
+- Connect across networks with [Tailcat mode](#connect-with-tailcat), carrying SSH inside a WireGuard-encrypted tunnel with NAT traversal and relay fallback, without a Tailscale account.
 - Verify every direct and jump-host connection against a global known-hosts list, prompting for unknown fingerprints and rejecting changed host keys.
 - Store each host's password or private-key credential in Android Keystore or iOS Keychain, with encrypted, device-authenticated Block Store recovery on supported Android devices.
 - Keep several named Herdr hosts open and switch between their live sessions.
@@ -246,7 +278,7 @@ See the [browser and device tool reference](docs/reverse-control-browser.md), [a
 ### Make it yours
 
 - Hide the status bar across the app or while a terminal is open with Rancher fullscreen settings.
-- Receive local notifications, vibration, and optional speech when an agent becomes blocked or finishes.
+- Configure local agent alerts with notifications, vibration, and optional speech, or enable [push notifications](#get-push-notifications) per saved host.
 - Set the duration of background agent alerts, dismiss active alerts by returning to Whip, and customize terminal gestures, controls, history, fonts, and cached sessions.
 - Use the app in English, French, Japanese, Spanish, Simplified Chinese, or Traditional Chinese, with system, light, GitHub Light, dark, and Tokyo Night appearance options.
 - Track time spent in Whip with the usage charts and keep settings sections expanded or collapsed as you prefer.
@@ -271,23 +303,28 @@ Signed ARM64 APKs are also published as normal latest releases on [GitHub Releas
 1. Read the [security policy](SECURITY.md) and [privacy notes](PRIVACY.md).
 2. Install through Google Play, or download `whip-arm64.apk` and its checksum from the latest GitHub release.
 3. Allow installation from the app that downloaded the APK, then open Whip.
-4. Make the host reachable over SSH, preferably through a Tailnet you trust. Whip can open a plain SSH shell even when Herdr is not installed, and a private destination can be reached through a saved jump host.
+4. Make the host reachable over SSH, through a Tailnet you trust, a saved jump host, or [Tailcat mode](#connect-with-tailcat). Whip can open a plain SSH shell even when Herdr is not installed.
 
 Whip supports Android 7.0 and newer (`minSdk 24`). The current direct APK distribution targets 64-bit ARM Android devices. Keep using the same distribution source when updating: Google Play may re-sign store builds through Play App Signing, so Android can require an uninstall when switching between Play and GitHub packages.
 
 ### iOS
 
-Install [Whip Herd from the App Store](https://apps.apple.com/us/app/whip-herd/id6808226150) on an iPhone or iPad running iOS or iPadOS 16.4 or newer. Make your host reachable over SSH, preferably through a Tailnet you trust.
+Install [Whip Herd from the App Store](https://apps.apple.com/us/app/whip-herd/id6808226150) on an iPhone or iPad running iOS or iPadOS 16.4 or newer. Make your host reachable over SSH, through a Tailnet you trust, a saved jump host, or [Tailcat mode](#connect-with-tailcat).
 
 CI also compiles a thin unsigned device app and uploads `whip-ios-unsigned-compile-only.app.zip` as a short-lived GitHub Actions artifact for compile validation. That artifact is not signed or directly installable. For a locally signed device build, follow the development instructions below.
 
 ## Connect your first host
 
-You need an SSH server on a laptop or server reachable from the mobile device. If Herdr is already installed, confirm the same connection outside Whip first:
+Connect to an existing SSH server, or use [Tailcat's built-in SSH service](#connect-with-tailcat).
+**No extra host software is needed when SSH and Herdr are already running.**
+Enter the SSH details in Whip, use the optional QR pairing helper below, or set up Tailcat for access across networks.
+The optional [push notification feature](#get-push-notifications) adds a host plugin.
 
-```bash
-ssh user@laptop.tailnet.ts.net 'herdr status server --json'
-```
+Managing Herdr needs a host that can execute `/bin/sh`, such as Linux, macOS, or WSL.
+Whip runs its setup and start scripts through `/bin/sh`, so the SSH login shell itself
+does not need to be POSIX: Fish works. A Windows host whose sshd `DefaultShell` is
+PowerShell or `cmd.exe` has no `/bin/sh`, so it reports **Cannot run Herdr setup
+commands**, and its SSH terminal tabs keep working.
 
 ### Pair with a QR code
 
@@ -327,26 +364,73 @@ boundaries, local-checkout Nix command, and nonstandard-port options.
 To enter the host without QR pairing:
 
 1. Tap **Add your first host**.
-2. Enter the Tailscale DNS name or `100.x.y.z` address, SSH user, and password or private key. You can import, paste, or generate an Ed25519 key in the app.
+2. Enter a reachable hostname or IP address (such as a Tailscale DNS name or `100.x.y.z` address), SSH user, and password or private key. You can import, paste, or generate an Ed25519 key in the app.
 3. Leave **Command** as `herdr`, or enter its absolute path if it is not in the non-interactive SSH `PATH`.
 4. Choose the Herdr session name and connect.
 5. On first connection, compare the displayed SSH fingerprint with the host through an independent trusted channel, then choose **Trust host**. Whip refuses a changed key on later connections.
 
 Whip saves the credential after you save or connect to a host, enabling one-tap reconnects. Host profiles can also reuse a key from **More → Global SSH keychain**.
 
+After connecting to a host, open **Edit host → Install public key** to authorize
+another key using the saved SSH credentials and jump-host route. Select a key
+from Whip’s keychain, paste an OpenSSH public key, or scan a Whip public-key QR.
+Review the fingerprint, then install it in `~/.ssh/authorized_keys`; existing
+entries are preserved and duplicate keys are skipped. To share a key, long-press
+it and choose **Show public key QR code**. The QR contains only the public key.
+
 For a destination that is not directly reachable, save and connect to the outer host first. Edit the destination, select that profile under **Jump host**, and connect. Jump hosts can themselves use another saved jump host; each hop keeps its own authentication, host-key verification, and optional agent-forwarding setting. Manage trusted fingerprints under **More → Known SSH hosts**.
 
-If Herdr is not installed yet, Whip still keeps the SSH connection open. From the offline host screen, choose **Open SSH shell** and install or troubleshoot Herdr yourself; Whip never installs software on the host.
+If Herdr is not installed yet, Whip keeps the SSH connection open and offers **Install Herdr** in Herd. Review the official command, `curl -fsSL https://herdr.dev/install.sh | sh`, and the Herdr website link in the glass confirmation popup, then confirm to run the installer for your SSH user without sudo. The installer defaults to `~/.local/bin`. The popup closes and Whip opens an **Install Herdr** SSH terminal tab showing the command and live output. Use the terminal’s Ctrl+C control to cancel. Herd shows **Installing Herdr…** and an **Open terminal** button that returns to that same tab. You can switch hosts while installation continues; each host installs independently. The terminal remains available after completion, and reconnecting never reruns the installer. Whip starts Herdr and refreshes the host after installation. **Open SSH shell** remains available for manual setup or troubleshooting. Whip never installs Herdr automatically or replaces a custom command path.
 
 Whip accepts Herdr releases that report protocols 17 through 22 and rejects other protocol versions to avoid sending incompatible commands. The **About Whip** screen shows both sides of the active connection.
 
+### Connect with Tailcat
+
+Tailcat mode carries SSH inside a WireGuard-encrypted tunnel across networks, without a Tailscale account or a separate Tailscale app on your phone. It tries a direct UDP connection first and falls back to an encrypted relay when needed; relay connections can increase typing latency. SSH credentials and host-key verification still apply.
+
+1. [Install Tailcat](https://github.com/tailscale/tailcat/blob/main/INSTALL.md) on the laptop or server you want to access.
+2. In Whip, open **Add host**, enable **Tailcat mode**, then choose **Enter host manually**. You can also enable the mode when editing a saved host. It defaults off for each host.
+3. Choose one of the server options below. Expand **How it works and server setup** in the host editor for copyable commands matching your settings.
+4. Leave `tailcat serve` running and paste its complete `tc…` address into **Tailcat address**. No separate SSH hostname or IP is required. Enter the SSH credentials, connect, and verify the SSH fingerprint through a trusted channel before choosing **Trust host**.
+
+#### Use an existing SSH server
+
+Leave **Use Tailcat’s SSH server** off. On the server, create a saved Tailcat identity once, then start the tunnel:
+
+```sh
+tailcat genkey --key=whip --fixed-region
+tailcat serve --key=whip 22
+```
+
+Replace `22` with your SSH daemon's port if needed, and enter the same port in Whip along with your usual SSH username and password or private key. Reuse `--key=whip` on future starts to keep the server identity.
+
+#### Use Tailcat's built-in SSH server
+
+Enable **Use Tailcat’s SSH server** and select or generate an SSH private key in Whip. A system SSH daemon is optional with this service. After creating the saved Tailcat identity with the `genkey` command above, run the editor's generated command as the account you want to access:
+
+```sh
+tailcat serve --key=whip --ssh-authorized-keys='<selected-SSH-public-key>' ssh
+```
+
+The placeholder is the public key corresponding to the private key selected in Whip; copying the generated command fills it in. This service requires SSH key authentication, uses tunnel port **22**, and runs shells as the user who starts Tailcat. It has a separate SSH host key from your system SSH daemon. Restart Tailcat after changing its authorized SSH keys.
+
+For Herdr connections, browser previews, and outbound port forwarding, install **OpenBSD netcat (`nc`) with `-N` and `-U` support** on the server. Shells and SFTP work without it. The built-in SSH service does not support reverse port forwarding, so **Reverse Control is unavailable**, and SSH agent forwarding is disabled. Use an existing SSH daemon through Tailcat when you need those features.
+
+#### Restrict tunnel access
+
+Node-key allowlisting is off by default; SSH authentication is still required. Whip creates and securely saves a separate Tailcat client identity for each host. To restrict the tunnel to that identity, copy **Restart with node-key allowlist** from the editor's setup help, stop the running Tailcat server, and run the copied command. It adds `--allow=nodekey:…` using that host's saved client public key and preserves the selected SSH service and authorized key. The node key is separate from the SSH key.
+
+Keep the `tc…` address private. Whip stores it and the client identity with the host credentials; switching Tailcat off retains them and the original SSH address. A Tailcat host can be the first hop in a jump-host chain, but cannot itself connect through another jump host. See the [transport documentation](packages/react-native-whip-ssh/README.md#tailcat-transport) for implementation and build details.
+
 ## How it works
 
-Whip connects from the mobile device to the configured SSH host, either directly or through its saved jump-host chain. There is no Whip-operated relay service, and Herdr remains bound to the host as usual. Strict known-host verification applies to every hop.
+Whip connects from the mobile device to the configured SSH host, directly, through its saved jump-host chain, or over a Tailcat tunnel. In Tailcat mode, the embedded client carries SSH over WireGuard with direct UDP or encrypted relay fallback. Terminal and Herdr traffic use the authenticated SSH connection, and Herdr remains bound to the host as usual. Strict known-host verification applies to every hop.
 
 Native screens read snapshots and live events from Herdr's local API sockets through the authenticated SSH connection. Actions use the same structured API, while each open pane terminal uses Herdr's client-protocol socket for live input, resize, scroll, and render frames. The remote file manager and terminal attachments use SFTP on that connection. Links found in terminal scrollback open directly when they are public; loopback and private-network addresses are forwarded through SSH first.
 
-Chat View reads agent conversation records rather than terminal scrollback. The Rust host runtime follows Claude Code session logs, Codex rollout JSONL, and the installed OpenCode version's export/database interfaces, matching each conversation to Herdr's native session identity. These sources become one typed Rust transcript model on the device. SQLite stores transcript checkpoints for fast reopening and saved-chat reading without an SSH connection; live updates resume when the host is available.
+Optional [push notifications](#get-push-notifications) use a separate path: the `whip-notify` Herdr status hook sends notifications over HTTPS through a Whip-operated or custom relay, then Expo and APNs/FCM. The hook opens no new listening port on the host. Device registration and lease renewal use the existing SSH connection.
+
+Chat View reads agent conversation records rather than terminal scrollback. The Rust host runtime follows Claude Code session logs, Codex rollout JSONL, Pi session JSONL, and the installed OpenCode version's export/database interfaces, matching each conversation to Herdr's native session identity. These sources become one typed Rust transcript model on the device. The embedded Rust Turso database stores transcript checkpoints for fast reopening and saved-chat reading without an SSH connection; live updates resume when the host is available.
 
 For an open, visible Herdr terminal, Whip periodically caches a bounded recent ANSI transcript in memory. If the terminal transport is connecting, disconnected, or in error, a local virtual backend owns that transcript and its per-terminal logical scroll position while the renderer presents it read-only; it does not run Herdr or an agent on the mobile device. Messages submitted through the native composer wait in an in-memory, per-terminal outbox and are retried in order after the live connection returns. The transcript, scroll position, and outbox are session fallbacks, not durable offline storage, and do not survive an app restart.
 
@@ -354,21 +438,31 @@ An unknown server key requires explicit fingerprint approval before Whip stores 
 
 ## Performance
 
-**Quick switches while your agents are busy.** A build is running in
-one terminal while an agent writes a reply in another. Open the agent's Chat
-View, read the reply as it arrives, then return to your build's open terminal.
-Whip keeps the connection running while you move around the app.
+An October 20, 2026 capture on a **Pixel 9 Pro**, running **Android 17**, WebView
+155.0.8059.43 and an **arm64 Android release**, recorded 1,175 native terminal
+batches:
 
-- **Watch work unfold.** Follow build logs, command output, and agent activity as
-  the host sends them.
-- **Pick up where you left off.** Switch between open terminal tabs or back to
-  the Herd queue, then return to the terminal you were using.
-- **Keep reading as replies arrive.** New text and tool activity update the
-  conversation you already have open, without reloading its entire history.
+| Measurement | Median | 95th percentile |
+| --- | ---: | ---: |
+| Native callback to two-animation-frame acknowledgement | **15.84 ms** | **24.63 ms** |
 
-Whip keeps terminals connected and reuses loaded conversations so checking on
-another task does not mean starting a new session. For capture results and
-methods, see the [Android performance measurements](docs/android-performance-measurements.md).
+This is a presentation proxy measured from Android callback entry, rather than
+socket arrival or compositor-confirmed display. SSH network round-trip time is
+separate. The legacy JS path recorded 28.00 ms median / 48.43 ms p95 from JS frame
+receipt; its different timing boundaries prevent a direct end-to-end speedup
+claim. Native captures contain no terminal-frame UniFFI callbacks.
+
+Whole-app CPU and memory improvements are not established: follow-up CPU/RSS
+observations were higher, and process history and retained application work were
+not held constant. iOS native compilation passes; iOS device performance remains
+unverified. See [native terminal delivery](docs/terminal-bridge-optimization.md)
+and the [measurement report](docs/terminal-bridge-measurements.json) for workload,
+phase timings, CPU/RSS results, validation, and remaining verification gaps.
+
+The [October 1 capture](docs/android-performance-regression-2026-10-01.md) recorded
+31.14 ms median / 59.64 ms p95 under an older build, workload, and timing marker.
+[Earlier Android measurements](docs/android-performance-measurements.md) preserve
+the historical results and definitions.
 
 ## Architecture
 
@@ -377,6 +471,12 @@ Rust/native core. React Native owns presentation and platform integration;
 Rust `AppCore` owns application/session state across hosts above the
 authoritative per-host runtimes. The diagrams below show those ownership
 boundaries together with the terminal and remote-host paths.
+
+Terminal frames use bounded Rust mailboxes, Android JNI or iOS WebKit, and the
+owned terminal WebView. xterm.js remains the authoritative terminal parser and
+renderer, and its write-completion credits return directly to Rust. React Native
+owns visibility, input, renderer configuration, and lifecycle; renderer identities
+and generations fence replacement and reconnect delivery.
 
 ### React Native Frontend
 
@@ -405,11 +505,11 @@ request guarded logical streams instead of retaining transport handles.
 React Native caches the actual `AppCoreProjection`; presentation selectors join
 saved host profiles and format snapshots without maintaining another session or
 terminal domain model. Rust serializes terminal resume data as an opaque string
-for AsyncStorage, including migration of older records. Terminal font sizes are
+for the Rust Turso app-data store, including migration of older records. Terminal font sizes are
 stored separately as presentation preferences. React Native sends typed semantic
 operations through thin AppCore adapters and the `HerdrClient` runtime facade.
 It still owns navigation, sheets/forms, platform credentials, pickers/share and
-previews, presentation preferences, opaque SQLite transcript-cache storage, and
+previews, presentation preferences, and
 the mounted WebView/xterm rendering lifecycle. QR-pinned WP4 pairing and
 key-management/native-diagnostic utilities share the same native module.
 
@@ -447,6 +547,13 @@ On other systems, install Node.js 24.3 or newer in the Node 24 LTS line, JDK 17,
 
 See [DEBUG.md](DEBUG.md) for the complete emulator and physical-device loop.
 
+Mermaid diagrams in chat, file previews, and Markdown render locally with bundled
+Pele in WebViews. Existing Mermaid syntax works offline. Remote code previews and
+editing use bundled CodeMirror 6 with language detection, completion, folding,
+search and replace, multiple selections, undo/redo, and keyboard shortcuts.
+The editor includes One Dark syntax colors, frosted controls, and pinch-to-zoom
+text with independent zoom controls.
+
 On macOS, the Nix shell supplies Node.js, CocoaPods, and the pinned Rust target while Xcode supplies the Apple build toolchain:
 
 ```bash
@@ -457,6 +564,14 @@ bundle exec pod install
 ```
 
 Open `ios/HerdR.xcworkspace` in Xcode for a signed device build. `scripts/install-ios-device.sh` provides a guided local build and in-place install, while CI invokes `scripts/build-ios-app.sh --unsigned` for reproducible thin-ARM64 compile validation.
+
+The device install script reuses JavaScript dependencies, CocoaPods, and the Rust
+framework when their inputs and generated files are unchanged. TypeScript UI
+edits only require bundling JavaScript and an incremental Xcode build. Cargo still
+checks Rust dependencies on every normal install, and native interface or
+dependency changes automatically refresh the affected steps. Local installs
+default to the GitHub distribution channel. `--skip-deps` bypasses these checks
+entirely, so use it only when the native bridge is already current.
 
 ### EAS builds
 
@@ -536,7 +651,7 @@ an already installed binary's version.
 
 ### Google Play publishing
 
-The manually triggered `Publish Android app bundle` GitHub Actions workflow builds a signed ARM64 `.aab` and uploads it through EAS Submit. Its default `internal-draft` profile leaves an internal-track release in Google Play Console for review; `production-draft` creates a production draft, `production` submits a production release for review with a full rollout, `internal` publishes to internal testers, and `closed` creates a completed alpha/closed-testing release.
+The manually triggered `Publish Android app bundle` GitHub Actions workflow builds a signed ARM64 `.aab` and uploads it through EAS Submit using the `production` profile. It submits a production release for review with a full rollout and requires no profile selection.
 
 The `production` profile sets `releaseStatus` to `completed` and `changesNotSentForReview` to `false`. Google's review still applies. After approval, the release publishes automatically unless managed publishing is enabled in Play Console, in which case you must publish the approved changes there.
 
@@ -560,16 +675,10 @@ gh secret set GOOGLE_PLAY_SERVICE_ACCOUNT_JSON < /path/to/google-play-service-ac
 gh secret set EXPO_TOKEN
 ```
 
-Increment `versionCode` in `android/app/build.gradle` for every Play upload, commit the release, and start a draft upload with:
+Increment `versionCode` in `android/app/build.gradle` for every Play upload, commit the release, and submit to production for review and a full rollout with:
 
 ```bash
-gh workflow run publish-play.yml -f submit_profile=production-draft
-```
-
-To submit directly to production for review and a full rollout, choose `production` in the workflow dropdown or run:
-
-```bash
-gh workflow run publish-play.yml -f submit_profile=production
+gh workflow run publish-play.yml
 ```
 
 ### Generated terminal assets
@@ -602,6 +711,7 @@ Run the primary JavaScript and Rust validation sets before opening a pull reques
 ```bash
 nix develop -c npm run doctor
 nix develop -c npm run check:scripts
+nix develop -c npm run check:terminal-callback-cleanup
 nix develop -c npx tsc --noEmit
 nix develop -c npm run worker:check
 nix develop -c npm run lint
@@ -641,3 +751,5 @@ Whip's Chat View is inspired by and adapted from the conversation design of [Ope
 Whip is licensed under the [GNU Affero General Public License v3.0 or later](LICENSE).
 
 Third-party work remains subject to its original terms; see [Third-Party Notices](THIRD_PARTY_NOTICES.md).
+
+

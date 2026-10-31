@@ -5,6 +5,9 @@ import { useTranslation } from 'react-i18next';
 import type { RuntimeRemoteTextAnchor, RuntimeRemoteTextPage, RuntimeRemoteTextReader } from 'react-native-whip-ssh';
 
 import { terminalFontFamily } from '@/src/lib/terminalFonts';
+import { appGlassBackgroundClassName } from '@/src/lib/appGlass';
+import { useAppGlassEnabled } from '@/src/lib/glassContext';
+import { cn } from '@/src/lib/utils';
 import type { HerdrClient } from '@/src/services/HerdrClient';
 import { loadRemoteContentProgress, saveRemoteContentProgress, type RemoteContentIdentity, type RemotePagedTextProgress } from '@/src/services/remoteContentProgress';
 import { bestEffortCleanup, reportBackgroundFailure } from '@/src/services/backgroundOperations';
@@ -30,6 +33,7 @@ interface Document {
 
 /** Large files stay in Rust; JS retains only the pages mounted by FlashList. */
 export function PagedRemoteTextPreview({ client, progressIdentity, initialLine }: Props) {
+  const appGlassEnabled = useAppGlassEnabled();
   const { t } = useTranslation();
   const { hostId, remotePath, fileSize, modificationDate } = progressIdentity;
   const [document, setDocument] = useState<Document | null>(null);
@@ -66,21 +70,27 @@ export function PagedRemoteTextPreview({ client, progressIdentity, initialLine }
         const stored = initialLine ? null : await loadRemoteContentProgress(identity);
         if (!active) return;
         const saved = stored?.kind === 'paged-text' ? stored : null;
+        const anchor = saved?.reanchor ? undefined : saved?.anchor;
         reader = await client.native.openRemoteTextReader(
-          remotePath, fileSize, modificationDate ? Number(modificationDate) : undefined, saved?.anchor,
+          remotePath, fileSize, modificationDate ? Number(modificationDate) : undefined, anchor,
         );
         if (!active) { reader.close(); return; }
-        let page = await reader.readPage(saved?.anchor.pageIndex ?? 0);
-        while (active && initialLine && !page.eof && page.rows.every(row => row.lineNumber < initialLine)) {
+        let page = await reader.readPage(anchor?.pageIndex ?? 0);
+        while (active && !page.eof && (initialLine
+          ? page.rows.every(row => row.lineNumber < initialLine)
+          : saved?.reanchor && page.anchor.pageIndex < saved.anchor.pageIndex)) {
           page = await reader.readPage(page.next.pageIndex);
         }
         if (!active) return;
         const lineIndex = initialLine ? page.rows.findIndex(row => row.lineNumber >= initialLine) : -1;
+        const pageEnd = Math.max(0, page.rows.length * ROW_HEIGHT - ROW_HEIGHT);
+        const savedOffset = saved?.reanchor && page.anchor.pageIndex < saved.anchor.pageIndex
+          ? pageEnd : saved?.offsetY ?? 0;
         const offsetY = Math.min(
           initialLine
             ? (lineIndex >= 0 ? lineIndex : page.rows.length - 1) * ROW_HEIGHT
-            : saved?.offsetY ?? 0,
-          Math.max(0, page.rows.length * ROW_HEIGHT - ROW_HEIGHT),
+            : savedOffset,
+          pageEnd,
         );
         anchors.current.set(page.anchor.pageIndex, page.anchor);
         lastPage.current = page.eof ? page.anchor.pageIndex : null;
@@ -166,7 +176,7 @@ export function PagedRemoteTextPreview({ client, progressIdentity, initialLine }
   if (error) return <PageError error={error} onRetry={() => setAttempt(value => value + 1)} />;
   if (!document) return <View style={styles.loading}><ActivityIndicator /><Text>{t('files.opening')}</Text></View>;
   return (
-    <View className="flex-1 bg-terminal-canvas">
+    <View className={cn('flex-1', appGlassBackgroundClassName(appGlassEnabled, 'bg-terminal-canvas'))}>
       <Text className="px-3 py-1 text-xs text-muted-foreground">{t('files.readOnly')}</Text>
       <ScrollView
         horizontal
@@ -224,6 +234,7 @@ interface TextPageProps {
 }
 
 const TextPage = memo(function TextPageBlock({ reader, index, pageHeight, initialPage, onPage, onRestart, onContentWidth }: TextPageProps) {
+  const appGlassEnabled = useAppGlassEnabled();
   const [result, setResult] = useState<RuntimeRemoteTextPage | null>(null);
   const [error, setError] = useState<string | null>(null);
   const page = result?.anchor.pageIndex === index ? result : initialPage.anchor.pageIndex === index ? initialPage : null;
@@ -250,8 +261,8 @@ const TextPage = memo(function TextPageBlock({ reader, index, pageHeight, initia
     <ScrollView horizontal scrollEnabled={false} showsHorizontalScrollIndicator={false} style={{ height: page.rows.length * ROW_HEIGHT }}>
       <View onLayout={event => onContentWidth(event.nativeEvent.layout.width)}>
         {page.rows.map((row, indexInPage) => <View key={indexInPage} style={styles.row}>
-          <Text selectable={false} style={[styles.text, styles.gutter]}>{row.continued ? '' : row.lineNumber}</Text>
-          <Text selectable numberOfLines={1} className="text-terminal-text" style={styles.text}>{renderCjkText(row.text || ' ')}</Text>
+          <Text appFontScaling={false} selectable={false} style={[styles.text, styles.gutter]}>{row.continued ? '' : row.lineNumber}</Text>
+          <Text appFontScaling={false} selectable numberOfLines={1} className={appGlassEnabled ? 'text-foreground' : 'text-terminal-text'} style={styles.text}>{renderCjkText(row.text || ' ')}</Text>
         </View>)}
       </View>
     </ScrollView>

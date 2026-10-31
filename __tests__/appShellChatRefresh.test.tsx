@@ -1,5 +1,6 @@
 import type { ComponentProps } from 'react';
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
+import { Platform } from 'react-native';
 
 import { AppShell } from '../src/components/AppShell';
 import type { LiveSessionView } from '../src/components/LiveSessionView';
@@ -30,15 +31,10 @@ jest.mock('../src/theme', () => ({
 jest.mock('../src/billing/effectiveSettings', () => ({
   effectiveDevicePreferences: (value: unknown) => value,
 }));
-jest.mock('../src/billing/rollout', () => ({
-  getBillingRolloutPolicy: () => ({}),
-}));
-jest.mock('../src/billing/developerMembership', () => ({
-  simulateDeveloperMembership: jest.fn(),
-}));
 jest.mock('../src/services/alerts', () => ({
   dismissAgentAlertsForTab: jest.fn(),
   alertAgent: jest.fn(),
+  transitionAgentAlert: jest.fn(),
 }));
 jest.mock('../src/services/backgroundMonitoring', () => ({
   startBackgroundMonitoring: jest.fn(),
@@ -49,9 +45,6 @@ jest.mock('../src/services/backgroundOperations', () => ({
 }));
 jest.mock('../src/services/NativeTranscriptService', () => ({
   agentTranscriptService: { activate: jest.fn() },
-}));
-jest.mock('../src/hooks/useSpinnerFrameRate', () => ({
-  SpinnerFrameRateProvider: 'SpinnerProvider',
 }));
 jest.mock('../src/components/app-ui', () => ({
   AgentStatusAnimationProvider: 'AnimationProvider',
@@ -135,6 +128,7 @@ function setup() {
     preferences: { value: { terminal: {} } },
     entitlements: {},
     hosts: {
+      hosts: [],
       editorProfile: null,
       newHostOpen: false,
       unlockedGlobalKeys: null,
@@ -166,6 +160,34 @@ function setup() {
     finishRefresh: () => finishRefresh(snapshot),
   };
 }
+
+test.each([
+  ['android', true, ['left', 'right']],
+  ['android', false, ['top', 'left', 'right']],
+  ['ios', true, ['left', 'right']],
+  ['ios', false, ['top', 'left', 'right']],
+] as const)('%s respects full screen %s across app and terminal screens', (platform, fullscreen, edges) => {
+  const { props } = setup();
+  Platform.OS = platform;
+  props.navigation.state.tab = 'hosts';
+  props.preferences.value.fullscreenApp = fullscreen;
+  props.preferences.value.terminal.fullscreen = fullscreen;
+  let renderer!: ReactTestRenderer;
+  try {
+    act(() => { renderer = create(<AppShell {...props} />); });
+    for (const tab of ['hosts', 'more', 'terminal'] as const) {
+      props.navigation.state.tab = tab;
+      act(() => { renderer.update(<AppShell {...props} />); });
+      const safeArea = renderer.root.find(node => (node.type as unknown) === 'SafeAreaView');
+      const statusBar = renderer.root.find(node => (node.type as unknown) === 'StatusBar');
+      expect(safeArea.props.edges).toEqual(edges);
+      expect(statusBar.props.hidden).toBe(fullscreen);
+    }
+  } finally {
+    act(() => renderer?.unmount());
+    Platform.OS = 'android';
+  }
+});
 
 test.each(['current', 'not-installed'] as const)(
   'a Chat refresh preserves the connected SSH client and shows %s remediation without installing',

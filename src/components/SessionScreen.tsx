@@ -3,10 +3,17 @@ import {
   useEffect,
   useEffectEvent,
   useLayoutEffect,
+  useReducer,
   useRef,
   useState,
+  type ReactNode,
+  type RefObject,
 } from 'react';
 import { useChatViewportRetention } from '../hooks/useChatViewportRetention';
+import { useGithubRepository } from '../hooks/useGithubRepository';
+import { remoteConnectionRequest } from '../services/remoteGitQueries';
+import { GithubViewer, type GithubViewerRequest } from './GithubViewer';
+import { useTranscriptTabTitles } from '../hooks/useTranscriptTabTitles';
 import { ScreenUpdates } from './ScreenUpdates';
 import {
   ChevronLeft,
@@ -22,11 +29,14 @@ import {
   Platform,
   ScrollView,
   View,
+  type ViewInstance,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useTranslation } from 'react-i18next';
-import { readCachedAgentTranscript } from 'react-native-whip-ssh';
+import { readSavedAgentTranscript } from 'react-native-whip-ssh';
 import WebView from 'react-native-webview';
+import Animated, { useAnimatedProps, useAnimatedStyle, useDerivedValue, type SharedValue } from 'react-native-reanimated';
+import { useAnimatedKeyboardHeight } from '../hooks/useKeyboardInset';
 import { browserRegistry } from '../browser/registry';
 import { supportsBrowserControl } from '../browser/native';
 import { OpenBrowserButton } from '../browser/OpenBrowserButton';
@@ -38,8 +48,8 @@ import {
 } from '@/src/herdQueue';
 import {
   terminalControlBarInset,
+  terminalKeyboardOffset,
   terminalSessionChromeHeight,
-  type TerminalSessionChromeLayout,
 } from '@/src/lib/floatingChrome';
 import { runWithInFlightGuard } from '@/src/lib/inFlightSubmission';
 import { cn } from '@/src/lib/utils';
@@ -76,7 +86,6 @@ import {
   type ChatAgent,
 } from '../lib/agentChatSession';
 import { agentChatStateFromNative } from '../lib/nativeAgentTranscript';
-import { agentChatCache } from '../services/agentChatCache';
 import {
   AgentChatPresentationPhase,
   chatPresentationLoading,
@@ -98,6 +107,7 @@ import {
 } from '../lib/agentChatReconciliation';
 import { useAgentChatOpen } from '../hooks/useAgentChatOpen';
 import { useFocusedChatSpeech } from '../hooks/useFocusedChatSpeech';
+import { useChatReadAloud } from '../hooks/useChatReadAloud';
 import type { AgentChatState } from '../agentChat';
 import type { HerdrClient } from '../services/HerdrClient';
 import {
@@ -125,7 +135,7 @@ import type { AgentStatus, HerdrSnapshot, PaneInfo, TabInfo } from '../types';
 import { AnimatedAgentStatusGlyph, hapticPress } from './app-ui';
 import { AgentIdentityWarningSheet } from './AgentIdentityWarningSheet';
 import { AppAlertPopup, type AppAlertContent } from './AppAlertPopup';
-import { AppBackground } from './AppBackground';
+import { AppBackground, FrostedAppBackground } from './AppBackground';
 import {
   AttachmentPasteSheet,
   type PastedAttachment,
@@ -140,7 +150,8 @@ import { Input } from './ui/input';
 import { Text } from './ui/text';
 import { TerminalBackground, TerminalScreen } from './TerminalScreen';
 import { AgentChatView } from './AgentChatView';
-import { useAppGlassEnabled } from './GlassSurface';
+import { GlassSurface, useAppGlassEnabled } from './GlassSurface';
+import { APP_FROSTED_GLASS_SURFACE_PROPS, appGlassBackgroundClassName, appGlassModalPresentation } from '../lib/appGlass';
 
 interface Props {
   hostId: string;
@@ -174,6 +185,7 @@ interface Props {
     terminalId: string,
     fontSize: number,
   ) => void;
+  onTerminalChatSelect: (hostSessionId: string, terminalId: string, selected: boolean) => void;
   terminalPreferences: TerminalPreferences;
   terminalControlUsage: TerminalControlUsage;
   terminalHistory: readonly string[];
@@ -187,7 +199,61 @@ interface Props {
   onExit: () => void;
 }
 
-type EditorMode = 'tab' | 'ssh-tab' | 'rename-tab' | 'rename-ssh-tab' | 'rename-pane';
+type EditorTarget =
+  | { mode: 'tab' | 'ssh-tab' | 'rename-tab' }
+  | { mode: 'rename-ssh-tab'; terminalId: string }
+  | { mode: 'rename-pane'; paneId: string };
+
+type EditorState = { name: string } & (EditorTarget | { mode: null });
+
+type EditorAction =
+  | { type: 'opened'; target: EditorTarget; name?: string }
+  | { type: 'name-changed'; name: string }
+  | { type: 'closed' };
+
+const CLOSED_EDITOR: EditorState = { mode: null, name: '' };
+
+function editorReducer(state: EditorState, action: EditorAction): EditorState {
+  switch (action.type) {
+    case 'opened':
+      return { ...action.target, name: action.name ?? '' };
+    case 'name-changed':
+      return state.mode === null ? state : { ...state, name: action.name };
+    case 'closed':
+      return CLOSED_EDITOR;
+  }
+}
+
+interface SavedChatViewState {
+  chat: { host: string; paneId: string; agent: ChatAgent; state: AgentChatState } | null;
+  open: boolean;
+  loading: boolean;
+  error: string | null;
+}
+
+type SavedChatAction =
+  | { type: 'opened' }
+  | { type: 'loading' }
+  | { type: 'loaded'; chat: NonNullable<SavedChatViewState['chat']> }
+  | { type: 'failed'; error: string }
+  | { type: 'closed' };
+
+const CLOSED_SAVED_CHAT: SavedChatViewState = { chat: null, open: false, loading: false, error: null };
+
+function savedChatReducer(state: SavedChatViewState, action: SavedChatAction): SavedChatViewState {
+  switch (action.type) {
+    case 'opened':
+      return { ...state, open: true, error: null };
+    case 'loading':
+      return { ...state, loading: true };
+    case 'loaded':
+      return { ...state, chat: action.chat, loading: false };
+    case 'failed':
+      return { ...state, error: action.error, loading: false };
+    case 'closed':
+      return CLOSED_SAVED_CHAT;
+  }
+}
 
 interface TerminalTab {
   id: string;
@@ -228,6 +294,7 @@ export function SessionScreen({
   onCloseTerminal,
   onTerminalStatus,
   onTerminalFontSizeChange,
+  onTerminalChatSelect,
   terminalPreferences,
   terminalControlUsage,
   terminalHistory,
@@ -253,28 +320,21 @@ export function SessionScreen({
   const [tabId, setTabId] = useState(focusedWorkspace?.active_tab_id || '');
   const [pendingCreatedSelection, setPendingCreatedSelection] =
     useState<CreatedTabFocusResult | null>(null);
-  const [editorMode, setEditorMode] = useState<EditorMode | null>(null);
-  const [editingPaneId, setEditingPaneId] = useState<string | null>(null);
-  const [editingSshTerminalId, setEditingSshTerminalId] = useState<string | null>(null);
-  const [name, setName] = useState('');
+  const [editor, dispatchEditor] = useReducer(editorReducer, CLOSED_EDITOR);
+  const { mode: editorMode, name } = editor;
   const [busy, setBusy] = useState(false);
-  const [savedChat, setSavedChat] = useState<{
-    paneId: string;
-    agent: ChatAgent;
-    state: AgentChatState;
-  } | null>(null);
-  const [savedChatOpen, setSavedChatOpen] = useState(false);
-  const [savedChatLoading, setSavedChatLoading] = useState(false);
-  const [savedChatError, setSavedChatError] = useState<string | null>(null);
+  const [{ chat: savedChat, open: savedChatOpen, loading: savedChatLoading, error: savedChatError }, dispatchSavedChat] =
+    useReducer(savedChatReducer, CLOSED_SAVED_CHAT);
   const savedChatGeneration = useRef(0);
-  const [terminalSessionChrome, setTerminalSessionChrome] =
-    useState<TerminalSessionChromeLayout>(() => ({
-      bottom: terminalControlBarInset(safeAreaInsets.bottom),
-      visible: true,
-    }));
+  const browserRuntimeIdRef = useRef(client?.native.runtimeId);
+  if (client) browserRuntimeIdRef.current = client.native.runtimeId;
+  const [terminalControlBarHeight, setTerminalControlBarHeight] =
+    useState(() => terminalControlBarInset(safeAreaInsets.bottom));
+  const keyboardHeight = useAnimatedKeyboardHeight();
   const [appAlert, setAppAlert] = useState<AppAlertContent | null>(null);
   const [linkScanRequest, setLinkScanRequest] = useState(0);
   const [linksOpen, setLinksOpen] = useState(false);
+  const [githubRequest, setGithubRequest] = useState<GithubViewerRequest | null>(null);
   const [terminalLinks, setTerminalLinks] = useState<string[]>([]);
   const [linksBusy, setLinksBusy] = useState(false);
   const [linksError, setLinksError] = useState<string | null>(null);
@@ -283,6 +343,7 @@ export function SessionScreen({
   const [browserCanGoBack, setBrowserCanGoBack] = useState(false);
   const [browserLoading, setBrowserLoading] = useState(false);
   const [attachmentsOpen, setAttachmentsOpen] = useState(false);
+  const [attachmentBlurTarget, setAttachmentBlurTarget] = useState<RefObject<ViewInstance | null>>();
   const [attachmentTerminalId, setAttachmentTerminalId] = useState<
     string | null
   >(null);
@@ -417,6 +478,13 @@ export function SessionScreen({
   const sessionChromeInset = terminalSessionChromeHeight(
     sshTabsVisible ? 0 : panes.length,
   );
+  const transcriptTabTitles = useTranscriptTabTitles(
+    hostSessionId,
+    selectableResources.panes,
+    tabs,
+    terminalState.activeTerminalId,
+    savedChat,
+  );
   const visibleTabs: TerminalTab[] = sshTabsVisible
     ? terminalState.sessions
         .filter(session => session.kind === 'ssh')
@@ -429,7 +497,7 @@ export function SessionScreen({
         }))
     : tabs.map(tab => ({
         id: tab.tab_id,
-        label: tab.label || tab.tab_id,
+        label: transcriptTabTitles.label(hostSessionId, tab, selectableResources.panes, terminalState.activeTerminalId),
         agentStatus: tab.agent_status,
         status: terminalState.sessions.find(session =>
           selectableResources.panes.some(
@@ -450,6 +518,9 @@ export function SessionScreen({
   const activePaneId = activePane?.pane_id;
   const activePaneWorkspaceId = activePane?.workspace_id;
   const activePaneTabId = activePane?.tab_id;
+  const githubPath = activePane?.foreground_cwd || activePane?.cwd ||
+    snapshot.workspaces.find(item => item.workspace_id === activePane?.workspace_id)?.worktree?.checkout_path;
+  const githubRepository = useGithubRepository(client, githubPath, visible && activeTerminalSession?.status === 'connected');
   useEffect(() => {
     if (client || !activePaneId) return;
     setWorkspaceId(activePaneWorkspaceId || '');
@@ -457,39 +528,42 @@ export function SessionScreen({
   }, [activePaneId, activePaneTabId, activePaneWorkspaceId, client]);
   useEffect(() => {
     savedChatGeneration.current += 1;
-    setSavedChatOpen(false);
-    setSavedChat(null);
-    setSavedChatError(null);
-    setSavedChatLoading(false);
+    dispatchSavedChat({ type: 'closed' });
   }, [activePane?.pane_id, hostSessionId]);
-  const openSavedChat = async () => {
+  const openSavedChat = useCallback(async () => {
     const agent = chatAgentForPane(activePane);
     const sessionId = activePane?.agent_session?.value;
     const generation = ++savedChatGeneration.current;
-    setSavedChatOpen(true);
-    setSavedChatError(null);
+    dispatchSavedChat({ type: 'opened' });
     if (!activePane || !agent || !sessionId) {
-      setSavedChatError(t('cachedHost.empty'));
+      dispatchSavedChat({ type: 'failed', error: t('cachedHost.empty') });
       return;
     }
     if (savedChat?.paneId === activePane?.pane_id) return;
-    setSavedChatLoading(true);
+    dispatchSavedChat({ type: 'loading' });
     try {
-      const chats = await agentChatCache.listNative();
-      const chat = chats.find(item => item.namespace === hostSessionId
-        && item.agent === agent && item.sessionId === sessionId);
-      if (!chat) throw new Error(t('cachedHost.empty'));
-      const blob = await agentChatCache.loadNative(chat.key);
-      if (!blob) throw new Error(t('savedChats.missing'));
+      const state = await readSavedAgentTranscript(hostSessionId, agent, sessionId);
+      if (!state) throw new Error(t('cachedHost.empty'));
       if (generation !== savedChatGeneration.current) return;
-      const restored = agentChatStateFromNative(readCachedAgentTranscript(agent, sessionId, blob));
-      setSavedChat({ paneId: activePane.pane_id, agent, state: restored });
+      const restored = agentChatStateFromNative(state);
+      dispatchSavedChat({ type: 'loaded', chat: { host: hostSessionId, paneId: activePane.pane_id, agent, state: restored } });
+      onTerminalChatSelect(hostSessionId, activePane.terminal_id, true);
     } catch (error) {
-      if (generation === savedChatGeneration.current) setSavedChatError(String(error));
-    } finally {
-      if (generation === savedChatGeneration.current) setSavedChatLoading(false);
+      if (generation === savedChatGeneration.current) dispatchSavedChat({ type: 'failed', error: String(error) });
     }
-  };
+  }, [activePane, hostSessionId, onTerminalChatSelect, savedChat?.paneId, t]);
+  const savedChatRestoreAttemptRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!activeTerminalSession?.chatSelected || client) {
+      savedChatRestoreAttemptRef.current = null;
+      return;
+    }
+    if (!visible || !chatAgentForPane(activePane)) return;
+    const key = `${hostSessionId}:${activeTerminalSession.terminalId}`;
+    if (savedChatRestoreAttemptRef.current === key) return;
+    savedChatRestoreAttemptRef.current = key;
+    reportBackgroundFailure(openSavedChat(), 'saved-chat-selection-restore');
+  }, [activePane, activeTerminalSession, client, hostSessionId, openSavedChat, visible]);
   const activeTarget =
     terminalTargets.find(
       target =>
@@ -509,6 +583,7 @@ export function SessionScreen({
     onBound: projection => {
       const presentation = requestedChatPresentation(projection.state);
       if (!activeTarget) return;
+      onTerminalChatSelect(hostSessionId, activeTarget.session.terminalId, true);
       setChatViews(current => new Map(current).set(activeTarget.key, {
         binding: projection.binding, presentation, state: projection.state,
       }));
@@ -526,8 +601,7 @@ export function SessionScreen({
   }, [activeTarget, chatOpen, client, savedChatOpen, visible]);
   useEffect(() => {
     if (savedChatOpen && chatPresentationVisible(activeChatView?.presentation)) {
-      setSavedChatOpen(false);
-      setSavedChat(null);
+      dispatchSavedChat({ type: 'closed' });
     }
   }, [activeChatView?.presentation, savedChatOpen]);
   const cancelChatOpen = chatOpen.cancel;
@@ -552,9 +626,22 @@ export function SessionScreen({
   const activeSavedChat = savedChat?.paneId === activePane?.pane_id ? savedChat : null;
   const voiceChatState = savedChatOpen ? activeSavedChat?.state : activeChatView?.state;
   const voiceChatKey = savedChatOpen ? activeSavedChat?.state.sessionId : activeChatView?.binding.bindingToken;
+  const voiceChatAgent = savedChatOpen ? activeSavedChat?.agent : activeChatView?.binding.agent;
   const onChatSpeechError = useCallback((error: unknown) => {
     setAppAlert({ title: 'Could not read chat aloud', message: String(error) });
   }, []);
+  const chatReadAloud = useChatReadAloud(
+    visible && chatVisible && voiceChatKey && voiceChatAgent && activePane
+      ? {
+          agent: voiceChatAgent,
+          bindingToken: voiceChatKey,
+          hostId: hostSessionId,
+          paneId: activePane.pane_id,
+          label: chatAgentDisplayName(voiceChatAgent),
+        }
+      : null,
+    onChatSpeechError,
+  );
   useFocusedChatSpeech(
     visible && activeChatView && chatPresentationVisible(activeChatView.presentation) && activePane
       ? {
@@ -565,7 +652,7 @@ export function SessionScreen({
           label: chatAgentDisplayName(activeChatView.binding.agent),
         }
       : null,
-    ttsEnabled,
+    ttsEnabled && chatReadAloud.readingTurnId === null,
     onChatSpeechError,
   );
   const chatViewportMounted = Boolean(
@@ -782,8 +869,7 @@ export function SessionScreen({
     pendingFocus.current = null;
     setPendingCreatedSelection(null);
     browserRequestRef.current += 1;
-    setEditorMode(null);
-    setEditingPaneId(null);
+    dispatchEditor({ type: 'closed' });
     setAppAlert(null);
     setLinksOpen(false);
     setBrowserUrl(null);
@@ -921,6 +1007,22 @@ export function SessionScreen({
           preloadTarget.hostSessionId, preloadTarget.session.terminalId, preloadTarget.client.native,
         )
       : null;
+    const selectedProjection = preload?.type === 'bound'
+      ? preload
+      : preloadTarget && projections.get(preloadTarget.key);
+    const restoreSelection = preloadTarget?.session.chatSelected &&
+      (!existing || existing.presentation.phase === AgentChatPresentationPhase.Dormant ||
+        existing.presentation.phase === AgentChatPresentationPhase.Warm);
+    const selectedView = selectedProjection?.type === 'bound' &&
+      (preload?.type === 'bound' || restoreSelection)
+      ? {
+          binding: selectedProjection.binding,
+          state: selectedProjection.state,
+          presentation: restoreSelection
+            ? requestedChatPresentation(selectedProjection.state)
+            : dormantChatPresentation(),
+        }
+      : null;
     setChatViews(current => {
       const next = reconcileAgentChatViews(
         current,
@@ -929,14 +1031,9 @@ export function SessionScreen({
         reboundPresentations,
         exitedTerminalKeys,
       );
-      if (preloadTarget && preload?.type === 'bound') {
-        return new Map(next).set(preloadTarget.key, {
-          binding: preload.binding,
-          state: preload.state,
-          presentation: dormantChatPresentation(),
-        });
-      }
-      return next;
+      return preloadTarget && selectedView
+        ? new Map(next).set(preloadTarget.key, selectedView)
+        : next;
     });
   }, [
     // Native state may change while JS is paused without a new pane snapshot.
@@ -1253,14 +1350,14 @@ export function SessionScreen({
   };
 
   const create = async () => {
-    if (!client) return;
+    if (!client || editor.mode === null) return;
     if (mutationInFlight.current) return;
     let succeeded = true;
     if (editorMode === 'ssh-tab') {
       succeeded = await run(() => onOpenSshShell(name));
-    } else if (editorMode === 'rename-ssh-tab' && editingSshTerminalId) {
+    } else if (editor.mode === 'rename-ssh-tab') {
       succeeded = await run(() =>
-        onRenameSshShell(editingSshTerminalId, name.trim() || t('terminal.sshShell')),
+        onRenameSshShell(editor.terminalId, name.trim() || t('terminal.sshShell')),
       );
     } else if (editorMode === 'rename-tab' && selectedTab) {
       succeeded = await run(() =>
@@ -1269,11 +1366,11 @@ export function SessionScreen({
           params: { tab_id: selectedTab.tab_id, label: name },
         }),
       );
-    } else if (editorMode === 'rename-pane' && editingPaneId) {
+    } else if (editor.mode === 'rename-pane') {
       succeeded = await run(() =>
         client.native.requestHerdrApi({
           method: 'pane.rename',
-          params: { pane_id: editingPaneId, label: name.trim() || null },
+          params: { pane_id: editor.paneId, label: name.trim() || null },
         }),
       );
     } else if (workspace) {
@@ -1303,25 +1400,18 @@ export function SessionScreen({
       });
     }
     if (!succeeded) pendingFocus.current = null;
-    setName('');
-    setEditingPaneId(null);
-    setEditingSshTerminalId(null);
-    setEditorMode(null);
+    dispatchEditor({ type: 'closed' });
   };
 
   const openRenameTab = (item: TabInfo | undefined = selectedTab) => {
     if (!item) return;
     if (item.tab_id !== selectedTab?.tab_id) chooseTab(item);
-    setName(item.label);
-    setEditingPaneId(null);
-    setEditorMode('rename-tab');
+    dispatchEditor({ type: 'opened', target: { mode: 'rename-tab' }, name: item.label });
   };
 
   const openRenameSshTab = (item: TerminalTab) => {
     chooseVisibleTab(item);
-    setName(item.label);
-    setEditingSshTerminalId(item.id);
-    setEditorMode('rename-ssh-tab');
+    dispatchEditor({ type: 'opened', target: { mode: 'rename-ssh-tab', terminalId: item.id }, name: item.label });
   };
 
   const closeTab = async (item: TabInfo | undefined = selectedTab) => {
@@ -1346,16 +1436,13 @@ export function SessionScreen({
 
   const openRenamePane = (pane: PaneInfo) => {
     if (pane.pane_id !== selectedPane?.pane_id) choosePane(pane);
-    setName(pane.label || '');
-    setEditingPaneId(pane.pane_id);
-    setEditorMode('rename-pane');
+    dispatchEditor({ type: 'opened', target: { mode: 'rename-pane', paneId: pane.pane_id }, name: pane.label || '' });
   };
 
   const closePane = async (pane: PaneInfo) => {
     if (!client) return;
-    if (editingPaneId === pane.pane_id) {
-      setEditingPaneId(null);
-      setEditorMode(null);
+    if (editor.mode === 'rename-pane' && editor.paneId === pane.pane_id) {
+      dispatchEditor({ type: 'closed' });
     }
     await run(() =>
       client.native.requestHerdrApi({
@@ -1366,10 +1453,7 @@ export function SessionScreen({
   };
 
   const closeEditor = () => {
-    setName('');
-    setEditingPaneId(null);
-    setEditingSshTerminalId(null);
-    setEditorMode(null);
+    dispatchEditor({ type: 'closed' });
   };
 
   const openFileManager = () => {
@@ -1392,16 +1476,17 @@ export function SessionScreen({
     });
   };
 
-  const openAttachments = () => {
+  const openAttachments = (blurTarget?: RefObject<ViewInstance | null>) => {
     if (activeTerminalSession?.status !== 'connected') return;
     setAttachmentTerminalId(activeTerminalSession.terminalId);
+    setAttachmentBlurTarget(blurTarget);
     setAttachmentsOpen(true);
   };
 
   const closeActiveChat = useCallback(() => {
+    if (activeTerminalSession) onTerminalChatSelect(hostSessionId, activeTerminalSession.terminalId, false);
     if (savedChatOpen) {
-      setSavedChatOpen(false);
-      setSavedChat(null);
+      dispatchSavedChat({ type: 'closed' });
       savedChatGeneration.current += 1;
       liveChatResumeRef.current = null;
       cancelChatOpen();
@@ -1419,7 +1504,7 @@ export function SessionScreen({
         ...view, presentation: closeChatPresentation(view.presentation),
       });
     });
-  }, [activeTerminalSession?.terminalId, activeTarget, cancelChatOpen, savedChatOpen, updateChatRestoreIntent]);
+  }, [activeTerminalSession, activeTarget, cancelChatOpen, hostSessionId, onTerminalChatSelect, savedChatOpen, updateChatRestoreIntent]);
 
   const openAgentChat = () => {
     if (!client) return openSavedChat();
@@ -1445,6 +1530,7 @@ export function SessionScreen({
           setChatViews(current => new Map(current).set(activeTarget.key, {
             binding: projection.binding, state: projection.state, presentation,
           }));
+          onTerminalChatSelect(hostSessionId, activeTarget.session.terminalId, true);
           return;
         }
       } catch (error) {
@@ -1471,17 +1557,14 @@ export function SessionScreen({
     >
       <TerminalBackground preferences={terminalPreferences} />
       <View
+        pointerEvents="box-none"
         className="absolute inset-x-0 z-30"
-        style={{ bottom: terminalSessionChrome.bottom }}
+        style={{ bottom: terminalControlBarHeight }}
       >
-        <View
-          accessibilityElementsHidden={!terminalSessionChrome.visible}
-          importantForAccessibility={
-            terminalSessionChrome.visible ? 'auto' : 'no-hide-descendants'
-          }
-          pointerEvents={terminalSessionChrome.visible ? 'auto' : 'none'}
+        <SessionChromeRow
+          keyboardHeight={keyboardHeight}
+          bottomSafeAreaInset={safeAreaInsets.bottom}
           className="h-[55px] flex-row border-b border-border bg-transparent"
-          style={terminalSessionChrome.visible ? undefined : { display: 'none' }}
         >
           <Button
             accessibilityLabel={t('session.backToHerd')}
@@ -1584,29 +1667,30 @@ export function SessionScreen({
               );
             })}
           </ScrollView>
-          {client && (
+          {browserRuntimeIdRef.current && (
             <OpenBrowserButton
-              runtimeId={client.native.runtimeId}
+              disabled={!client}
+              runtimeId={browserRuntimeIdRef.current}
               paneId={activePane?.pane_id}
             />
           )}
-          {client && <Button
+          <Button
             accessibilityLabel={t('session.newTab')}
             className={cn(
               'h-[55px] items-center justify-center rounded-none px-0 py-0',
               Platform.OS === 'ios' ? 'w-14' : 'w-11',
             )}
-            disabled={busy}
+            disabled={!client || busy}
             size="content"
             variant="ghost"
-            onPress={hapticPress(() => setEditorMode(sshTabsVisible ? 'ssh-tab' : 'tab'))}
+            onPress={hapticPress(() => dispatchEditor({ type: 'opened', target: { mode: sshTabsVisible ? 'ssh-tab' : 'tab' } }))}
           >
             <Plus
               size={Platform.OS === 'ios' ? 23 : 16}
               color={colors.text}
             />
-          </Button>}
-        </View>
+          </Button>
+        </SessionChromeRow>
 
         <ResourceEditorSheet
           busy={busy}
@@ -1634,7 +1718,7 @@ export function SessionScreen({
               returnKeyType="done"
               selectTextOnFocus={editorMode?.startsWith('rename')}
               value={name}
-              onChangeText={setName}
+              onChangeText={value => dispatchEditor({ type: 'name-changed', name: value })}
               onSubmitEditing={() => {
                 reportBackgroundFailure(create(), 'session-resource-create');
               }}
@@ -1650,8 +1734,11 @@ export function SessionScreen({
           </ResourceEditorField>
         </ResourceEditorSheet>
 
-        {terminalSessionChrome.visible && !sshTabsVisible && selectedTab && panes.length > 1 && (
-          <View className="h-11 flex-row border-b border-border bg-transparent">
+        {!sshTabsVisible && selectedTab && panes.length > 1 && (
+          <SessionChromeRow
+            keyboardHeight={keyboardHeight}
+            bottomSafeAreaInset={safeAreaInsets.bottom}
+            className="h-11 flex-row border-b border-border bg-transparent">
             <ScrollView
               horizontal
               showsHorizontalScrollIndicator={false}
@@ -1695,12 +1782,12 @@ export function SessionScreen({
                         {label}
                       </Text>
                     </Button>
-                    {client && <Button
+                    <Button
                       accessibilityLabel={t('session.closePane', {
                         pane: label,
                       })}
                       className="size-11 rounded-none px-0"
-                      disabled={busy}
+                      disabled={!client || busy}
                       variant="ghost"
                       onPress={hapticPress(() => closePane(pane))}
                     >
@@ -1708,12 +1795,12 @@ export function SessionScreen({
                         size={13}
                         color={active ? colors.onPrimary : colors.textSecondary}
                       />
-                    </Button>}
+                    </Button>
                   </View>
                 );
               })}
             </ScrollView>
-          </View>
+          </SessionChromeRow>
         )}
       </View>
 
@@ -1728,7 +1815,7 @@ export function SessionScreen({
             targets={terminalTargets}
             compact
             sessionChromeInset={sessionChromeInset}
-            onSessionChromeLayoutChange={setTerminalSessionChrome}
+            onControlBarHeightChange={setTerminalControlBarHeight}
             latencyMs={latencyMs}
             latencyWarningActive={latencyWarningActive}
             visible={visible && (Boolean(activeTarget) || !client)}
@@ -1752,6 +1839,10 @@ export function SessionScreen({
             }
             onRequestAttachment={openAttachments}
             onRequestFiles={openFileManager}
+            onRequestGithub={githubRepository && client ? () => setGithubRequest({
+              repository: githubRepository,
+              connection: remoteConnectionRequest(client),
+            }) : undefined}
             onRequestLinks={scanTerminalLinks}
             chatControl={
               activeChatControl
@@ -1785,19 +1876,22 @@ export function SessionScreen({
               : undefined}
             renderViewportOverlay={
               savedChatOpen
-                ? (insets, latestButtonBottom, search) => (
-                    <View className="absolute inset-0 bg-background">
+                ? (insets, latestButtonBottom, search, animatedBottomInset) => (
+                    <View className={cn('absolute inset-0', appGlassBackgroundClassName(appGlassEnabled))}>
                       {activeSavedChat ? (
                         <AgentChatView
                           state={activeSavedChat.state}
+                          savedSearchNamespace={hostSessionId}
+                          readAloud={chatReadAloud}
                           imageClient={client ?? undefined}
                           agent={activeSavedChat.agent}
                           agentStatus="idle"
                           contentInsets={insets}
+                          animatedBottomInset={animatedBottomInset}
                           latestButtonBottom={latestButtonBottom}
                           searchOpen={search.open}
                           onCloseSearch={search.onClose}
-                          onOpenFile={() => setSavedChatError(t('savedChats.filesUnavailable'))}
+                          onOpenFile={() => dispatchSavedChat({ type: 'failed', error: t('savedChats.filesUnavailable') })}
                           onOpenWebLink={handleOpenWebLink}
                         />
                       ) : savedChatLoading ? (
@@ -1808,7 +1902,7 @@ export function SessionScreen({
                     </View>
                   )
                 : mountedChatViews.length
-                ? (insets, latestButtonBottom, search) =>
+                ? (insets, latestButtonBottom, search, animatedBottomInset) =>
                     mountedChatViews.map(
                       ({ key, view: chatView, identity }) => {
                         const selected = key === activeTarget?.key;
@@ -1840,6 +1934,9 @@ export function SessionScreen({
                                     chatView.presentation.generation,
                                   ].join(':')}
                                   state={chatView.state}
+                                  searchRuntime={chatClient?.native}
+                                  searchKey={chatView.binding.transcriptKey}
+                                  readAloud={active ? chatReadAloud : undefined}
                                   imageClient={chatClient}
                                   active={active}
                                   savedViewport={viewportRetention.snapshots.get(
@@ -1858,6 +1955,7 @@ export function SessionScreen({
                                       : 'idle'
                                   }
                                   contentInsets={insets}
+                                  animatedBottomInset={animatedBottomInset}
                                   latestButtonBottom={latestButtonBottom}
                                   searchOpen={search.open}
                                   onCloseSearch={search.onClose}
@@ -1929,7 +2027,10 @@ export function SessionScreen({
             }
             viewportOverlayBackground={
               chatVisible && appGlassEnabled ? (
-                <AppBackground
+                savedChatOpen ? <FrostedAppBackground
+                  uri={appBackgroundImageUri}
+                  dimming={appBackgroundDimming}
+                /> : <AppBackground
                   uri={appBackgroundImageUri}
                   dimming={appBackgroundDimming}
                 />
@@ -2012,6 +2113,7 @@ export function SessionScreen({
         {client && <AttachmentPasteSheet
           client={client}
           visible={attachmentsOpen}
+          blurTarget={attachmentBlurTarget}
           onClose={() => setAttachmentsOpen(false)}
           onPaste={(attachment: PastedAttachment) => {
             if (!attachmentTerminalId) {
@@ -2037,13 +2139,16 @@ export function SessionScreen({
           onClose={chatOpen.dismissNotice}
         />
         <Modal
+          {...appGlassModalPresentation(appGlassEnabled, Platform.OS)}
           animationType="slide"
           onRequestClose={browserUrl ? leaveBrowser : dismissLinks}
           statusBarTranslucent
           visible={linksOpen}
         >
-          <View
-            className="flex-1 bg-background"
+          <GlassSurface
+            {...APP_FROSTED_GLASS_SURFACE_PROPS}
+            className="flex-1"
+            fallbackClassName="bg-background"
             style={{
               paddingTop: safeAreaInsets.top,
               paddingBottom: safeAreaInsets.bottom,
@@ -2051,7 +2156,7 @@ export function SessionScreen({
           >
             {browserUrl ? (
               <>
-                <View className="h-12 flex-row items-center border-b border-border bg-background">
+                <View className={cn('h-12 flex-row items-center border-b border-border', appGlassBackgroundClassName(appGlassEnabled))}>
                   <Button
                     accessibilityLabel={t('terminal.browserBack')}
                     className="h-12 w-12 rounded-none px-0"
@@ -2219,9 +2324,17 @@ export function SessionScreen({
                 )}
               </>
             )}
-          </View>
+          </GlassSurface>
         </Modal>
       </View>
+      {githubRequest && visible && (
+        <GithubViewer
+          key={`${githubRequest.connection.native.runtimeId}:${githubRequest.repository.nameWithOwner}`}
+          {...githubRequest}
+          connection={client?.activeNative?.runtimeId === githubRequest.connection.native.runtimeId ? remoteConnectionRequest(client) : githubRequest.connection}
+          onClose={() => setGithubRequest(null)}
+        />
+      )}
       <AppAlertPopup
         message={visibleAppAlert?.message}
         title={visibleAppAlert?.title || ''}
@@ -2230,4 +2343,22 @@ export function SessionScreen({
       />
     </View>
   );
+}
+
+function SessionChromeRow({ keyboardHeight, bottomSafeAreaInset, className, children }: {
+  keyboardHeight: SharedValue<number>;
+  bottomSafeAreaInset: number;
+  className: string;
+  children: ReactNode;
+}) {
+  const hidden = useDerivedValue(() => terminalKeyboardOffset(keyboardHeight.value, bottomSafeAreaInset) > 0);
+  const style = useAnimatedStyle(() => ({ opacity: hidden.value ? 0 : 1 }));
+  const animatedProps = useAnimatedProps(() => {
+    return {
+      pointerEvents: hidden.value ? 'none' as const : 'auto' as const,
+      accessibilityElementsHidden: hidden.value,
+      importantForAccessibility: hidden.value ? 'no-hide-descendants' as const : 'auto' as const,
+    };
+  });
+  return <Animated.View className={className} style={style} animatedProps={animatedProps}>{children}</Animated.View>;
 }

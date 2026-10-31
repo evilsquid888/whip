@@ -12,16 +12,13 @@ class HerdrBackgroundPackage : ReactPackage {
       WhipBrowserModule(reactContext),
       WhipDeviceModule(reactContext),
       WhipShizukuModule(reactContext),
+      WhipLaunchScreenModule(reactContext),
       ClipboardAttachmentModule(reactContext),
       ComposerFontModule(reactContext),
       CredentialVaultModule(reactContext),
       HerdrBackgroundModule(reactContext),
-      HerdrSoftInputModule(reactContext),
-      HerdrSystemSettingsModule(reactContext),
       HerdrVolumeKeysModule(reactContext),
-      ImageLibraryPickerModule(reactContext),
       PerformanceTraceModule(reactContext),
-      PrivateKeyFilePickerModule(reactContext),
     )
 
   override fun createViewManagers(

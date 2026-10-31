@@ -1,4 +1,4 @@
-import { AlertCircle, Bot, Ellipsis, Globe2, LockKeyhole, LogIn, LogOut, Network, Plus, Server, ServerOff, Trash2 } from 'lucide-react-native';
+import { AlertCircle, Bell, Bot, Cat, Ellipsis, Globe2, KeyRound, LockKeyhole, LogIn, LogOut, Network, Plus, Server, ServerOff, Trash2 } from 'lucide-react-native';
 import { useEffect, useRef, useState } from 'react';
 import { PanResponder, Platform, ScrollView, View } from 'react-native';
 import Animated, { cancelAnimation, useAnimatedStyle, useSharedValue, withSpring } from 'react-native-reanimated';
@@ -20,7 +20,8 @@ import {
   shouldOpenHostSwipe,
 } from '@/src/lib/hostSwipeActions';
 import type { CredentialRecoveryStatus } from '@/src/services/credentialVault';
-import { bestEffortCleanup } from '@/src/services/backgroundOperations';
+import { bestEffortCleanup, reportBackgroundFailure } from '@/src/services/backgroundOperations';
+import { remoteNotificationStates, subscribeRemoteNotifications } from '@/src/services/remoteNotifications';
 import { statusColor, useTheme } from '@/src/theme';
 import type { HostProfile } from '@/src/types';
 import { AgentStatusMedallion, hapticPress, HerdrMark, IconButton, ScreenHeader, StatusBadge, WhipMark } from './app-ui';
@@ -28,6 +29,12 @@ import { GlassSurface } from './GlassSurface';
 import { Button } from './ui/button';
 import { Icon } from './ui/icon';
 import { Text } from './ui/text';
+
+const HOST_FEATURE_ICON_SIZE = 13;
+const HOST_FEATURE_ICON_FRAME_CLASS_NAME = 'size-5 items-center justify-center';
+const HOST_FEATURE_BADGE_CLASS_NAME = 'min-h-5 flex-row items-center gap-1';
+const HOST_FEATURE_VALUE_CLASS_NAME = 'text-[10px] font-semibold leading-[15px] text-muted-foreground';
+const HOST_FEATURE_VALUE_STYLE = { includeFontPadding: false } as const;
 
 interface Props {
   hosts: HostProfile[];
@@ -44,13 +51,33 @@ interface Props {
   onDelete: (host: HostProfile) => void;
   onDisconnect: (host: HostProfile) => void;
   onEdit: (host: HostProfile) => void;
+  onManageGlobalKeychain: () => void;
   onUnlockCredentials: () => Promise<boolean>;
 }
 
-export function HostsScreen({ hosts, connectingHostIds = [], error, activeHostId, connectedHostIds = [], latencyMsByHostId = {}, runtimeByHostId = {}, credentialRecovery, credentialRecoveryBusy, onAdd, onConnect, onDelete, onDisconnect, onEdit, onUnlockCredentials }: Props) {
+export function HostsScreen({ hosts, connectingHostIds = [], error, activeHostId, connectedHostIds = [], latencyMsByHostId = {}, runtimeByHostId = {}, credentialRecovery, credentialRecoveryBusy, onAdd, onConnect, onDelete, onDisconnect, onEdit, onManageGlobalKeychain, onUnlockCredentials }: Props) {
   const { t } = useTranslation();
   const { colors } = useTheme();
   const { bottom } = useSafeAreaInsets();
+  const [pushEnabledHostIds, setPushEnabledHostIds] = useState<Set<string>>(() => new Set());
+  useEffect(() => {
+    let active = true;
+    let request = 0;
+    const refresh = () => {
+      const currentRequest = ++request;
+      reportBackgroundFailure(remoteNotificationStates().then(states => {
+        if (active && currentRequest === request) {
+          setPushEnabledHostIds(new Set(states.filter(state => state.enabled).map(state => state.hostId)));
+        }
+      }), 'hosts-push-state');
+    };
+    const unsubscribe = subscribeRemoteNotifications(refresh);
+    refresh();
+    return () => {
+      active = false;
+      unsubscribe();
+    };
+  }, []);
   const connectingHostIdSet = new Set(connectingHostIds);
   const connectedHostIdSet = new Set(connectedHostIds);
   const hostsById = new Map(hosts.map(host => [host.id, host]));
@@ -70,6 +97,7 @@ export function HostsScreen({ hosts, connectingHostIds = [], error, activeHostId
             {supportsBrowserControl() && (
               <IconButton icon={Globe2} accessibilityLabel={t('terminal.openBrowser')} onPress={() => bestEffortCleanup(browserRegistry.openLocal(), 'browser-open-local')} />
             )}
+            <IconButton icon={KeyRound} accessibilityLabel={t('settings.globalKeychain')} onPress={onManageGlobalKeychain} />
             <IconButton icon={Plus} accessibilityLabel={t('hosts.add')} onPress={onAdd} />
           </View>
         }
@@ -121,6 +149,7 @@ export function HostsScreen({ hosts, connectingHostIds = [], error, activeHostId
                   const connecting = connectingHostIdSet.has(host.id);
                   const active = activeHostId === host.id;
                   const connected = connectedHostIdSet.has(host.id);
+                  const pushEnabled = pushEnabledHostIds.has(host.id);
                   const state = connecting ? 'working' : connected ? 'done' : 'idle';
                   const label = connecting ? t('hosts.opening') : active && connected ? t('hosts.active') : connected ? t('hosts.open') : t('hosts.offline');
                   const displayName = hostDisplayName(host);
@@ -170,7 +199,7 @@ export function HostsScreen({ hosts, connectingHostIds = [], error, activeHostId
                                   ? ` · ${t('hosts.lastConnected', { value: formatLastUsed(host.lastConnectedAt, t) })}`
                                   : ''}
                               </Text>
-                              {host.jumpHostId || connected ? (
+                              {connected ? (
                                 <View className="mt-1.5 flex-row flex-wrap items-center gap-x-2.5 gap-y-1">
                                   {host.jumpHostId ? (
                                     <View
@@ -178,38 +207,50 @@ export function HostsScreen({ hosts, connectingHostIds = [], error, activeHostId
                                       accessibilityLabel={t('hosts.jumpHost', {
                                         host: jumpHost ? hostDisplayName(jumpHost) : t('hosts.jumpHostUnavailable'),
                                       })}
-                                      className="flex-row items-center gap-1">
-                                      <Icon as={Network} className="text-muted-foreground" size={11} />
-                                      <Text className="text-[10px] font-semibold leading-[15px] text-muted-foreground">
+                                      className={HOST_FEATURE_BADGE_CLASS_NAME}>
+                                      <View className={HOST_FEATURE_ICON_FRAME_CLASS_NAME}>
+                                        <Icon as={Network} className="text-muted-foreground" size={HOST_FEATURE_ICON_SIZE} />
+                                      </View>
+                                      <Text style={HOST_FEATURE_VALUE_STYLE} className={HOST_FEATURE_VALUE_CLASS_NAME}>
                                         {jumpHost ? hostDisplayName(jumpHost) : t('hosts.jumpHostUnavailable')}
                                       </Text>
                                     </View>
                                   ) : null}
-                                  {connected ? (
-                                    <>
-                                      <View
-                                        accessible
-                                        accessibilityLabel={t('hosts.agents', { count: runtime?.agentTotal ?? 0 })}
-                                        className="flex-row items-center gap-1">
-                                        <Icon as={Bot} className="text-muted-foreground" size={20} />
-                                        <Text className="text-[10px] font-semibold leading-[15px] text-muted-foreground">
-                                          {runtime?.agentTotal ?? 0}
-                                        </Text>
-                                      </View>
-                                      <View
-                                        accessible
-                                        accessibilityLabel={runtime?.protocol == null
-                                          ? t('hosts.herdrProtocolNone')
-                                          : t('hosts.herdrProtocol', { version: runtime.protocol })}
-                                        className="flex-row items-center gap-1">
-                                        <HerdrMark size={13} />
-                                        <Text className="text-[10px] font-semibold leading-[15px] text-muted-foreground">
-                                          {runtime?.protocol == null
-                                            ? t('hosts.herdrProtocolNoneValue')
-                                            : t('hosts.herdrProtocolValue', { version: runtime.protocol })}
-                                        </Text>
-                                      </View>
-                                    </>
+                                  <View
+                                    accessible
+                                    accessibilityLabel={t('hosts.agents', { count: runtime?.agentTotal ?? 0 })}
+                                    className={HOST_FEATURE_BADGE_CLASS_NAME}>
+                                    <View className={HOST_FEATURE_ICON_FRAME_CLASS_NAME}>
+                                      <Icon as={Bot} className="text-muted-foreground" size={HOST_FEATURE_ICON_SIZE} />
+                                    </View>
+                                    <Text style={HOST_FEATURE_VALUE_STYLE} className={HOST_FEATURE_VALUE_CLASS_NAME}>
+                                      {runtime?.agentTotal ?? 0}
+                                    </Text>
+                                  </View>
+                                  <View
+                                    accessible
+                                    accessibilityLabel={runtime?.protocol == null
+                                      ? t('hosts.herdrProtocolNone')
+                                      : t('hosts.herdrProtocol', { version: runtime.protocol })}
+                                    className={HOST_FEATURE_BADGE_CLASS_NAME}>
+                                    <View className={HOST_FEATURE_ICON_FRAME_CLASS_NAME}>
+                                      <HerdrMark size={HOST_FEATURE_ICON_SIZE} />
+                                    </View>
+                                    <Text style={HOST_FEATURE_VALUE_STYLE} className={HOST_FEATURE_VALUE_CLASS_NAME}>
+                                      {runtime?.protocol == null
+                                        ? t('hosts.herdrProtocolNoneValue')
+                                        : t('hosts.herdrProtocolValue', { version: runtime.protocol })}
+                                    </Text>
+                                  </View>
+                                  {host.tailcatEnabled ? (
+                                    <View accessible accessibilityLabel={t('connection.tailcat')} className={HOST_FEATURE_ICON_FRAME_CLASS_NAME}>
+                                      <Icon as={Cat} className="text-muted-foreground" size={HOST_FEATURE_ICON_SIZE} />
+                                    </View>
+                                  ) : null}
+                                  {pushEnabled ? (
+                                    <View accessible accessibilityLabel={t('settings.notifications')} className={HOST_FEATURE_ICON_FRAME_CLASS_NAME}>
+                                      <Icon as={Bell} className="text-muted-foreground" size={HOST_FEATURE_ICON_SIZE} />
+                                    </View>
                                   ) : null}
                                 </View>
                               ) : null}

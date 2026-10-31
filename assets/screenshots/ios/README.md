@@ -1,25 +1,71 @@
 # iOS README previews
 
-This directory contains screenshots of Whip 1.8.6 captured on the
-previously configured iPhone 17 Pro simulator on `mini`, running iOS 26.5.
-The local ARM64 simulator build uses commit `dbfca79d`. It retains the saved
-background image, glass mode, and developer Rancher appearance. These are actual
+The gallery uses frames from the Whip 1.9.1 launch recordings, captured on the
+configured iPhone 17 Pro simulator on `mini`, running iOS 26.5. The GitHub-channel
+arm64 Release simulator build uses commit `137bcd01`. It retains the saved
+waterfall background, glass mode, and developer Rancher appearance. These are actual
 app screens inside iPhone mockups, encoded as transparent 706×1466 WebP images.
 The iPhone frame comes from `@sneas/telephone`; its screen opening is fitted to
 the capture's aspect ratio so the app remains proportional. The captured
 Dynamic Island is retained, and the frame's synthetic status UI is removed.
 
 The Herd capture focuses on `thinker` and its Whip space so both rails are
-visible. The Markdown preview opens the repository's root `README.md`.
-`reverse-control.webp` shows an unsent Codex launch draft with Reverse Control
-enabled. `chat-details.webp` shows a completed turn's token footer and details.
+visible. `chat-view.webp` shows a completed coding-agent reply with an expanded
+inline file diff. The composer contains the unsent question “What hosts do I
+have in Whip?” over that demo's completed conversation. `reverse-control.webp`
+shows the actual `hosts.list` phone-tool call and its four-host response.
+The Git preview shows a tracked CSS source change with line numbers and context
+controls. The terminal preview shows real coding-agent output and the mobile
+input controls. The Markdown preview opens the repository's root `README.md`.
 
-The browser preview shows the repository's Reverse Control documentation served
-locally on `mini` at `http://127.0.0.1:8765`.
+The browser preview shows this README served locally on `mini` at
+`http://127.0.0.1:8794`, using Desktop WebKit with the automatic viewport.
+
+## Source frames
+
+All ten gallery images use the unframed 1206×2622 recordings in
+[`launch-videos/source-assets/ios/current`](../../../launch-videos/source-assets/ios/current/README.md).
+Times below are seconds within those MP4 files, before the launch film's scene
+timing or 3D phone framing is applied.
+
+| Preview | Recording | Time |
+| --- | --- | --- |
+| `hosts.webp` | `hosts.mp4` | 0.2 |
+| `herd.webp` | `herd.mp4` | 4.0 |
+| `chat-view.webp` | `chat.mp4` | 2.25 |
+| `chat-composer.webp` | `composer.mp4` | 1.85 |
+| `reverse-control.webp` | `reverse-control.mp4` | 1.75 |
+| `remote-files.webp` | `files.mp4` | 0.7 |
+| `git-diff.webp` | `git-diff.mp4` | 0.2 |
+| `browser.webp` | `browser.mp4` | 1.75 |
+| `terminal.webp` | `terminal.mp4` | 1.325 |
+| `markdown-preview.webp` | `readme.mp4` | 2.5 |
+
+Extract each selected frame to `.codex-readme-raw/1.9.1/` using its preview's base
+name. For example, from the repository root:
+
+```sh
+mkdir -p .codex-readme-raw/1.9.1
+nix develop -c ffmpeg -ss 0.2 \
+  -i launch-videos/source-assets/ios/current/hosts.mp4 \
+  -frames:v 1 -update 1 .codex-readme-raw/1.9.1/hosts.png
+nix develop -c npm run generate:readme-phone-mockups -- --ios .codex-readme-raw/1.9.1
+```
+
+Use the original phone recordings rather than rendered film frames so the
+gallery retains the full app resolution and receives only one device frame.
+The unused `chat-details.webp` and `settings.webp` remain earlier 1.9.0 captures.
+
+## Capture new screens
 
 Update the app in place with `xcrun simctl install` to retain its hosts, keys,
-background image, and preferences. Use a local development distribution so
-the simulator's saved developer membership setting applies.
+background image, and preferences. Build with
+`WHIP_DISTRIBUTION_CHANNEL=github` and an embedded production JavaScript bundle.
+Use Metro's `--max-workers 1` setting for this Nix/macOS build environment.
+
+When capturing new screens, disable app and terminal full-screen mode so the
+status bar and Dynamic Island do not cover navigation or pinned chat context.
+Restore the simulator's saved full-screen preferences after capture.
 
 The configured simulator's existing Keychain access group is
 `52863FPC7A.io.github.kaminarios.whip`. Keep that group in the simulator
@@ -42,18 +88,14 @@ xcrun simctl io 35AF86B7-DC94-48B9-8215-82C9DE8E08F7 \
   screenshot build/readme/screenshots/hosts.png
 ```
 
-Copy the raw 1206×2622 PNGs to `.codex-readme-raw/` in the local checkout, then
+Copy the raw 1206×2622 PNGs to `.codex-readme-raw/1.9.1/` in the local checkout, then
 run the shared mockup generator with its iPhone preset:
 
 ```sh
-nix develop -c npm run generate:readme-phone-mockups -- --ios .codex-readme-raw
+nix develop -c npm run generate:readme-phone-mockups -- --ios .codex-readme-raw/1.9.1
 ```
 
 The iPhone preset preserves the raw PNGs outside version control. To regenerate
 one image, append its base name, for example `herd`. Update the gallery captions
 and build information when replacing the previews. Frame attribution and the
 MIT license are in [the parent capture notes](../README.md).
-
-During this refresh, tracked-file diffs on the host with a `fish` login shell
-returned `HostRuntimeError.GitFailure`. The Git preview uses this newly added
-capture-notes file; the tracked-file error needs separate investigation.

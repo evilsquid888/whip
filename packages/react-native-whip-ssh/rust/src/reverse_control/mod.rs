@@ -4,9 +4,23 @@ mod browser;
 mod device;
 mod download;
 pub(crate) mod herdr;
+mod hosts;
 mod http;
+mod instructions;
 mod recovery;
 mod tools;
+
+pub use browser::operations::{
+    BrowserEffectPermit, BrowserOperationCoordinator, BrowserOperationError,
+    BrowserOperationPlatform, BrowserOperationSession, BrowserOwner, BrowserPageDocument,
+    BrowserPlatformAction, BrowserPlatformError, BrowserPlatformResult, BrowserTabChange,
+    BrowserTabLifecycle, BrowserTabProjection,
+};
+pub use hosts::{
+    HostActionConnection, HostActionContext, HostActionCoordinator, HostActionCredential,
+    HostActionPermit, HostActionPermitError, HostActionPlatform, HostActionPlatformError,
+    HostActionProfilePatch,
+};
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -24,8 +38,10 @@ use crate::ssh::{RemoteForward, SshSession};
 
 const MAX_RESPONSE: usize = browser::model::MAX_IMAGE_RESULT;
 const ACTION_TIMEOUT: Duration = Duration::from_secs(20);
+const LOCATION_ACTION_TIMEOUT: Duration = Duration::from_secs(45);
 const MCP_TOOL_TIMEOUT: Duration = Duration::from_secs(330);
 const APPLICATION_TIMEOUT: Duration = Duration::from_secs(325);
+const INSTRUCTIONS_TIMEOUT: Duration = Duration::from_secs(5);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 const MCP_SERVER_NAME: &str = "whip";
 const CLAUDE_MCP_CONFIG_ARG: &str = "--mcp-config";
@@ -42,6 +58,7 @@ pub struct ReverseControlSession {
     pub session_id: String,
     pub pane_id: String,
     pub terminal_id: String,
+    pub shizuku_access: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
@@ -72,6 +89,8 @@ pub fn set_reverse_control_event_sink(sink: Arc<dyn ReverseControlEventSink>) {
 }
 
 pub(crate) fn detach_ui() {
+    hosts::detach();
+    browser::operations::detach();
     if let Some(sink) = SINK.get() {
         *sink.write() = None;
     }
@@ -97,10 +116,12 @@ struct Session {
     started: Instant,
     observed_agent: bool,
     conversation: Option<String>,
+    conversation_confirmed: bool,
     protocol: Option<String>,
 }
 
 struct AuthenticatedSession {
+    agent: HerdrAgentKind,
     protocol: Option<String>,
 }
 
@@ -146,6 +167,8 @@ fn retire_bridge(bridge: Option<Bridge>) {
 
 struct Pending {
     session: String,
+    host: Option<std::sync::Weak<HostActionPermit>>,
+    shizuku: bool,
     rpc_id: Value,
     response: oneshot::Sender<Value>,
 }
@@ -212,59 +235,6 @@ impl Drop for NativeStep {
         }
     }
 }
-struct NativeBridge {
-    owner: std::sync::Weak<ReverseControl>,
-    session: String,
-    parent: String,
-}
-impl browser::engine::Bridge for NativeBridge {
-    fn call(
-        &self,
-        operation: browser::engine::Primitive,
-    ) -> futures::future::BoxFuture<'_, Result<Value, browser::model::BrowserError>> {
-        Box::pin(async move {
-            let owner = self.owner.upgrade().ok_or_else(|| {
-                browser::model::BrowserError::new(
-                    browser::model::ErrorCode::SessionClosed,
-                    "Browser session closed",
-                )
-            })?;
-            let download = if let browser::engine::Primitive::Download {
-                destination_path,
-                max_bytes,
-                ..
-            } = &operation
-            {
-                let ssh = owner
-                    .bridge
-                    .lock()
-                    .as_ref()
-                    .and_then(|bridge| bridge.transport.as_ref())
-                    .map(|transport| transport.ssh.clone())
-                    .filter(|ssh| ssh.is_alive())
-                    .ok_or_else(|| {
-                        browser::model::BrowserError::new(
-                            browser::model::ErrorCode::DownloadFailed,
-                            "Download requires a connected SSH host",
-                        )
-                    })?;
-                Some((ssh, destination_path.clone(), *max_bytes))
-            } else {
-                None
-            };
-            let value = owner
-                .begin_step(&self.session, &self.parent, operation)?
-                .receive()
-                .await?;
-            if let Some((ssh, destination, max_bytes)) = download {
-                download::transfer(ssh, value, &destination, max_bytes).await
-            } else {
-                Ok(value)
-            }
-        })
-    }
-}
-
 #[derive(Default)]
 pub(crate) struct ReverseControl {
     recovery: Mutex<recovery::Recovery>,
@@ -277,7 +247,7 @@ pub(crate) struct ReverseControl {
     pending: Mutex<HashMap<String, Pending>>,
     steps: Mutex<HashMap<String, NativeStepPending>>,
     tasks: Mutex<HashMap<String, tokio::task::AbortHandle>>,
-    browser_sessions: Mutex<HashMap<String, Arc<browser::engine::BrowserSession>>>,
+    browser_sessions: Mutex<HashMap<String, Arc<BrowserOperationSession>>>,
 }
 
 /// Keep shell observations from retiring a new launch during restart verification.
@@ -347,7 +317,8 @@ pub(crate) fn agent_launch(launch: HerdrTabLaunch) -> Result<AgentLaunch, String
         HerdrTabLaunch::Agent {
             kind,
             args,
-        } if !args.iter().any(|arg| arg.chars().any(char::is_control)) => {
+        } if matches!(kind, HerdrAgentKind::Claude | HerdrAgentKind::Codex | HerdrAgentKind::OpenCode)
+            && !args.iter().any(|arg| arg.chars().any(char::is_control)) => {
             if kind == HerdrAgentKind::OpenCode
                 && (args.first().is_some_and(|arg| arg == "attach")
                     || args.iter().any(|arg| {
@@ -439,6 +410,9 @@ fn configured_launch(
             ),
         ],
     );
+    // SessionStart output enters model context before the first turn, including
+    // resume and compaction. MCP metadata alone may be deferred by Codex.
+    args.splice(0..0, instructions::codex_config(&url, token)?);
     Ok(HerdrTabLaunch::Agent { kind, args })
 }
 
@@ -498,6 +472,7 @@ impl ReverseControl {
                     started: Instant::now(),
                     observed_agent: false,
                     conversation,
+                    conversation_confirmed: false,
                     protocol: None,
                 },
             );
@@ -732,6 +707,7 @@ impl ReverseControl {
         let received = token_hash(token);
         self.sessions.lock().get(id).and_then(|session| {
             (received == session.token_hash).then(|| AuthenticatedSession {
+                agent: session.agent,
                 protocol: session.protocol.clone(),
             })
         })
@@ -755,7 +731,20 @@ impl ReverseControl {
             }
             return None;
         }
-        let result = match message["method"].as_str() {
+        let method = message["method"].as_str();
+        let instructions = if matches!(method, Some("initialize" | "tools/list")) {
+            match self.instruction_text(session, id.clone()).await {
+                Ok(instructions) => instructions,
+                Err(error) => {
+                    let mut response = rpc_error(id, -32000, "Could not load Whip AGENTS.md");
+                    response["error"]["data"] = error["structuredContent"]["error"].clone();
+                    return Some(response);
+                }
+            }
+        } else {
+            String::new()
+        };
+        let result = match method {
             Some("initialize") => {
                 let requested = message["params"]["protocolVersion"]
                     .as_str()
@@ -774,10 +763,10 @@ impl ReverseControl {
                 drop(sessions);
                 self.save_recovery();
                 emit(&info, STATE_CHANGED_EVENT, "", "", Value::Null);
-                tools::initialize(protocol)
+                tools::initialize(protocol, &instructions)
             }
             Some("ping") => json!({}),
-            Some("tools/list") => json!({"tools":tools::tools()}),
+            Some("tools/list") => json!({"tools":tools::catalog(&instructions)}),
             Some("tools/call") => match self.start_action(session, id.clone(), message) {
                 Ok(receiver) => receiver.await.unwrap_or_else(|_| {
                     browser::model::BrowserError::new(
@@ -831,23 +820,18 @@ impl ReverseControl {
             engine::authorize_tab(&session_id, tab).map_err(|error| error.mcp())?;
         }
         let (native_action, args) = match &action {
-            ToolAction::Application(_) => (String::new(), Value::Null),
+            ToolAction::Application(_) | ToolAction::Browser(_) => (String::new(), Value::Null),
             ToolAction::Device(action) => {
                 let (name, args) = action.wire();
                 (name.to_owned(), args)
             }
-            ToolAction::Browser(action) => engine::Primitive::ResolveTab {
-                tab_id: action.tab_id().cloned(),
-            }
-            .wire()
-            .map_err(|error| error.mcp())?,
         };
         let runtime = crate::runtime().map_err(|_| {
             BrowserError::new(ErrorCode::BrowserUnavailable, "Browser runtime unavailable").mcp()
         })?;
         let (response, receiver) = oneshot::channel();
         let request = self.sequence.fetch_add(1, Ordering::Relaxed).to_string();
-        let caller_host = {
+        let (caller_host, caller_identity, caller_scope) = {
             let bridge = self.bridge.lock();
             if bridge.as_ref().is_some_and(|bridge| !bridge.connected()) {
                 return Err(
@@ -860,7 +844,22 @@ impl ReverseControl {
                     BrowserError::new(ErrorCode::SessionClosed, "Browser session closed").mcp(),
                 );
             };
+            let shizuku = device::is_shizuku_tool(name);
+            if shizuku && !cfg!(target_os = "ios") && !owned.info.shizuku_access {
+                return Err(BrowserError::new(
+                    ErrorCode::PermissionDenied,
+                    "Enable Shizuku access for this agent's Reverse Control session first",
+                )
+                .mcp());
+            }
             let caller_host = owned.info.runtime_id.clone();
+            let caller_identity = owned.info.clone();
+            let caller_scope = (
+                self.epoch.load(Ordering::Acquire),
+                bridge
+                    .as_ref()
+                    .map(|bridge| (bridge.epoch, bridge.transport_epoch)),
+            );
             let mut pending = self.pending.lock();
             if pending
                 .values()
@@ -878,6 +877,8 @@ impl ReverseControl {
                 request.clone(),
                 Pending {
                     session: session.to_owned(),
+                    host: None,
+                    shizuku,
                     rpc_id,
                     response,
                 },
@@ -886,10 +887,10 @@ impl ReverseControl {
             drop(sessions);
             // Suspension must see every request accepted on this transport.
             drop(bridge);
-            caller_host
+            (caller_host, caller_identity, caller_scope)
         };
         // Resolve the selected browser tab at arrival. Device calls need no tab.
-        let step = if matches!(&action, ToolAction::Application(_)) {
+        let step = if !matches!(&action, ToolAction::Device(_)) {
             None
         } else {
             match self.begin_wire_step(session, &request, &native_action, args) {
@@ -900,13 +901,16 @@ impl ReverseControl {
                 }
             }
         };
-        let timeout = if matches!(&action, ToolAction::Application(_)) {
-            APPLICATION_TIMEOUT
-        } else if matches!(&action, ToolAction::Browser(action) if matches!(action.as_ref(), BrowserAction::Download(_)))
-        {
-            DOWNLOAD_TIMEOUT
-        } else {
-            ACTION_TIMEOUT
+        let timeout = match &action {
+            ToolAction::Application(action) if action.is_instructions() => INSTRUCTIONS_TIMEOUT,
+            ToolAction::Application(_) => APPLICATION_TIMEOUT,
+            ToolAction::Device(device::DeviceAction::Location) => LOCATION_ACTION_TIMEOUT,
+            ToolAction::Browser(action)
+                if matches!(action.as_ref(), BrowserAction::Download(_)) =>
+            {
+                DOWNLOAD_TIMEOUT
+            }
+            _ => ACTION_TIMEOUT,
         };
         let work: futures::future::BoxFuture<'static, Result<Value, BrowserError>> = match action {
             ToolAction::Application(action) => Box::pin(action.run(
@@ -925,31 +929,28 @@ impl ReverseControl {
                 )
             }),
             ToolAction::Browser(action) => {
-                let queue = self
-                    .browser_sessions
-                    .lock()
-                    .entry(session.to_owned())
-                    .or_default()
-                    .clone();
-                let bridge: Arc<dyn engine::Bridge> = Arc::new(NativeBridge {
-                    owner: Arc::downgrade(self),
-                    session: session.to_owned(),
-                    parent: request.clone(),
-                });
-                let browser_request = request.clone();
-                Box::pin(async move {
-                    let context = engine::decode(
-                        step.ok_or_else(|| {
-                            BrowserError::new(ErrorCode::InvalidResult, "Missing browser step")
-                        })?
-                        .receive()
-                        .await?,
-                    )?;
-                    let _serial = queue.gate.lock().await;
-                    engine::run(bridge, &session_id, &browser_request, *action, context)
-                        .await?
-                        .mcp()
-                })
+                let admission = (|| {
+                    let state = BrowserOperationSession::new(BrowserOwner::from(&caller_identity))
+                        .map_err(browser::operations::error)?;
+                    self.browser_sessions
+                        .lock()
+                        .insert(session.to_owned(), state.clone());
+                    browser::operations::Admission::new(
+                        &caller_identity,
+                        request.clone(),
+                        &action,
+                        state,
+                        caller_scope,
+                    )
+                })();
+                let admission = match admission {
+                    Ok(admission) => admission,
+                    Err(error) => {
+                        self.finish_action(&request, error.mcp());
+                        return Ok(receiver);
+                    }
+                };
+                Box::pin(admission.run(self.clone(), caller_identity, *action))
             }
         };
         let owner = Arc::downgrade(self);
@@ -968,16 +969,6 @@ impl ReverseControl {
         self.tasks.lock().insert(request, task.abort_handle());
         let _ = begin.send(());
         Ok(receiver)
-    }
-
-    fn begin_step(
-        self: &Arc<Self>,
-        session: &str,
-        parent: &str,
-        operation: browser::engine::Primitive,
-    ) -> Result<NativeStep, browser::model::BrowserError> {
-        let (action, args) = operation.wire()?;
-        self.begin_wire_step(session, parent, &action, args)
     }
 
     fn begin_wire_step(
@@ -1039,6 +1030,10 @@ impl ReverseControl {
     }
 
     fn finish_action(&self, request: &str, result: Value) {
+        self.settle_action(request, result, true);
+    }
+
+    fn settle_action(&self, request: &str, result: Value, notify_ui: bool) {
         self.tasks.lock().remove(request);
         let pending = self.pending.lock().remove(request);
         if let Some(pending) = pending {
@@ -1048,7 +1043,7 @@ impl ReverseControl {
                 .get(&pending.session)
                 .map(|session| session.info.clone());
             let _ = pending.response.send(result);
-            if let Some(info) = info {
+            if let Some(info) = info.filter(|_| notify_ui) {
                 emit(&info, "release", request, "", Value::Null);
             }
         }
@@ -1073,18 +1068,40 @@ impl ReverseControl {
         }
     }
     fn cancel_request(&self, request: &str, message: &str) {
-        if let Some(task) = self.tasks.lock().remove(request) {
-            task.abort();
-        }
         let code = if message.contains("timed out") {
             browser::model::ErrorCode::Timeout
         } else {
             browser::model::ErrorCode::Cancelled
         };
-        self.finish_action(
-            request,
-            browser::model::BrowserError::new(code, message).mcp(),
-        );
+        let error = browser::model::BrowserError::new(code, message);
+        let permit = self
+            .pending
+            .lock()
+            .get(request)
+            .and_then(|call| call.host.as_ref())
+            .and_then(std::sync::Weak::upgrade);
+        let error = match permit {
+            Some(permit) => permit.with_progress(error),
+            None => error,
+        };
+        self.reject_action(request, error);
+    }
+
+    fn reject_action(&self, request: &str, error: browser::model::BrowserError) {
+        if let Some(task) = self.tasks.lock().remove(request) {
+            task.abort();
+        }
+        self.finish_action(request, error.mcp());
+    }
+
+    fn reject_host_action(&self, request: &str, error: browser::model::BrowserError) {
+        if let Some(task) = self.tasks.lock().remove(request) {
+            task.abort();
+        }
+        // Host workflows hold native permits rather than browser UI leases.
+        // Context updates can arrive synchronously from the JS thread, so no
+        // synchronous foreign event callback belongs in this cancellation path.
+        self.settle_action(request, error.mcp(), false);
     }
 
     pub(crate) fn reply(&self, session: &str, request: &str, result: &str) {
@@ -1136,6 +1153,33 @@ impl ReverseControl {
             && self.sessions.lock().values().any(|session| {
                 session.info.terminal_id == terminal_id && session.protocol.is_some()
             })
+    }
+
+    pub(crate) fn set_terminal_shizuku_access(&self, terminal_id: &str, enabled: bool) {
+        self.recovery
+            .lock()
+            .set_shizuku_access(terminal_id, enabled);
+        let mut sessions = self.sessions.lock();
+        let ids: HashSet<_> = sessions
+            .values_mut()
+            .filter(|session| session.info.terminal_id == terminal_id)
+            .map(|session| {
+                session.info.shizuku_access = enabled;
+                session.info.session_id.clone()
+            })
+            .collect();
+        let requests: Vec<_> = self
+            .pending
+            .lock()
+            .iter()
+            .filter(|(_, pending)| !enabled && pending.shizuku && ids.contains(&pending.session))
+            .map(|(request, _)| request.clone())
+            .collect();
+        drop(sessions);
+        for request in requests {
+            self.cancel_request(&request, "Shizuku access disabled for this session");
+        }
+        self.save_recovery();
     }
 
     pub(crate) fn recovering_terminal(&self, terminal_id: &str) -> bool {
@@ -1217,7 +1261,9 @@ impl ReverseControl {
             }
             self.cancel_steps(&root);
         }
-        self.browser_sessions.lock().remove(id);
+        if let Some(browser) = self.browser_sessions.lock().remove(id) {
+            browser.close();
+        }
         emit(&session.info, "closed", "", "", Value::Null);
         retire_bridge(bridge);
         self.save_recovery();
@@ -1266,6 +1312,15 @@ impl ReverseControl {
                         .as_deref()
                         .zip(conversation)
                         .is_some_and(|(original, current)| original != current);
+                    // Codex /new, /clear and /resume change the conversation
+                    // inside the same CLI launch and reuse its MCP credentials.
+                    // A requested resume must first confirm the intended ID;
+                    // restart verification must still reject a wrong session.
+                    let follows_codex_thread = agent
+                        && session.agent == HerdrAgentKind::Codex
+                        && session.conversation_confirmed
+                        && !restarting.contains(&session.info.terminal_id);
+                    let replaced = replaced && !follows_codex_thread;
                     // agent.start results, event projections, and lifecycle
                     // snapshots can disagree while the resumed CLI boots.
                     // Only tolerate a shell, on this terminal, until the caller
@@ -1274,8 +1329,11 @@ impl ReverseControl {
                         && pane.is_some_and(|pane| pane.agent.is_none());
                     if agent {
                         session.observed_agent = true;
-                        if session.conversation.is_none() {
-                            session.conversation = conversation.map(str::to_owned);
+                        if !replaced && let Some(conversation) = conversation {
+                            if session.conversation.as_deref() != Some(conversation) {
+                                session.conversation = Some(conversation.to_owned());
+                            }
+                            session.conversation_confirmed = true;
                         }
                     }
                     (replaced
@@ -1323,6 +1381,7 @@ pub(crate) fn new_session(
         session_id: random_token()?,
         pane_id: pane.pane_id.clone(),
         terminal_id: pane.terminal_id.clone(),
+        shizuku_access: false,
     })
 }
 

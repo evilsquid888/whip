@@ -1,14 +1,32 @@
-import { ChatSearchIndex } from './generated-entry';
-export type { ChatSearchDocument, ChatSearchMatch, ChatSearchResults } from './generated-entry';
+import { AgentTranscriptKind, ChatSearchIndex, type ChatSearchIndexLike } from './generated-entry';
+import type { HostRuntimeConnection, RuntimeAgentKind } from './index';
+export type { ChatSearchMatch, ChatSearchResults, ChatSearchFocus } from './generated-entry';
+
+export type ChatSearchSource =
+  | { type: 'live'; runtime: Pick<HostRuntimeConnection, 'agentTranscriptSearch'>; key: string }
+  | { type: 'saved'; namespace: string; agent: RuntimeAgentKind; sessionId: string };
+
+export interface ChatSearchInitialTarget { query: string; documentId: string; offset: bigint }
+
+const AGENT_KIND = {
+  claude: AgentTranscriptKind.Claude,
+  codex: AgentTranscriptKind.Codex,
+  opencode: AgentTranscriptKind.OpenCode,
+  pi: AgentTranscriptKind.Pi,
+} as const;
 
 /** Matching, result bounds and selection belong to the Rust index. */
 export class NativeChatSearchIndex {
-  private readonly index = new ChatSearchIndex();
-  setDocuments(documents: Parameters<ChatSearchIndex['setDocuments']>[0]): void {
-    this.index.setDocuments(documents);
+  private readonly index: ChatSearchIndexLike;
+  constructor(source: ChatSearchSource) {
+    this.index = source.type === 'live'
+      ? source.runtime.agentTranscriptSearch(source.key)
+      : ChatSearchIndex.forSaved(source.namespace, AGENT_KIND[source.agent], source.sessionId);
   }
-  search(query: string) { return this.index.search(query); }
+  search(query: string, focus?: import('./generated-entry').ChatSearchFocus) { return this.index.search(query, focus); }
   navigate(backwards: boolean) { return this.index.navigate(backwards); }
   select(index: number) { return this.index.select(index); }
-  dispose(): void { this.index.uniffiDestroy(); }
+  dispose(): void {
+    if (ChatSearchIndex.instanceOf(this.index)) this.index.uniffiDestroy();
+  }
 }

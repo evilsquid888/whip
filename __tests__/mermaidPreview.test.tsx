@@ -72,6 +72,8 @@ test('falls back to source on timeout and clears pending work when unmounted', (
   message({ type: 'ready' });
   act(() => { jest.advanceTimersByTime(10_000); });
   expect(renderer.root.findAll(node => node.props.children === 'source')).toHaveLength(1);
+  message({ type: 'rendered', requestId: 1 });
+  expect(renderer.root.findAll(node => node.props.children === 'source')).toHaveLength(1);
   act(() => { renderer.update(<MermaidPreview content="flowchart TD" filename="Mermaid" inline fallback={sourceFallback} />); });
   expect(jest.getTimerCount()).toBe(1);
   act(() => { renderer.unmount(); });

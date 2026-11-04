@@ -11,10 +11,12 @@ import LogOut from 'lucide-react-native/icons/log-out';
 import Network from 'lucide-react-native/icons/network';
 import Plus from 'lucide-react-native/icons/plus';
 import Server from 'lucide-react-native/icons/server';
+import Square from 'lucide-react-native/icons/square';
+import SquareCheck from 'lucide-react-native/icons/square-check';
 import ServerOff from 'lucide-react-native/icons/server-off';
 import Trash2 from 'lucide-react-native/icons/trash';
 import { useEffect, useRef, useState } from 'react';
-import { PanResponder, Platform, ScrollView, View } from 'react-native';
+import { PanResponder, Platform, Pressable, ScrollView, View } from 'react-native';
 import Animated, { cancelAnimation, useAnimatedStyle, useSharedValue, withSpring } from 'react-native-reanimated';
 import { useTranslation } from 'react-i18next';
 import type { TFunction } from 'i18next';
@@ -65,11 +67,13 @@ interface Props {
   onDelete: (host: HostProfile) => void;
   onDisconnect: (host: HostProfile) => void;
   onEdit: (host: HostProfile) => void;
+  /** Opt a host in or out of connecting and polling Herdr at startup. */
+  onPollOnStartupChange?: (host: HostProfile, enabled: boolean) => void;
   onManageGlobalKeychain: () => void;
   onUnlockCredentials: () => Promise<boolean>;
 }
 
-export function HostsScreen({ hosts, connectingHostIds = [], error, activeHostId, connectedHostIds = [], latencyMsByHostId = {}, runtimeByHostId = {}, credentialRecovery, credentialRecoveryBusy, onAdd, onConnect, onDelete, onDisconnect, onEdit, onManageGlobalKeychain, onUnlockCredentials }: Props) {
+export function HostsScreen({ hosts, connectingHostIds = [], error, activeHostId, connectedHostIds = [], latencyMsByHostId = {}, runtimeByHostId = {}, credentialRecovery, credentialRecoveryBusy, onAdd, onConnect, onDelete, onDisconnect, onEdit, onPollOnStartupChange, onManageGlobalKeychain, onUnlockCredentials }: Props) {
   const { t } = useTranslation();
   const { colors } = useTheme();
   const { bottom } = useSafeAreaInsets();
@@ -270,6 +274,24 @@ export function HostsScreen({ hosts, connectingHostIds = [], error, activeHostId
                               ) : null}
                             </View>
                           </Button>
+                          {onPollOnStartupChange ? (
+                            <Pressable
+                              accessibilityRole="checkbox"
+                              accessibilityState={{ checked: host.pollOnStartup !== false }}
+                              accessibilityLabel={t('hosts.pollOnStartup', { host: displayName })}
+                              className="h-11 w-11 items-center justify-center"
+                              hitSlop={4}
+                              onPress={hapticPress(() => {
+                                if (actionsOpen) closeActions();
+                                else onPollOnStartupChange(host, host.pollOnStartup === false);
+                              })}>
+                              <Icon
+                                as={host.pollOnStartup !== false ? SquareCheck : Square}
+                                className={host.pollOnStartup !== false ? 'text-primary' : 'text-muted-foreground'}
+                                size={22}
+                              />
+                            </Pressable>
+                          ) : null}
                           <IconButton icon={Ellipsis} accessibilityLabel={t('hosts.edit', { host: displayName })} onPress={() => {
                             if (actionsOpen) closeActions();
                             else onEdit(host);

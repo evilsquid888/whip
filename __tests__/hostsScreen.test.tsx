@@ -10,13 +10,22 @@ jest.mock('react-native-css-interop/jsx-runtime', () =>
 jest.mock('react-native', () => ({
   View: 'View',
   ScrollView: 'ScrollView',
+  Pressable: 'Pressable',
+  PanResponder: { create: () => ({ panHandlers: {} }) },
   Platform: { OS: 'android' },
   NativeModules: { WhipBrowser: {} },
 }));
 jest.mock('react-native-whip-ssh', () =>
   require('./mockWhipSsh').createMockWhipSshModule(),
 );
-jest.mock('react-native-reanimated', () => ({}));
+jest.mock('react-native-reanimated', () => ({
+  __esModule: true,
+  default: { View: 'AnimatedView' },
+  cancelAnimation: jest.fn(),
+  useAnimatedStyle: (factory: () => unknown) => factory(),
+  useSharedValue: (value: unknown) => ({ value }),
+  withSpring: (value: unknown) => value,
+}));
 jest.mock('expo-haptics', () => ({
   selectionAsync: jest.fn(() => Promise.resolve()),
 }));
@@ -40,6 +49,8 @@ jest.mock('lucide-react-native/icons/network', () => (undefined));
 jest.mock('lucide-react-native/icons/plus', () => ('Plus'));
 jest.mock('lucide-react-native/icons/server', () => ('Server'));
 jest.mock('lucide-react-native/icons/server-off', () => (undefined));
+jest.mock('lucide-react-native/icons/square', () => ('Square'));
+jest.mock('lucide-react-native/icons/square-check', () => ('SquareCheck'));
 jest.mock('lucide-react-native/icons/trash', () => (undefined));
 jest.mock('../src/theme', () => ({
   useTheme: () => ({ colors: {} }),
@@ -48,6 +59,9 @@ jest.mock('../src/components/app-ui', () => ({
   ScreenHeader: ({ right }: { right: ReactNode }) => right,
   IconButton: 'IconButton',
   WhipMark: 'WhipMark',
+  AgentStatusMedallion: 'AgentStatusMedallion',
+  HerdrMark: 'HerdrMark',
+  StatusBadge: 'StatusBadge',
   hapticPress: (handler: () => void) => handler,
 }));
 jest.mock('../src/components/GlassSurface', () => ({ GlassSurface: 'GlassSurface' }));
@@ -99,4 +113,55 @@ test('the Hosts header opens and reuses a browser without any connected hosts', 
       for (const id of browserRegistry.entries.keys()) await browserRegistry.close(id);
     });
   }
+});
+
+test('each host row has a startup polling checkbox that reports the toggled value', async () => {
+  const onPollOnStartupChange = jest.fn();
+  const host = (id: string, pollOnStartup?: boolean) => ({
+    id,
+    name: id,
+    host: `${id}.example`,
+    port: '22',
+    username: 'me',
+    authMode: 'key' as const,
+    herdrCommand: 'herdr',
+    sessionName: 'main',
+    createdAt: '2026-11-04T00:00:00.000Z',
+    updatedAt: '2026-11-04T00:00:00.000Z',
+    ...(pollOnStartup === undefined ? {} : { pollOnStartup }),
+  });
+  const hosts = [host('alpha'), host('beta', false)];
+  let view!: ReactTestRenderer;
+  await act(async () => {
+    view = create(
+      <HostsScreen
+        hosts={hosts}
+        error={null}
+        credentialRecovery={{ state: 'ready', count: 0 }}
+        credentialRecoveryBusy={false}
+        onAdd={jest.fn()}
+        onConnect={jest.fn()}
+        onDelete={jest.fn()}
+        onDisconnect={jest.fn()}
+        onEdit={jest.fn()}
+        onPollOnStartupChange={onPollOnStartupChange}
+        onManageGlobalKeychain={jest.fn()}
+        onUnlockCredentials={jest.fn()}
+      />,
+    );
+  });
+  const boxes = view.root.findAll(
+    node => (node.type as unknown) === 'Pressable' && node.props.accessibilityRole === 'checkbox',
+  );
+  expect(boxes.map(box => box.props.accessibilityState.checked)).toEqual([true, false]);
+
+  await act(async () => {
+    boxes[0].props.onPress();
+    boxes[1].props.onPress();
+  });
+  expect(onPollOnStartupChange.mock.calls).toEqual([
+    [hosts[0], false],
+    [hosts[1], true],
+  ]);
+  act(() => view.unmount());
 });

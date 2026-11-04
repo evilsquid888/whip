@@ -465,6 +465,7 @@ export const fr = {
   'hosts.delete': 'Supprimer',
   'hosts.deleteHost': 'Supprimer {{host}}',
   'hosts.edit': 'Modifier {{host}}',
+  'hosts.pollOnStartup': 'Connecter {{host}} et interroger Herdr au démarrage',
   'hosts.latencyUnavailable': 'Latence indisponible',
   'hosts.latency': 'Latence de {{value}} millisecondes',
   'hosts.agents_one': '{{count}} agent',

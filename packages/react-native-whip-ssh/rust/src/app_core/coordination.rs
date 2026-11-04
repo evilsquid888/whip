@@ -120,6 +120,7 @@ pub struct StartupSessionHost {
     pub host_id: String,
     pub jump_host_id: Option<String>,
     pub key_auth: bool,
+    pub poll_on_startup: bool,
 }
 #[derive(Clone, Debug, thiserror::Error, uniffi::Error)]
 pub enum SessionRestoreError {
@@ -236,6 +237,29 @@ fn protected_host(
     false
 }
 
+/// Hosts to connect at startup: every host opted into startup polling.
+/// Previously live hosts keep their order first; the rest follow in profile
+/// order. Hosts opted out are skipped even if they were live at last exit.
+fn startup_host_ids(persisted: Vec<String>, hosts: &[StartupSessionHost]) -> Vec<String> {
+    let polled = |id: &str| {
+        hosts
+            .iter()
+            .any(|host| host.host_id == id && host.poll_on_startup)
+    };
+    let mut seen = HashSet::new();
+    persisted
+        .into_iter()
+        .filter(|id| polled(id))
+        .chain(
+            hosts
+                .iter()
+                .filter(|host| host.poll_on_startup)
+                .map(|host| host.host_id.clone()),
+        )
+        .filter(|id| seen.insert(id.clone()))
+        .collect()
+}
+
 struct RestoreRequest {
     raw: Option<String>,
     loaded: bool,
@@ -279,14 +303,10 @@ impl AppCore {
                 .map_err(|error| failure(error.to_string()))?
         };
         let persisted = membership(raw.as_deref())?;
+        let host_ids = startup_host_ids(persisted.host_ids, &hosts);
         let hosts: HashMap<_, _> = hosts
             .into_iter()
             .map(|host| (host.host_id.clone(), host))
-            .collect();
-        let host_ids: Vec<_> = persisted
-            .host_ids
-            .into_iter()
-            .filter(|id| hosts.contains_key(id))
             .collect();
         let active = persisted
             .active_host_id

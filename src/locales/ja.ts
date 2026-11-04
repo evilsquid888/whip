@@ -457,6 +457,7 @@ export const ja = {
   'hosts.delete': '削除',
   'hosts.deleteHost': '{{host}} を削除',
   'hosts.edit': '{{host}} を編集',
+  'hosts.pollOnStartup': '起動時に {{host}} に接続して Herdr を確認',
   'hosts.latencyUnavailable': 'レイテンシーは利用できません',
   'hosts.latency': '遅延 {{value}} ミリ秒',
   'hosts.agents_one': '{{count}} エージェント',

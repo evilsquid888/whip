@@ -94,7 +94,7 @@ export interface SessionRuntimeController {
   getClient: (sessionId: string) => HerdrClient | undefined;
   select: (sessionId: string, tab?: 'herd' | 'terminal') => void;
   connect: (
-    profile: ConnectionProfile,
+    profile: ConnectionProfile | HostProfile,
     options?: ConnectOptions,
   ) => Promise<boolean>;
   connectSavedHost: (host: HostProfile) => Promise<void>;

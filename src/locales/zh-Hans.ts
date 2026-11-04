@@ -457,6 +457,7 @@ export const zhHans = {
   'hosts.delete': '删除',
   'hosts.deleteHost': '删除 {{host}}',
   'hosts.edit': '编辑 {{host}}',
+  'hosts.pollOnStartup': '启动时连接 {{host}} 并轮询 Herdr',
   'hosts.latencyUnavailable': '延迟不可用',
   'hosts.latency': '延迟 {{value}} 毫秒',
   'hosts.agents_one': '{{count}} 代理',

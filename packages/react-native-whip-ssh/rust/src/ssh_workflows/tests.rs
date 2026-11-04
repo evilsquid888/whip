@@ -252,6 +252,7 @@ fn host(id: &str, jump: Option<&str>) -> HostProfileRecord {
         tailcat_ssh_server: false,
         auth_mode: HostAuthMode::Password,
         herdr_enabled: true,
+        poll_on_startup: true,
         herdr_backend: crate::HostHerdrBackend::Legacy,
         herdr_command: "herdr".into(),
         herdr_socket_path: String::new(),

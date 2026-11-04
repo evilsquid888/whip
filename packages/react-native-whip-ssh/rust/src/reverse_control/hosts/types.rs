@@ -50,6 +50,7 @@ pub struct HostActionProfilePatch {
     pub herdr_socket_path: Option<String>,
     pub session_name: Option<String>,
     pub forward_agent: Option<bool>,
+    pub poll_on_startup: Option<bool>,
     pub jump_host_id: Option<String>,
     #[serde(skip)]
     pub jump_host_changed: bool,

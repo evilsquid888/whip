@@ -115,6 +115,13 @@ fn host(id: &str, key_auth: bool, jump: Option<&str>) -> StartupSessionHost {
         host_id: id.into(),
         key_auth,
         jump_host_id: jump.map(str::to_owned),
+        poll_on_startup: true,
+    }
+}
+fn unpolled(id: &str) -> StartupSessionHost {
+    StartupSessionHost {
+        poll_on_startup: false,
+        ..host(id, false, None)
     }
 }
 
@@ -216,7 +223,10 @@ fn protected_dependencies_are_verified_once_before_any_credentials_are_requested
         let hosts = vec![
             host("a", false, Some("jump")),
             host("b", true, None),
-            host("jump", true, None),
+            StartupSessionHost {
+                poll_on_startup: false,
+                ..host("jump", true, None)
+            },
         ];
         let raw = Some(r#"{"hostIds":["a","b"],"activeHostId":"a"}"#.into());
         core.start_session_restore(raw, true, hosts, true, false, platform.clone())
@@ -426,4 +436,51 @@ fn removed_active_profiles_select_the_first_surviving_host_without_terminal_navi
             .unwrap();
         assert_eq!(result.view.active_session_id.as_deref(), Some("host"));
     });
+}
+
+#[test]
+fn startup_connects_every_polled_host_and_skips_opted_out_live_hosts() {
+    run(async {
+        let core = AppCore::new();
+        let platform = Platform::new(core.clone());
+        let raw = Some(r#"{"hostIds":["c","b"],"activeHostId":"b"}"#.into());
+        let hosts = vec![
+            host("a", false, None),
+            unpolled("b"),
+            host("c", false, None),
+            unpolled("d"),
+        ];
+        let result = core
+            .start_session_restore(raw, true, hosts, false, true, platform.clone())
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+        let mut connected: Vec<_> = platform
+            .calls
+            .lock()
+            .iter()
+            .filter_map(|call| call.strip_prefix("connect:"))
+            .map(|call| call.split(':').next().unwrap_or_default().to_owned())
+            .collect();
+        connected.sort();
+        assert_eq!(connected, vec!["a", "c"]);
+        assert_eq!(result.view.active_session_id.as_deref(), Some("c"));
+    });
+}
+
+#[test]
+fn startup_host_ids_keep_live_order_then_profile_order_without_duplicates() {
+    let hosts = vec![
+        host("a", false, None),
+        host("b", false, None),
+        unpolled("c"),
+        host("d", false, None),
+    ];
+    let ids = startup_host_ids(
+        vec!["d".into(), "c".into(), "missing".into(), "d".into()],
+        &hosts,
+    );
+    assert_eq!(ids, vec!["d", "a", "b"]);
+    assert!(startup_host_ids(vec![], &[unpolled("x")]).is_empty());
 }

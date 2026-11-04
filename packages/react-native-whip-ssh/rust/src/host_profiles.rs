@@ -11,6 +11,9 @@ pub(crate) const DEFAULT_HERDR_COMMAND: &str = "herdr";
 const fn default_herdr_enabled() -> bool {
     true
 }
+const fn default_poll_on_startup() -> bool {
+    true
+}
 pub(crate) const MAX_AGENT_INSTRUCTIONS: usize = 32 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Enum)]
@@ -49,6 +52,9 @@ pub struct HostProfileRecord {
     pub herdr_enabled: bool,
     #[serde(default)]
     pub herdr_backend: HostHerdrBackend,
+    /// Connect this host and poll Herdr when Whip starts.
+    #[serde(default = "default_poll_on_startup")]
+    pub poll_on_startup: bool,
     pub herdr_command: String,
     #[serde(default)]
     pub herdr_socket_path: String,
@@ -283,6 +289,7 @@ impl HostProfileStore {
                 tailcat_ssh_server: false,
                 auth_mode: legacy.auth_mode.unwrap_or(HostAuthMode::Password),
                 herdr_enabled: default_herdr_enabled(),
+                poll_on_startup: default_poll_on_startup(),
                 herdr_backend: crate::HostHerdrBackend::Legacy,
                 herdr_command: legacy
                     .herdr_command
@@ -554,6 +561,7 @@ mod tests {
             tailcat_ssh_server: false,
             auth_mode: HostAuthMode::Key,
             herdr_enabled: default_herdr_enabled(),
+            poll_on_startup: default_poll_on_startup(),
             herdr_backend: crate::HostHerdrBackend::Legacy,
             herdr_command: "herdr".to_owned(),
             herdr_socket_path: String::new(),

@@ -78,7 +78,7 @@ export class HostProfileRepository {
       authMode: patch.authMode === undefined ? undefined : patch.authMode === 'key' ? HostAuthMode.Key : HostAuthMode.Password,
       herdrCommand: patch.herdrCommand, herdrSocketPath: patch.herdrSocketPath,
       herdrBackend: patch.herdrBackend === undefined ? undefined : toNativeHerdrBackend(patch.herdrBackend),
-      sessionName: patch.sessionName, forwardAgent: patch.forwardAgent,
+      sessionName: patch.sessionName, forwardAgent: patch.forwardAgent, pollOnStartup: patch.pollOnStartup,
       jumpHostId: patch.jumpHostId ?? undefined, jumpHostChanged: patch.jumpHostId !== undefined,
     };
     const result = await this.run(new CredentialCommand.SaveMetadata({ id, patch: nativePatch, source }), guard);

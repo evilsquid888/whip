@@ -1222,6 +1222,7 @@ export type NativeHostProfile = {
   authMode: 'password' | 'key';
   herdrEnabled: boolean;
   herdrBackend?: HerdrBackend;
+  pollOnStartup?: boolean;
   herdrCommand: string;
   herdrSocketPath: string;
   sessionName: string;
@@ -1250,6 +1251,7 @@ function rustHostProfile(value: NativeHostProfile): NativeHostProfileRecord {
     ...value,
     tailcatEnabled: Boolean(value.tailcatEnabled),
     tailcatSshServer: Boolean(value.tailcatSshServer),
+    pollOnStartup: value.pollOnStartup !== false,
     agentInstructions: value.agentInstructions ?? '',
     authMode:
       value.authMode === 'key' ? HostAuthMode.Key : HostAuthMode.Password,
@@ -3899,7 +3901,7 @@ export class NativeAppCore {
   async restoreSessions(options: {
     raw?: string;
     loaded: boolean;
-    hosts: ReadonlyArray<Pick<NativeHostProfile, 'id' | 'jumpHostId' | 'authMode'>>;
+    hosts: ReadonlyArray<Pick<NativeHostProfile, 'id' | 'jumpHostId' | 'authMode' | 'pollOnStartup'>>;
     protectKeys: boolean;
     reopenTerminal: boolean;
     platform: import('./generated-entry').SessionRestorePlatform;
@@ -3913,6 +3915,7 @@ export class NativeAppCore {
             hostId: host.id,
             jumpHostId: host.jumpHostId,
             keyAuth: host.authMode === 'key',
+            pollOnStartup: host.pollOnStartup !== false,
           })),
           options.protectKeys,
           options.reopenTerminal,

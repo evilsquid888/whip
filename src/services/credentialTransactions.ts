@@ -145,6 +145,7 @@ export function nativeHost(host: HostProfile): HostProfileRecord {
     tailcatSshServer: !!host.tailcatSshServer, herdrEnabled: host.herdrEnabled !== false,
     herdrCommand: host.herdrCommand, herdrSocketPath: host.herdrSocketPath ?? '', sessionName: host.sessionName,
     herdrBackend: toNativeHerdrBackend(host.herdrBackend),
+    pollOnStartup: host.pollOnStartup !== false,
     agentInstructions: host.agentInstructions ?? '', createdAt: host.createdAt, updatedAt: host.updatedAt,
     lastConnectedAt: host.lastConnectedAt,
   };

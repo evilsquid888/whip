@@ -458,6 +458,7 @@ export const en = {
   'hosts.delete': 'Delete',
   'hosts.deleteHost': 'Delete {{host}}',
   'hosts.edit': 'Edit {{host}}',
+  'hosts.pollOnStartup': 'Connect {{host}} and poll Herdr at startup',
   'hosts.latencyUnavailable': 'Latency unavailable',
   'hosts.latency': 'Latency {{value}} milliseconds',
   'hosts.agents_one': '{{count}} agent',

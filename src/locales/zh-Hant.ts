@@ -457,6 +457,7 @@ export const zhHant: Record<string, string> = {
   'hosts.delete': '刪除',
   'hosts.deleteHost': '刪除 {{host}}',
   'hosts.edit': '編輯 {{host}}',
+  'hosts.pollOnStartup': '啟動時連線 {{host}} 並輪詢 Herdr',
   'hosts.latencyUnavailable': '無法取得延遲',
   'hosts.latency': '延遲 {{value}} 毫秒',
   'hosts.agents_one': '{{count}} 個代理程式',

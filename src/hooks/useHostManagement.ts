@@ -22,6 +22,7 @@ import {
   markHostDisconnected,
   migrateCredentialBackupsIfNeeded,
   saveConnectionProfile,
+  saveHostMetadata,
   subscribeToHostProfiles,
 } from '../services/hostProfiles';
 import {
@@ -93,6 +94,8 @@ export interface HostManagementController {
   openEditor: (host: HostProfile) => Promise<void>;
   closeEditor: () => void;
   saveHost: (profile: ConnectionProfile) => Promise<void>;
+  /** Persist a host's startup polling opt-in; resolves to the saved host. */
+  setPollOnStartup: (host: HostProfile, enabled: boolean) => Promise<HostProfile>;
   savePairedHost: (
     result: PairHostResult,
     key: PairingKeySelection,
@@ -321,6 +324,12 @@ export function useHostManagement({
     [persistProfile, t],
   );
 
+  const setPollOnStartup = useCallback(
+    async (host: HostProfile, enabled: boolean) =>
+      (await saveHostMetadata(host.id, { pollOnStartup: enabled })).host,
+    [],
+  );
+
   const savePairedHost = useCallback(
     async (result: PairHostResult, key: PairingKeySelection, jumpHostId?: string) => {
       await trustKnownHost({
@@ -508,6 +517,7 @@ export function useHostManagement({
       closeEditor,
       saveHost,
       savePairedHost,
+      setPollOnStartup,
       unlockGlobalKeychain,
       openGlobalKeychain,
       closeGlobalKeychain,
@@ -564,6 +574,7 @@ export function useHostManagement({
       resolveUnknownHost,
       saveHost,
       savePairedHost,
+      setPollOnStartup,
       trustChallenge,
       unknownHostChallenge,
       unlockedGlobalKeys,

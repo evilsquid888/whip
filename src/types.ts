@@ -29,6 +29,8 @@ export interface HostProfile {
   authMode: AuthMode;
   herdrEnabled?: boolean;
   herdrBackend?: 'auto' | 'legacy' | 'core';
+  /** Connect this host and poll Herdr when Whip starts. Defaults to true. */
+  pollOnStartup?: boolean;
   herdrCommand: string;
   herdrSocketPath?: string;
   sessionName: string;

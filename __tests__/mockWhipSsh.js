@@ -25,6 +25,7 @@ class MockNativeHostProfileStore {
       tailcatEnabled: Boolean(profile.tailcatEnabled),
       tailcatSshServer: Boolean(profile.tailcatSshServer),
       herdrEnabled: profile.herdrEnabled !== false,
+      pollOnStartup: profile.pollOnStartup !== false,
       herdrCommand: profile.herdrCommand.trim() || 'herdr',
       herdrSocketPath: profile.herdrSocketPath.trim(), sessionName: profile.sessionName.trim(),
       agentInstructions: profile.agentInstructions || '',

@@ -215,6 +215,7 @@ impl Workflow {
             tailcat_ssh_server: false,
             auth_mode: crate::HostAuthMode::Password,
             herdr_enabled: true,
+            poll_on_startup: true,
             herdr_backend: crate::HostHerdrBackend::Legacy,
             herdr_command: DEFAULT_HERDR_COMMAND.into(),
             herdr_socket_path: String::new(),
@@ -235,7 +236,8 @@ impl Workflow {
             herdr_backend,
             herdr_socket_path,
             session_name,
-            forward_agent
+            forward_agent,
+            poll_on_startup
         );
         if patch.jump_host_changed {
             host.jump_host_id = patch.jump_host_id;

@@ -10442,6 +10442,10 @@ export type HostProfileRecord = {
   authMode: HostAuthMode;
   herdrEnabled: boolean;
   herdrBackend: HostHerdrBackend;
+  /**
+   * Connect this host and poll Herdr when Whip starts.
+   */
+  pollOnStartup: boolean;
   herdrCommand: string;
   herdrSocketPath: string;
   sessionName: string;
@@ -10485,6 +10489,7 @@ const FfiConverterTypeHostProfileRecord = (() => {
         authMode: FfiConverterTypeHostAuthMode.read(from),
         herdrEnabled: FfiConverterBool.read(from),
         herdrBackend: FfiConverterTypeHostHerdrBackend.read(from),
+        pollOnStartup: FfiConverterBool.read(from),
         herdrCommand: FfiConverterString.read(from),
         herdrSocketPath: FfiConverterString.read(from),
         sessionName: FfiConverterString.read(from),
@@ -10507,6 +10512,7 @@ const FfiConverterTypeHostProfileRecord = (() => {
       FfiConverterTypeHostAuthMode.write(value.authMode, into);
       FfiConverterBool.write(value.herdrEnabled, into);
       FfiConverterTypeHostHerdrBackend.write(value.herdrBackend, into);
+      FfiConverterBool.write(value.pollOnStartup, into);
       FfiConverterString.write(value.herdrCommand, into);
       FfiConverterString.write(value.herdrSocketPath, into);
       FfiConverterString.write(value.sessionName, into);
@@ -10529,6 +10535,7 @@ const FfiConverterTypeHostProfileRecord = (() => {
         FfiConverterTypeHostAuthMode.allocationSize(value.authMode) +
         FfiConverterBool.allocationSize(value.herdrEnabled) +
         FfiConverterTypeHostHerdrBackend.allocationSize(value.herdrBackend) +
+        FfiConverterBool.allocationSize(value.pollOnStartup) +
         FfiConverterString.allocationSize(value.herdrCommand) +
         FfiConverterString.allocationSize(value.herdrSocketPath) +
         FfiConverterString.allocationSize(value.sessionName) +
@@ -13438,6 +13445,7 @@ export type HostActionProfilePatch = {
   herdrSocketPath?: string;
   sessionName?: string;
   forwardAgent?: boolean;
+  pollOnStartup?: boolean;
   jumpHostId?: string;
   jumpHostChanged: boolean;
 };
@@ -13476,6 +13484,7 @@ const FfiConverterTypeHostActionProfilePatch = (() => {
         herdrSocketPath: FfiConverterOptionalString.read(from),
         sessionName: FfiConverterOptionalString.read(from),
         forwardAgent: FfiConverterOptionalBoolean.read(from),
+        pollOnStartup: FfiConverterOptionalBoolean.read(from),
         jumpHostId: FfiConverterOptionalString.read(from),
         jumpHostChanged: FfiConverterBool.read(from),
       };
@@ -13491,6 +13500,7 @@ const FfiConverterTypeHostActionProfilePatch = (() => {
       FfiConverterOptionalString.write(value.herdrSocketPath, into);
       FfiConverterOptionalString.write(value.sessionName, into);
       FfiConverterOptionalBoolean.write(value.forwardAgent, into);
+      FfiConverterOptionalBoolean.write(value.pollOnStartup, into);
       FfiConverterOptionalString.write(value.jumpHostId, into);
       FfiConverterBool.write(value.jumpHostChanged, into);
     }
@@ -13508,6 +13518,7 @@ const FfiConverterTypeHostActionProfilePatch = (() => {
         FfiConverterOptionalString.allocationSize(value.herdrSocketPath) +
         FfiConverterOptionalString.allocationSize(value.sessionName) +
         FfiConverterOptionalBoolean.allocationSize(value.forwardAgent) +
+        FfiConverterOptionalBoolean.allocationSize(value.pollOnStartup) +
         FfiConverterOptionalString.allocationSize(value.jumpHostId) +
         FfiConverterBool.allocationSize(value.jumpHostChanged)
       );
@@ -17316,6 +17327,7 @@ export type StartupSessionHost = {
   hostId: string;
   jumpHostId?: string;
   keyAuth: boolean;
+  pollOnStartup: boolean;
 };
 
 /**
@@ -17343,18 +17355,21 @@ const FfiConverterTypeStartupSessionHost = (() => {
         hostId: FfiConverterString.read(from),
         jumpHostId: FfiConverterOptionalString.read(from),
         keyAuth: FfiConverterBool.read(from),
+        pollOnStartup: FfiConverterBool.read(from),
       };
     }
     write(value: TypeName, into: RustBuffer): void {
       FfiConverterString.write(value.hostId, into);
       FfiConverterOptionalString.write(value.jumpHostId, into);
       FfiConverterBool.write(value.keyAuth, into);
+      FfiConverterBool.write(value.pollOnStartup, into);
     }
     allocationSize(value: TypeName): number {
       return (
         FfiConverterString.allocationSize(value.hostId) +
         FfiConverterOptionalString.allocationSize(value.jumpHostId) +
-        FfiConverterBool.allocationSize(value.keyAuth)
+        FfiConverterBool.allocationSize(value.keyAuth) +
+        FfiConverterBool.allocationSize(value.pollOnStartup)
       );
     }
   }
@@ -37179,7 +37194,9 @@ export const SessionConnectionPlatformError = (() => {
       return Failed_.instanceOf(obj);
     }
 
-    static getInner(obj: Failed_): Readonly<{
+    static getInner(
+      obj: Failed_,
+    ): Readonly<{
       kind: SessionConnectionFailureKind;
       expectedProtocol?: string;
       receivedProtocol?: string;

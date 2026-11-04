@@ -275,6 +275,7 @@ impl Fixture {
             tailcat_enabled: false,
             tailcat_ssh_server: false,
             herdr_enabled: false,
+            poll_on_startup: true,
             herdr_backend: crate::HostHerdrBackend::Legacy,
             herdr_command: "herdr".into(),
             herdr_socket_path: String::new(),

@@ -384,6 +384,27 @@ export function AppShell({
                               sessions.closeHostById(host.id)
                             }
                             onEdit={hosts.openEditor}
+                            onPollOnStartupChange={(host, enabled) => {
+                              const connected = sessions.presentationSessions.some(
+                                session =>
+                                  session.hostId === host.id
+                                  && isLiveHostSshConnected(session.connectionStatus),
+                              );
+                              hosts
+                                .setPollOnStartup(host, enabled)
+                                .then(saved => {
+                                  if (!enabled || connected) return;
+                                  return sessions
+                                    .connect(saved, {
+                                      loadSavedCredential: true,
+                                      promptForUnknownHosts: true,
+                                      navigate: false,
+                                      activateSession: false,
+                                    })
+                                    .then(() => undefined);
+                                })
+                                .catch(error => hosts.setError(String(error)));
+                            }}
                             onManageGlobalKeychain={openGlobalKeychain}
                             onUnlockCredentials={hosts.unlockCredentialRecovery}
                           />

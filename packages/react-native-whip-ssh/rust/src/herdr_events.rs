@@ -131,13 +131,13 @@ fn forward_events(client_key: &str, events: Vec<HerdrEvent>) {
     let Some(events) = crate::host_runtime::deliver_herdr_events(client_key, events) else {
         return;
     };
-    EVENT_SINK_INFLIGHT.fetch_add(1, Ordering::SeqCst);
+    let inflight = crate::sink_inflight::InflightGuard::enter(&EVENT_SINK_INFLIGHT);
     if let Some(sink) = event_sink().read().clone() {
         for event in events {
             sink.event(client_key.to_owned(), event);
         }
     }
-    EVENT_SINK_INFLIGHT.fetch_sub(1, Ordering::SeqCst);
+    drop(inflight);
 }
 
 fn transport_closed(id: u64, reason: String) {
@@ -148,13 +148,13 @@ fn transport_closed(id: u64, reason: String) {
     subscription.finish_acknowledgement(Err(HerdrEventError::TransportDisconnected(format!(
         "Herdr event subscription closed before acknowledgement: {reason}"
     ))));
-    EVENT_SINK_INFLIGHT.fetch_add(1, Ordering::SeqCst);
+    let inflight = crate::sink_inflight::InflightGuard::enter(&EVENT_SINK_INFLIGHT);
     if !crate::host_runtime::event_subscription_closed(&subscription.client_key, reason.clone())
         && let Some(sink) = event_sink().read().clone()
     {
         sink.closed(subscription.client_key.clone(), reason);
     }
-    EVENT_SINK_INFLIGHT.fetch_sub(1, Ordering::SeqCst);
+    drop(inflight);
     remove_subscription(id);
 }
 
@@ -162,13 +162,13 @@ fn fail_subscription(subscription: &EventSubscription, reason: String) {
     subscription.finish_acknowledgement(Err(HerdrEventError::SubscriptionUnavailable(
         reason.clone(),
     )));
-    EVENT_SINK_INFLIGHT.fetch_add(1, Ordering::SeqCst);
+    let inflight = crate::sink_inflight::InflightGuard::enter(&EVENT_SINK_INFLIGHT);
     if !crate::host_runtime::event_subscription_closed(&subscription.client_key, reason.clone())
         && let Some(sink) = event_sink().read().clone()
     {
         sink.closed(subscription.client_key.clone(), reason);
     }
-    EVENT_SINK_INFLIGHT.fetch_sub(1, Ordering::SeqCst);
+    drop(inflight);
     subscription.close_stream();
     remove_subscription(subscription.id);
 }

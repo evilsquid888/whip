@@ -36,6 +36,7 @@ mod remote_preview;
 mod reverse_control;
 mod rich_text_html;
 mod secure_id;
+mod sink_inflight;
 mod speech_playback;
 mod ssh;
 mod ssh_workflows;

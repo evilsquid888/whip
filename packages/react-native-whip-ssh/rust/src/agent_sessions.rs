@@ -2398,7 +2398,7 @@ fn emit(
             }
         }
     }
-    EVENT_SINK_INFLIGHT.fetch_add(1, Ordering::SeqCst);
+    let inflight = crate::sink_inflight::InflightGuard::enter(&EVENT_SINK_INFLIGHT);
     let sink = event_sink().read().clone();
     if let Some(sink) = sink {
         sink.event(AgentTranscriptEvent {
@@ -2409,7 +2409,7 @@ fn emit(
             update,
         });
     }
-    EVENT_SINK_INFLIGHT.fetch_sub(1, Ordering::SeqCst);
+    drop(inflight);
 }
 
 fn stream_data(context: u64, bytes: Vec<u8>) {

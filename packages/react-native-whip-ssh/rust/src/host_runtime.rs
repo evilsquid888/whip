@@ -661,12 +661,12 @@ fn emit(event: HostRuntimeEvent) {
     crate::usage::observe_runtime_event(&event);
     // Foreign callbacks may synchronously re-enter HostRuntime. Never retain
     // either the sink registry lock or a runtime-state lock across the call.
-    EVENT_SINK_INFLIGHT.fetch_add(1, Ordering::SeqCst);
+    let inflight = crate::sink_inflight::InflightGuard::enter(&EVENT_SINK_INFLIGHT);
     let sink = event_sink().read().clone();
     if let Some(sink) = sink {
         sink.event(event);
     }
-    EVENT_SINK_INFLIGHT.fetch_sub(1, Ordering::SeqCst);
+    drop(inflight);
 }
 
 fn publish_lifecycle_status(inner: &RuntimeInner) {
